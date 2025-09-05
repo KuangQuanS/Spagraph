@@ -23,7 +23,7 @@ logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 # 创建一个文件处理器（FileHandler），并将日志写入文件
-file_handler = logging.FileHandler('STEncoder/train.log')
+file_handler = logging.FileHandler('/home/maweicheng/ST_Graduation_Project/STEncoder/train.log')
 file_handler.setLevel(logging.INFO)
 file_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
 file_handler.setFormatter(file_formatter)
@@ -126,21 +126,21 @@ def train_bert_mlm(model, train_loader, accelerator, args):
 
         train_loss_list.append(train_loss)
 
-        if accelerator.is_main_process:
+        if accelerator.is_main_process and (epoch + 1) % 5 == 0:
             logging.info(f"Epoch {epoch+1}/{args.bert_epochs} - Train Loss: {train_loss:.4f}")
 
         # ✅ 只在 rank=0 保存
         if accelerator.is_main_process and train_loss < best_train_loss:
             best_train_loss = train_loss
             unwrapped_model = accelerator.unwrap_model(model)
-            unwrapped_model.save_pretrained(os.path.join(args.output_dir, f"bert_mlm_best-train_{train_loss}"))
+            unwrapped_model.save_pretrained(os.path.join(args.output_dir, f"bert_best"))
             logging.info(f"Best model saved with train loss: {best_train_loss:.4f}")
 
-        if accelerator.is_main_process and (epoch + 1) % 10 == 0:
+        if accelerator.is_main_process and (epoch + 1) % 20 == 0:
             unwrapped_model = accelerator.unwrap_model(model)
-            save_path = os.path.join(args.output_dir, f"bert_mlm_epoch_{epoch+1}-train_{train_loss}")
+            save_path = os.path.join(args.output_dir, f"bert_mlm_epoch_{epoch+1}-train_{train_loss:.4f}")
             unwrapped_model.save_pretrained(save_path)
-            logging.info(f"✅ Epoch {epoch+1}: checkpoint saved -> {save_path}")
+            logging.info(f"✅ Epoch {epoch+1}: checkpoint saved")
 
     # ✅ 只在主进程画图 & 保存
     if accelerator.is_main_process:
@@ -311,15 +311,15 @@ def train_vit_mim(model, train_loader, accelerator, args):
         # ✅ 保存最好模型（只在主进程）
         if accelerator.is_main_process and train_loss < best_train_loss:
             best_train_loss = train_loss
-            model_dir = os.path.join(args.output_dir, f"vit_best_train_{train_loss:.4f}")
-            logging.info(f"best train loss: {best_train_loss} Saving best model -> {model_dir}")
+            model_dir = os.path.join(args.output_dir, f"vit_best")
+            logging.info(f"best train loss: {best_train_loss} Saving")
             accelerator.unwrap_model(model).save_pretrained(model_dir)
 
         # ✅ 定期保存 checkpoint
-        if accelerator.is_main_process and (epoch + 1) % 10 == 0:
+        if accelerator.is_main_process and (epoch + 1) % 20 == 0:
             ckpt_dir = os.path.join(args.output_dir, f"vit_epoch_{epoch+1}_train_{train_loss:.4f}")
             accelerator.unwrap_model(model).save_pretrained(ckpt_dir)
-            logging.info(f"Epoch:{epoch + 1 } Saved checkpoint -> {ckpt_dir}")
+            logging.info(f"Epoch:{epoch + 1 } Saved")
 
     # ✅ 训练完成后保存最终模型
     if accelerator.is_main_process:

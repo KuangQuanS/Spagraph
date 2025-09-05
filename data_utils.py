@@ -185,7 +185,7 @@ class STDataProcessor:
 
 
 #--------------------------------------------这个是为了算单个npz里面的细胞通讯得分构造的dataset-----------------------------------
-class STSampleDataset(Dataset):
+class Process_CC_Dataset(Dataset):
     def __init__(self, npz_files, use_lr_score=True):  # 添加布尔参数，默认启用
         self.npz_files = npz_files
         data = np.load(npz_files, allow_pickle=True)
@@ -217,7 +217,7 @@ class STSampleDataset(Dataset):
         
         return result
 
-def create_batch_collate(batch, tokenizer, use_lr_score=False):
+def create_cc_batch_collate(batch, tokenizer, use_lr_score=False):
     """
     一个能正确处理批次的 collate_fn。
     它会遍历批次中的每个样本，然后将它们堆叠成一个大的批处理张量。
@@ -313,7 +313,7 @@ class ST_COMMDataset(Dataset):
                 i, j = row['spot_i'], row['spot_j']
                 key = (i, j)
                 self.comm_event_dict[key] = {
-                    'ligand_receptor': row['receptor_ligand'], # TODO:以后记得改一下，row名是ligand_receptor
+                    'ligand_receptor': row['ligand_receptor'], 
                     'comm_score': float(row['comm_score']),
                 }
 

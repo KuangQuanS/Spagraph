@@ -5,8 +5,8 @@ import torch
 import glob
 import pandas as pd
 from data_utils import ST_COMMDataset,comm_collate_fn
-from model import ST_COMM, BERTEncoder, clip_loss, info_nce_loss
-from utils import setup_logging, set_seed, build_graph_data_for_contrastive_learning
+from model import ST_COMM, clip_loss, info_nce_loss
+from utils import setup_logging, set_seed
 from tokenizer import GeneTokenizer
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -34,85 +34,70 @@ def parse_args():
     parser.add_argument('--weight_decay', type=float, default=0.01, help='权重衰减')
     parser.add_argument('--seed', type=int, default=42, help='随机种子')
     parser.add_argument('--device', type=str, default='cuda', help='设备')
+    parser.add_argument('--npz_file', type=str, help='单个npz文件路径')
     
     return parser.parse_args()
 
 #---------------------------------ST_COMM模型-----------------------------------
-def train_one_sample(model, dataloader, optimizer, scheduler, device,
-                    lambda_graph=0.7, lambda_clip=0.3):
+# TODO:考虑加入融合后的向量之间的余弦相似度来使不同类之间的spot通讯更重要
+def train_one_sample(model, batch, optimizer, scheduler, device,
+                     lambda_graph=0.7, lambda_clip=0.3):
+    """
+    处理单个 batch 的逻辑
+    """
     model.train()
-    total_loss, total_infonce, total_contrast = 0, 0, 0
 
-    pbar = tqdm(dataloader, desc="Training batches")
-    for batch_idx, batch in enumerate(pbar):
-        input_ids = batch['input_ids'].to(device)
-        images = batch['patches'].to(device)
-        attention_mask = batch['attention_mask'].to(device)
-        coords = batch['coords'].to(device)
-        edge_index = batch['edge_index'].to(device)
-        edge_attr = batch['edge_attr'].to(device)
+    # 获取 batch 数据
+    input_ids = batch['input_ids'].to(device)
+    images = batch['patches'].to(device)
+    attention_mask = batch['attention_mask'].to(device)
+    coords = batch['coords'].to(device)
+    edge_index = batch['edge_index'].to(device)
+    edge_attr = batch['edge_attr'].to(device)
 
-        ei1_list, ea1_list = [], []
-        ei2_list, ea2_list = [], []
+    # 图增强
+    ei1_list, ea1_list = [], []
+    ei2_list, ea2_list = [], []
 
-        B = edge_index.size(0)
-        num_nodes = coords.size(1)
+    B = edge_index.size(0)
+    num_nodes = coords.size(1)
+    for b in range(B):
+        ei_b1, ea_b1 = augment_graph(edge_index[b], edge_attr[b])
+        ei1_list.append(ei_b1)
+        ea1_list.append(ea_b1)
 
-        for b in range(B):
-            ei_b1, ea_b1 = augment_graph(edge_index[b], edge_attr[b])
-            ei1_list.append(ei_b1)
-            ea1_list.append(ea_b1)
+        ei_b2, ea_b2 = augment_rw(edge_index[b], edge_attr[b], num_nodes)
+        ei2_list.append(ei_b2)
+        ea2_list.append(ea_b2)
 
-            ei_b2, ea_b2 = augment_rw(edge_index[b], edge_attr[b], num_nodes)
-            ei2_list.append(ei_b2)
-            ea2_list.append(ea_b2)
+    ei1 = torch.stack(ei1_list, dim=0)
+    ea1 = torch.stack(ea1_list, dim=0)
+    ei2 = torch.stack(ei2_list, dim=0)
+    ea2 = torch.stack(ea2_list, dim=0)
 
-        ei1 = torch.stack(ei1_list, dim=0)
-        ea1 = torch.stack(ea1_list, dim=0)
-        ei2 = torch.stack(ei2_list, dim=0)
-        ea2 = torch.stack(ea2_list, dim=0)
+    # 模型前向传播
+    node_emb1, attn_scores1, attn_logistic1, text_emb, image_emb, fusion_emb = model(input_ids, attention_mask, images, ei1, ea1, coords)
+    node_emb2, attn_scores2, attn_logistic2, text_emb, image_emb, fusion_emb = model(input_ids, attention_mask, images, ei2, ea2, coords)
 
-        node_emb1, attn_scores1, text_emb, image_emb, fusion_emb = model(input_ids, attention_mask, images, ei1, ea1, coords)
-        node_emb2, attn_scores2, text_emb, image_emb, fusion_emb = model(input_ids, attention_mask, images, ei2, ea2, coords)
-        infonce_loss = info_nce_loss(node_emb1, node_emb2)
+    # 计算损失
+    infonce_loss = info_nce_loss(node_emb1, node_emb2)
 
-        B, N, D = text_emb.shape
-        text_emb_flat = text_emb.reshape(B*N, D)
-        image_emb_flat = image_emb.reshape(B*N, D)
-        # TODO:考虑加入融合后的向量之间的余弦相似度来使不同类之间的spot通讯更重要
-        logits_per_image = torch.matmul(image_emb_flat, text_emb_flat.T)
-        logits_per_text = logits_per_image.T
+    B, N, D = text_emb.shape
+    text_emb_flat = text_emb.reshape(B * N, D)
+    image_emb_flat = image_emb.reshape(B * N, D)
+    logits_per_image = torch.matmul(image_emb_flat, text_emb_flat.T)
+    logits_per_text = logits_per_image.T
 
-        c_loss = clip_loss(logits_per_image, logits_per_text)
-        loss = lambda_graph * infonce_loss + lambda_clip * c_loss
+    c_loss = clip_loss(logits_per_image, logits_per_text)
+    loss = lambda_graph * infonce_loss + lambda_clip * c_loss
 
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-        scheduler.step()
+    # 反向传播和优化
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+    scheduler.step()
 
-        total_loss += loss.item()
-        total_infonce += infonce_loss.item()
-        total_contrast += c_loss.item()
-
-        # 在 tqdm 进度条上显示当前 loss
-        pbar.set_postfix({
-            "loss": f"{loss.item():.4f}",
-            "InfoNCE": f"{infonce_loss.item():.4f}",
-            "CLIP": f"{c_loss.item():.4f}"
-        })
-
-        # 你还可以保留logging，如果需要的话
-        if (batch_idx + 1) % 10 == 0:
-            logging.info(f"Batch {batch_idx+1} - Loss: {loss.item():.4f}, InfoNCE: {infonce_loss.item():.4f}, CLIP: {c_loss.item():.4f}")
-
-    avg_loss = total_loss / len(dataloader)
-    avg_infonce = total_infonce / len(dataloader)
-    avg_contrast = total_contrast / len(dataloader)
-
-    logging.info(f"Epoch summary - Avg Loss: {avg_loss:.4f}, Avg InfoNCE: {avg_infonce:.4f}, Avg CLIP: {avg_contrast:.4f}")
-
-    return avg_loss, avg_infonce, avg_contrast
+    return loss.item(), infonce_loss.item(), c_loss.item()
 
 def main():
     # 解析参数
@@ -217,43 +202,38 @@ def main():
 
     # 记录所有 epoch 的损失
     epoch_train_loss, epoch_infonce_loss, epoch_contrast_loss = [], [], []
+    npz_file = npz_files[0]
+    # 加载指定的单个 npz 文件
+    dataset = ST_COMMDataset(
+        token_patch_npz_path=npz_file,
+        graph_npz_path=npz_file.replace(".npz", "_graph_data.npz"),
+        event_csv_path=npz_file.replace(".npz", "_lr.csv")
+    )
 
-    for epoch in range(args.epochs):
-        logging.info(f'Processing Epoch {epoch+1}/{args.epochs}')
-        
+    dataloader = DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        collate_fn=lambda batch: comm_collate_fn(batch, tokenizer=tokenizer)
+    )
+
+    # 记录所有 epoch 的损失
+    epoch_train_loss, epoch_infonce_loss, epoch_contrast_loss = [], [], []
+
+    # 使用 tqdm 包裹 epochs 循环，显示训练进度
+    for epoch in tqdm(range(args.epochs), desc="Epoch Progress"):
         total_loss, total_infonce, total_contrast = 0.0, 0.0, 0.0
         total_batches = 0
 
-        # tqdm 包裹 npz_files，显示样本处理进度
-        with tqdm(npz_files, desc=f"Processing Epoch {epoch+1}") as pbar:
-            for npz_path in pbar:
-                dataset = ST_COMMDataset(
-                    token_patch_npz_path=npz_path,
-                    graph_npz_path=npz_path.replace(".npz", "_graph_data.npz"),
-                    event_csv_path=npz_path.replace(".npz", "_lr.csv")
-                )
-                dataloader = DataLoader(
-                    dataset,
-                    batch_size=args.batch_size,
-                    shuffle=False,
-                    collate_fn=lambda batch: comm_collate_fn(batch, tokenizer=tokenizer)
-                )
+        for batch in dataloader:
+            train_loss, infonce_loss, contrast_loss = train_one_sample(
+                model, batch, optimizer, scheduler, device
+            )
 
-                train_loss, infonce_loss, contrast_loss = train_one_sample(
-                    model, dataloader, optimizer, scheduler, device
-                )
-
-                total_loss += train_loss
-                total_infonce += infonce_loss
-                total_contrast += contrast_loss
-                total_batches += 1
-
-                # 更新进度条后缀，显示当前平均loss
-                pbar.set_postfix({
-                    "avg_loss": f"{total_loss / total_batches:.4f}",
-                    "avg_infoNCE": f"{total_infonce / total_batches:.4f}",
-                    "avg_contrast": f"{total_contrast / total_batches:.4f}"
-                })
+            total_loss += train_loss
+            total_infonce += infonce_loss
+            total_contrast += contrast_loss
+            total_batches += 1
 
         avg_loss = total_loss / total_batches
         avg_infonce = total_infonce / total_batches
@@ -265,13 +245,14 @@ def main():
         epoch_infonce_loss.append(avg_infonce)
         epoch_contrast_loss.append(avg_contrast)
 
-        if (epoch + 1) % 5 == 0:
+        if (epoch + 1) % 10 == 0:
             torch.save(model.state_dict(), f"{args.output_dir}/ST_COMM_epoch{epoch+1}.pth")
 
-    plt.figure(figsize=(8,6))
-    plt.plot(range(1, args.epochs+1), epoch_train_loss, label="Total Loss")
-    plt.plot(range(1, args.epochs+1), epoch_infonce_loss, label="InfoNCE Loss")
-    plt.plot(range(1, args.epochs+1), epoch_contrast_loss, label="Contrast Loss")
+    # 绘制损失曲线
+    plt.figure(figsize=(8, 6))
+    plt.plot(range(1, args.epochs + 1), epoch_train_loss, label="Total Loss")
+    plt.plot(range(1, args.epochs + 1), epoch_infonce_loss, label="InfoNCE Loss")
+    plt.plot(range(1, args.epochs + 1), epoch_contrast_loss, label="Contrast Loss")
     plt.xlabel("Epoch")
     plt.ylabel("Loss")
     plt.title("ST_COMM Training Loss Curve")

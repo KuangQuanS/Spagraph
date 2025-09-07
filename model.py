@@ -191,25 +191,25 @@ class CrossAttention(nn.Module):
         return self.to_out(out)
     
 class MultiModalFusion(nn.Module):
-    """多模态融合模块，使用交叉注意力机制融合文本和图像特征"""
-    
     def __init__(self, dim=384, heads=6, dim_head=64, dropout=0.1, depth=2):
         super().__init__()
-        # 文本到图像的交叉注意力
-        self.text_to_image_layers = nn.ModuleList([])
-        for _ in range(depth):
-            self.text_to_image_layers.append(nn.ModuleList([
-                PreNorm(dim, CrossAttention(dim, heads=heads, dim_head=dim_head, dropout=dropout)),
-                PreNorm(dim, FeedForward(dim, dim*4, dropout=dropout))
-            ]))
+        self.depth = depth
+        self.dim = dim
         
-        # 图像到文本的交叉注意力
-        self.image_to_text_layers = nn.ModuleList([])
-        for _ in range(depth):
-            self.image_to_text_layers.append(nn.ModuleList([
-                PreNorm(dim, CrossAttention(dim, heads=heads, dim_head=dim_head, dropout=dropout)),
-                PreNorm(dim, FeedForward(dim, dim*4, dropout=dropout))
-            ]))
+        # 共享的层归一化
+        self.norm = nn.ModuleList([nn.LayerNorm(dim) for _ in range(depth * 2)])
+        
+        # 文本到图像和图像到文本的交叉注意力
+        self.cross_attention = nn.ModuleList([
+            CrossAttention(dim, heads=heads, dim_head=dim_head, dropout=dropout)
+            for _ in range(depth * 2)
+        ])
+        
+        # 共享的前馈网络
+        self.ffn = nn.ModuleList([
+            FeedForward(dim, dim*4, dropout=dropout)
+            for _ in range(depth * 2)
+        ])
         
         # 融合层
         self.fusion = nn.Sequential(
@@ -220,24 +220,24 @@ class MultiModalFusion(nn.Module):
         )
     
     def forward(self, text_features, image_features):
-        # 文本到图像的交叉注意力
-        text_attended = text_features
-        for cross_attn, ff in self.text_to_image_layers:
-            text_attended = cross_attn(text_attended, image_features) + text_attended
-            text_attended = ff(text_attended) + text_attended
+        text_out = text_features
+        image_out = image_features
         
-        # 图像到文本的交叉注意力
-        image_attended = image_features
-        for cross_attn, ff in self.image_to_text_layers:
-            image_attended = cross_attn(image_attended, text_features) + image_attended
-            image_attended = ff(image_attended) + image_attended
-        # text_attended shape: torch.Size([16, 11, 384])
-        # image_attended shape: torch.Size([16, 11, 384])
+        for i in range(self.depth):
+            # 文本到图像的注意力
+            text_out = self.norm[i*2](text_out)
+            text_attended = self.cross_attention[i*2](text_out, image_out)
+            text_out = text_out + text_attended
+            text_out = text_out + self.ffn[i*2](self.norm[i*2+1](text_out))
+            
+            # 图像到文本的注意力
+            image_out = self.norm[i*2](image_out)
+            image_attended = self.cross_attention[i*2+1](image_out, text_out)
+            image_out = image_out + image_attended
+            image_out = image_out + self.ffn[i*2+1](self.norm[i*2+1](image_out))
+        
         # 融合特征
-        fused_features = torch.cat([text_attended, image_attended], dim=2)
-        # fused_features shape before fusion: torch.Size([16, 11, 768])
-        fused_features = self.fusion(fused_features)
-        # fused_features shape: torch.Size([16, 11, 384])
+        fused_features = self.fusion(torch.cat([text_out, image_out], dim=-1))
         return fused_features
     
 # -----------------------------------Graphformer-----------------------------------
@@ -263,11 +263,13 @@ class GraphomerEncoder(nn.Module):
         edge_bias = self.edge_proj(edge_attr)    # [B, E, num_heads]
 
         attn_scores = [] 
+        attn_logistic = []
         for layer in self.layers:
-            node_feats, attn = layer(node_feats, edge_index, edge_bias)
+            node_feats, attn, attn_raw = layer(node_feats, edge_index, edge_bias)
             attn_scores.append(attn)
+            attn_logistic.append(attn_raw)
 
-        return self.norm(node_feats), attn_scores
+        return self.norm(node_feats), attn_scores, attn_logistic
 
 class GraphomerLayer(nn.Module):
     def __init__(self, hidden_dim, num_heads):
@@ -315,7 +317,7 @@ class GraphomerLayer(nn.Module):
 
         out = out.transpose(1, 2).contiguous().view(B, N, H)
         out = self.out_proj(out)
-        return self.norm(x + self.dropout(out)),attn_weight
+        return self.norm(x + self.dropout(out)),attn_weight,attn_score
 # -----------------------------------总模型-----------------------------------
 class ST_COMM(nn.Module):
     def __init__(self,
@@ -377,6 +379,8 @@ class ST_COMM(nn.Module):
             num_layers=graphormer_layers
         )
 
+        self.final_norm = nn.LayerNorm(hidden_size)
+
     def forward(self, input_ids, attention_mask, images, edge_index, edge_attr, num_nodes=None):
         # ==== Step 1: BERT编码 ====
         text_features = self.bert(input_ids, attention_mask)
@@ -388,13 +392,15 @@ class ST_COMM(nn.Module):
         fusion_emb = self.fusion_module(text_features, image_features)
         # fusion_emb shape: torch.Size([16, 11, 384])
         # ==== Step 4: Graphormer 编码图结构 ====
-        node_emb, attn_scores = self.graphormer(
+        node_emb, attn_scores, attn_logistic = self.graphormer(
             fusion_emb,
             edge_index,
             edge_attr
         )
 
-        return node_emb, attn_scores, text_features, image_features, fusion_emb
+        node_emb = self.final_norm(node_emb)
+        
+        return node_emb, attn_scores, attn_logistic, text_features, image_features, fusion_emb
 
 def clip_loss(logits_per_image, logits_per_text):
     labels = torch.arange(logits_per_image.size(0), device=logits_per_image.device)
@@ -404,27 +410,21 @@ def clip_loss(logits_per_image, logits_per_text):
 
 def info_nce_loss(z1, z2, temperature=0.2):
     """
+    批量计算 InfoNCE loss，避免使用循环
     z1, z2: Tensor of shape [B, N, D]
-    对每个 batch 单独计算 N x N 相似度矩阵，并计算 infoNCE
-    
-    返回：batch 上的平均损失
     """
     B, N, D = z1.size()
-    z1 = F.normalize(z1, dim=-1)
-    z2 = F.normalize(z2, dim=-1)
+    z1 = F.normalize(z1, dim=-1)  # [B, N, D]
+    z2 = F.normalize(z2, dim=-1)  # [B, N, D]
 
-    losses = []
-    for b in range(B):
-        z1_b = z1[b]  # [N, D]
-        z2_b = z2[b]  # [N, D]
-        sim_matrix = torch.matmul(z1_b, z2_b.T)  # [N, N]
+    # 计算每个 batch 的相似度矩阵
+    sim_matrix = torch.bmm(z1, z2.transpose(1, 2))  # [B, N, N]
+    sim_matrix = sim_matrix / temperature
 
-        pos_sim = torch.diag(sim_matrix)  # 正样本对相似度 [N]
-
-        logits = sim_matrix / temperature
-
-        labels = torch.arange(N, device=z1.device)
-        loss = F.cross_entropy(logits, labels)
-        losses.append(loss)
-
-    return torch.stack(losses).mean()
+    # 创建标签：对角线上的元素是正样本
+    labels = torch.arange(N, device=z1.device).unsqueeze(0).expand(B, -1)  # [B, N]
+    
+    # 计算每个 batch 的 loss
+    loss = F.cross_entropy(sim_matrix.reshape(B*N, N), labels.reshape(-1))
+    
+    return loss

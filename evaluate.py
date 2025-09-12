@@ -11,6 +11,18 @@ import matplotlib.pyplot as plt
 import networkx as nx
 import glob
 
+def load_lr_id_mapping(csv_path):
+    """加载lr_id到ligand_receptor名称的映射"""
+    try:
+        df = pd.read_csv(csv_path)
+        # 创建从lr_id到ligand_receptor的映射字典
+        id_to_name = dict(zip(df['lr_id'], df['ligand_receptor']))
+        print(f"✅ 加载了 {len(id_to_name)} 个配体受体对映射")
+        return id_to_name
+    except Exception as e:
+        print(f"⚠️ 无法加载配体受体映射文件 {csv_path}: {e}")
+        return {}
+
 def parse_args():
     parser = argparse.ArgumentParser(description='ST_COMM Model Evaluation')
     parser.add_argument('--data_dir', type=str, required=True, help='数据目录路径')
@@ -18,6 +30,7 @@ def parse_args():
     parser.add_argument('--model_checkpoint', type=str, required=True, help='用于评估的模型检查点路径')
     parser.add_argument('--bert_pretrained_model', type=str, required=True, help='BERT预训练模型路径')
     parser.add_argument('--vit_pretrained_model', type=str, help='ViT预训练模型路径')
+    parser.add_argument('--lr_mapping_file', type=str, default='./ligand_receptor_labeled.csv', help='配体受体映射文件路径')
     parser.add_argument('--output_dir', type=str, default='./evaluation_results', help='评估结果输出目录')
     parser.add_argument('--batch_size', type=int, default=8, help='批次大小')
     parser.add_argument('--max_length', type=int, default=2048, help='最大序列长度')
@@ -26,14 +39,15 @@ def parse_args():
     parser.add_argument('--save_detailed', action='store_true', help='保存详细的评估结果')
     parser.add_argument('--max_graph_edges', type=int, default=50, help='网络图中显示的最大边数量')
     parser.add_argument('--min_node_labels', type=int, default=30, help='显示节点标签的最大节点数量')
+    parser.add_argument('--attention_threshold', type=float, default=0.0, help='注意力权重阈值，仅保存大于此值的边')
+    parser.add_argument('--filter_no_lr', action='store_true', help='是否过滤掉没有配体受体对的边')
     
     return parser.parse_args()
 
 def safe_extract(data, batch_idx, default_shape=None):
-    """安全地提取数据"""
+    """Extract the returned data."""
     if data is None:
         return None
-    
     if isinstance(data, torch.Tensor):
         if data.dim() >= 2 and data.shape[0] > batch_idx:
             return data[batch_idx].cpu().numpy()
@@ -57,10 +71,10 @@ def safe_extract(data, batch_idx, default_shape=None):
             return data[batch_idx]
         else:
             return data[0] if len(data) > 0 else None
-    
+
     return np.arange(default_shape) if default_shape else None
 
-def evaluate_model(model, dataloader, device, save_dir=None, detailed=False):
+def evaluate_model(model, dataloader, device, save_dir=None, detailed=False, lr_id_mapping=None, attention_threshold=0.0, filter_no_lr=False):
     """评估模型"""
     model.eval()
     all_results = []
@@ -91,18 +105,11 @@ def evaluate_model(model, dataloader, device, save_dir=None, detailed=False):
                 # 处理attention_logistic特殊情况
                 attn_logistic_b = None
                 if attn_logistic is not None:
-                    if isinstance(attn_logistic, (list, tuple)) and len(attn_logistic) > 0:
-                        last_layer = attn_logistic[-1]
-                        if isinstance(last_layer, torch.Tensor):
-                            if last_layer.dim() >= 2 and last_layer.shape[0] > b:
-                                attn_logistic_b = last_layer[b].cpu().numpy()
-                            else:
-                                attn_logistic_b = last_layer.cpu().numpy()
-                    elif isinstance(attn_logistic, torch.Tensor):
-                        if attn_logistic.dim() >= 2 and attn_logistic.shape[0] > b:
-                            attn_logistic_b = attn_logistic[b].cpu().numpy()
-                        else:
-                            attn_logistic_b = attn_logistic.cpu().numpy()
+                    last_layer = attn_logistic[-1]
+                    if last_layer.dim() >= 2 and last_layer.shape[0] > b:
+                        attn_logistic_b = last_layer[b].cpu().numpy()
+                    else:
+                        attn_logistic_b = last_layer.cpu().numpy()
 
                 batch_result = {
                     'batch_idx': batch_idx,
@@ -130,8 +137,11 @@ def evaluate_model(model, dataloader, device, save_dir=None, detailed=False):
                     safe_extract(edge_index, b, None),
                     safe_extract(edge_attr, b, None),
                     attn_logistic_b,
-                    safe_extract(spot_ids, b, N)
+                    safe_extract(spot_ids, b, N),
+                    safe_extract(coords, b, N),  # 添加坐标参数
+                    lr_id_mapping
                 )
+
                 batch_result['edge_attention_analysis'] = edge_analysis
                 
                 all_results.append(batch_result)
@@ -139,7 +149,7 @@ def evaluate_model(model, dataloader, device, save_dir=None, detailed=False):
     # 保存结果
     if save_dir is not None:
         os.makedirs(save_dir, exist_ok=True)
-        save_edge_analysis_csv(all_results, save_dir)
+        save_edge_analysis_csv(all_results, save_dir, attention_threshold, filter_no_lr)
         
         if detailed:
             save_path = os.path.join(save_dir, 'detailed_evaluation_results.npz')
@@ -151,8 +161,8 @@ def evaluate_model(model, dataloader, device, save_dir=None, detailed=False):
     
     return all_results
 
-def analyze_edge_attention(edge_index, edge_attr, attn_logistic, spot_ids):
-    """分析每条边的注意力权重"""
+def analyze_edge_attention(edge_index, edge_attr, attn_logistic, spot_ids, coords=None, lr_id_mapping=None):
+    """分析每条边的注意力权重（包含坐标信息）"""
     if attn_logistic is None or edge_index is None:
         return None
         
@@ -177,15 +187,37 @@ def analyze_edge_attention(edge_index, edge_attr, attn_logistic, spot_ids):
             score = edge_attr_info[0] if edge_attr_info and len(edge_attr_info) >= 1 else None
             lr_id = int(edge_attr_info[1]) if edge_attr_info and len(edge_attr_info) >= 2 else None
             
+            # 映射lr_id到配体受体名称
+            lr_name = None
+            if lr_id is not None and lr_id != -1 and lr_id_mapping:
+                lr_name = lr_id_mapping.get(lr_id, f"unknown_lr_{lr_id}")
+            elif lr_id == -1:
+                lr_name = "no_ligand_receptor"
+            
+            # 获取源和目标节点的坐标
+            src_x, src_y, tgt_x, tgt_y = None, None, None, None
+            if coords is not None:
+                if src_node < len(coords) and coords[src_node] is not None:
+                    if hasattr(coords[src_node], '__len__') and len(coords[src_node]) >= 2:
+                        src_x, src_y = float(coords[src_node][0]), float(coords[src_node][1])
+                if tgt_node < len(coords) and coords[tgt_node] is not None:
+                    if hasattr(coords[tgt_node], '__len__') and len(coords[tgt_node]) >= 2:
+                        tgt_x, tgt_y = float(coords[tgt_node][0]), float(coords[tgt_node][1])
+            
             edge_info = {
                 'edge_idx': i,
                 'src_node': int(src_node),
                 'tgt_node': int(tgt_node),
                 'src_spot_id': spot_ids[src_node] if spot_ids is not None and src_node < len(spot_ids) else f"node_{src_node}",
                 'tgt_spot_id': spot_ids[tgt_node] if spot_ids is not None and tgt_node < len(spot_ids) else f"node_{tgt_node}",
+                'src_x': src_x,
+                'src_y': src_y,
+                'tgt_x': tgt_x,
+                'tgt_y': tgt_y,
                 'edge_attr': edge_attr_info,
                 'score': score,
                 'lr_id': lr_id,
+                'lr_name': lr_name,
                 'attention_weight': attention_weight
             }
             edge_analysis.append(edge_info)
@@ -193,9 +225,10 @@ def analyze_edge_attention(edge_index, edge_attr, attn_logistic, spot_ids):
     edge_analysis.sort(key=lambda x: x['attention_weight'], reverse=True)
     return edge_analysis
 
-def save_edge_analysis_csv(results, save_dir):
-    """将边的注意力分析结果保存为CSV文件"""
+def save_edge_analysis_csv(results, save_dir, attention_threshold=0.0, filter_no_lr=False):
+    """将边的注意力分析结果保存为CSV文件（包含坐标信息）"""
     all_edges_data = []
+    filtered_edges_data = []
     
     for result in results:
         if result['edge_attention_analysis'] is not None:
@@ -207,20 +240,47 @@ def save_edge_analysis_csv(results, save_dir):
                     'edge_idx': edge_info['edge_idx'],
                     'src_node': edge_info['src_node'],
                     'tgt_node': edge_info['tgt_node'],
-                    'src_spot_id': edge_info['src_spot_id'],
-                    'tgt_spot_id': edge_info['tgt_spot_id'],
+                    'source_spot': edge_info['src_spot_id'],  # 改名以便可视化使用
+                    'target_spot': edge_info['tgt_spot_id'],
+                    'src_x': edge_info.get('src_x', None),
+                    'src_y': edge_info.get('src_y', None),
+                    'tgt_x': edge_info.get('tgt_x', None),
+                    'tgt_y': edge_info.get('tgt_y', None),
                     'attention_weight': edge_info['attention_weight'],
                     'score': edge_info.get('score', None),
                     'lr_id': edge_info.get('lr_id', None),
+                    'lr_name': edge_info.get('lr_name', None),
                     'edge_attr_mean': np.mean(edge_info['edge_attr']) if edge_info['edge_attr'] is not None else None,
                 }
                 all_edges_data.append(edge_data)
+                
+                # 应用过滤条件
+                is_valid_attention = edge_info['attention_weight'] > attention_threshold
+                is_valid_lr = not filter_no_lr or (edge_info.get('lr_name') != 'no_ligand_receptor' and edge_info.get('lr_name') is not None)
+                
+                if is_valid_attention and is_valid_lr:
+                    filtered_edges_data.append(edge_data)
     
-    df = pd.DataFrame(all_edges_data)
-    csv_path = os.path.join(save_dir, 'edge_attention_analysis.csv')
-    df.to_csv(csv_path, index=False)
-    print(f"✅ Edge analysis CSV saved to {csv_path}")
-    return df
+    # 保存完整版本
+    df_full = pd.DataFrame(all_edges_data)
+    csv_path_full = os.path.join(save_dir, 'edge_attention_analysis_full.csv')
+    df_full.to_csv(csv_path_full, index=False)
+    print(f"✅ 完整边分析CSV保存到 {csv_path_full} (共{len(all_edges_data)}条边)")
+    
+    # 保存过滤版本
+    if len(filtered_edges_data) > 0:
+        df_filtered = pd.DataFrame(filtered_edges_data)
+        filter_info = f"attention>{attention_threshold}"
+        if filter_no_lr:
+            filter_info += "_with_LR"
+        csv_path_filtered = os.path.join(save_dir, f'edge_attention_analysis_filtered_{filter_info}.csv')
+        df_filtered.to_csv(csv_path_filtered, index=False)
+        print(f"✅ 过滤后边分析CSV保存到 {csv_path_filtered} (共{len(filtered_edges_data)}条边)")
+        print(f"📊 过滤比例: {len(filtered_edges_data)}/{len(all_edges_data)} ({len(filtered_edges_data)/len(all_edges_data)*100:.1f}%)")
+    else:
+        print("⚠️ 过滤后没有边满足条件")
+    
+    return df_full, df_filtered if len(filtered_edges_data) > 0 else None
 
 def visualize_edge_attention(results, save_dir, max_edges=50, min_nodes_for_labels=30):
     """绘制网络图，显示节点和边的注意力权重"""
@@ -414,7 +474,7 @@ def print_top_attention_edges(results, top_k=10):
     
     print(f"\n🔍 Top-{top_k} Edges with Highest Attention Weights:")
     print("=" * 120)
-    print(f"{'Rank':<6} {'Sample':<12} {'Src Spot':<20} {'Tgt Spot':<20} {'Attention':<15} {'Edge Attr':<25}")
+    print(f"{'Rank':<6} {'Sample':<12} {'Src Spot':<15} {'Tgt Spot':<15} {'Attention':<15} {'Edge Attr':<25}")
     print("=" * 120)
     
     for i, edge in enumerate(all_edges[:top_k]):
@@ -441,6 +501,9 @@ def main():
     print(f'Using device: {device}')
     
     tokenizer = GeneTokenizer(vocab_file=args.vocab_file, max_length=args.max_length)
+    
+    # 加载配体受体映射
+    lr_id_mapping = load_lr_id_mapping(args.lr_mapping_file)
     
     model = ST_COMM(
         bert_model=args.bert_pretrained_model, 
@@ -492,7 +555,7 @@ def main():
     )
     
     print("🔬 Starting model evaluation...")
-    eval_results = evaluate_model(model, dataloader, device, args.output_dir, args.save_detailed)
+    eval_results = evaluate_model(model, dataloader, device, args.output_dir, args.save_detailed, lr_id_mapping, args.attention_threshold, args.filter_no_lr)
     
     print_top_attention_edges(eval_results, top_k=args.top_k_edges)
     

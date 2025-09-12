@@ -8,6 +8,7 @@ from model import ST_COMM
 from tokenizer import GeneTokenizer
 from torch.utils.data import DataLoader
 import matplotlib.pyplot as plt
+import networkx as nx
 import glob
 
 def parse_args():
@@ -23,6 +24,8 @@ def parse_args():
     parser.add_argument('--device', type=str, default='cuda', help='设备')
     parser.add_argument('--top_k_edges', type=int, default=20, help='显示Top-K注意力边数量')
     parser.add_argument('--save_detailed', action='store_true', help='保存详细的评估结果')
+    parser.add_argument('--max_graph_edges', type=int, default=50, help='网络图中显示的最大边数量')
+    parser.add_argument('--min_node_labels', type=int, default=30, help='显示节点标签的最大节点数量')
     
     return parser.parse_args()
 
@@ -143,7 +146,7 @@ def evaluate_model(model, dataloader, device, save_dir=None, detailed=False):
             np.savez_compressed(save_path, results=all_results)
             print(f"✅ Detailed results saved to {save_path}")
         
-        visualize_edge_attention(all_results, save_dir)
+        visualize_edge_attention(all_results, save_dir, max_edges=50, min_nodes_for_labels=30)
         print(f"✅ Evaluation results saved to {save_dir}")
     
     return all_results
@@ -169,13 +172,20 @@ def analyze_edge_attention(edge_index, edge_attr, attn_logistic, spot_ids):
             else:
                 attention_weight = float(attn_logistic[i]) if i < len(attn_logistic) else 0.0
             
+            # 提取edge_attr信息 (edge_attr格式: [score, lr_id])
+            edge_attr_info = edge_attr[i].tolist() if edge_attr is not None and i < len(edge_attr) else None
+            score = edge_attr_info[0] if edge_attr_info and len(edge_attr_info) >= 1 else None
+            lr_id = int(edge_attr_info[1]) if edge_attr_info and len(edge_attr_info) >= 2 else None
+            
             edge_info = {
                 'edge_idx': i,
                 'src_node': int(src_node),
                 'tgt_node': int(tgt_node),
                 'src_spot_id': spot_ids[src_node] if spot_ids is not None and src_node < len(spot_ids) else f"node_{src_node}",
                 'tgt_spot_id': spot_ids[tgt_node] if spot_ids is not None and tgt_node < len(spot_ids) else f"node_{tgt_node}",
-                'edge_attr': edge_attr[i].tolist() if edge_attr is not None and i < len(edge_attr) else None,
+                'edge_attr': edge_attr_info,
+                'score': score,
+                'lr_id': lr_id,
                 'attention_weight': attention_weight
             }
             edge_analysis.append(edge_info)
@@ -200,6 +210,8 @@ def save_edge_analysis_csv(results, save_dir):
                     'src_spot_id': edge_info['src_spot_id'],
                     'tgt_spot_id': edge_info['tgt_spot_id'],
                     'attention_weight': edge_info['attention_weight'],
+                    'score': edge_info.get('score', None),
+                    'lr_id': edge_info.get('lr_id', None),
                     'edge_attr_mean': np.mean(edge_info['edge_attr']) if edge_info['edge_attr'] is not None else None,
                 }
                 all_edges_data.append(edge_data)
@@ -210,8 +222,120 @@ def save_edge_analysis_csv(results, save_dir):
     print(f"✅ Edge analysis CSV saved to {csv_path}")
     return df
 
-def visualize_edge_attention(results, save_dir):
-    """可视化边的注意力权重分布"""
+def visualize_edge_attention(results, save_dir, max_edges=50, min_nodes_for_labels=30):
+    """绘制网络图，显示节点和边的注意力权重"""
+    if len(results) == 0:
+        print("⚠️ No results found for visualization")
+        return
+    
+    # 取第一个样本进行可视化
+    result = results[0]
+    if result['edge_attention_analysis'] is None:
+        print("⚠️ No edge attention analysis found for visualization")
+        return
+    
+    # 获取数据
+    edge_analysis = result['edge_attention_analysis']
+    coords = result['coords']
+    spot_ids = result['spot_ids']
+    
+    # 创建网络图
+    G = nx.Graph()
+    
+    # 添加节点
+    for i, spot_id in enumerate(spot_ids):
+        if coords is not None and i < len(coords):
+            pos = (coords[i][0], coords[i][1]) if coords[i].ndim > 0 else (i, 0)
+        else:
+            pos = (i, 0)
+        G.add_node(spot_id, pos=pos)
+    
+    # 添加边，按注意力权重排序，只取Top-K
+    top_k_edges = min(max_edges, len(edge_analysis))  # 限制显示的边数量
+    top_edges = edge_analysis[:top_k_edges]
+    
+    edge_weights = []
+    for edge_info in top_edges:
+        src_spot = edge_info['src_spot_id']
+        tgt_spot = edge_info['tgt_spot_id']
+        weight = edge_info['attention_weight']
+        
+        if src_spot in G.nodes and tgt_spot in G.nodes:
+            G.add_edge(src_spot, tgt_spot, weight=weight)
+            edge_weights.append(weight)
+    
+    if len(edge_weights) == 0:
+        print("⚠️ No valid edges found for visualization")
+        return
+    
+    # 设置图形大小
+    plt.figure(figsize=(16, 12))
+    ax = plt.gca()  # 获取当前axes
+    
+    # 获取节点位置
+    pos = nx.get_node_attributes(G, 'pos')
+    if not pos:  # 如果没有位置信息，使用spring layout
+        pos = nx.spring_layout(G, k=1, iterations=50)
+    
+    # 归一化边权重用于可视化
+    min_weight = min(edge_weights)
+    max_weight = max(edge_weights)
+    
+    # 绘制节点
+    node_sizes = [100] * len(G.nodes())  # 所有节点大小相同
+    nx.draw_networkx_nodes(G, pos, 
+                          node_size=node_sizes,
+                          node_color='lightblue',
+                          alpha=0.8,
+                          edgecolors='black',
+                          linewidths=0.5,
+                          ax=ax)
+    
+    # 绘制边，边的粗细和颜色反映注意力权重
+    edges = G.edges()
+    weights = [G[u][v]['weight'] for u, v in edges]
+    
+    # 归一化权重用于边的粗细
+    normalized_weights = [(w - min_weight) / (max_weight - min_weight) * 5 + 0.5 for w in weights]
+    
+    # 绘制边
+    nx.draw_networkx_edges(G, pos,
+                          width=normalized_weights,
+                          edge_color=weights,
+                          edge_cmap=plt.cm.Reds,
+                          alpha=0.7,
+                          ax=ax)
+    
+    # 添加节点标签（只显示部分以避免拥挤）
+    if len(G.nodes()) <= min_nodes_for_labels:  # 只有节点数量不多时才显示标签
+        labels = {node: str(node)[:8] for node in G.nodes()}  # 截断长标签
+        nx.draw_networkx_labels(G, pos, labels, font_size=8, font_weight='bold', ax=ax)
+    
+    plt.title(f'Attention Network Graph\n(Top-{top_k_edges} edges, Sample: {result["batch_idx"]}_{result["sample_idx"]})', 
+              fontsize=14, fontweight='bold')
+    
+    # 添加颜色条
+    sm = plt.cm.ScalarMappable(cmap=plt.cm.Reds, 
+                              norm=plt.Normalize(vmin=min_weight, vmax=max_weight))
+    sm.set_array([])
+    cbar = plt.colorbar(sm, ax=ax, shrink=0.8)
+    cbar.set_label('Attention Weight', rotation=270, labelpad=15)
+    
+    plt.axis('off')
+    plt.tight_layout()
+    
+    # 保存图像
+    save_path = os.path.join(save_dir, 'attention_network_graph.png')
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    print(f"✅ Network graph saved to {save_path}")
+    
+    # 创建第二个图：显示所有样本的统计信息
+    create_attention_statistics_plot(results, save_dir)
+
+def create_attention_statistics_plot(results, save_dir):
+    """创建注意力权重的统计图表"""
     all_attention_weights = []
     
     for result in results:
@@ -220,58 +344,38 @@ def visualize_edge_attention(results, save_dir):
                 all_attention_weights.append(edge_info['attention_weight'])
     
     if len(all_attention_weights) == 0:
-        print("⚠️ No attention weights found for visualization")
+        print("⚠️ No attention weights found for statistics")
         return
     
-    plt.figure(figsize=(15, 10))
+    plt.figure(figsize=(12, 8))
     
     # 子图1: 直方图
-    plt.subplot(2, 3, 1)
+    plt.subplot(2, 2, 1)
     plt.hist(all_attention_weights, bins=50, alpha=0.7, edgecolor='black', color='skyblue')
     plt.xlabel('Attention Weight')
     plt.ylabel('Frequency')
     plt.title('Distribution of Edge Attention Weights')
     plt.grid(True, alpha=0.3)
     
-    # 子图2: 累积分布
-    plt.subplot(2, 3, 2)
-    sorted_weights = np.sort(all_attention_weights)
-    cumulative = np.arange(1, len(sorted_weights) + 1) / len(sorted_weights)
-    plt.plot(sorted_weights, cumulative, color='orange', linewidth=2)
-    plt.xlabel('Attention Weight')
-    plt.ylabel('Cumulative Probability')
-    plt.title('Cumulative Distribution of Attention Weights')
-    plt.grid(True, alpha=0.3)
-    
-    # 子图3: Top-K 注意力权重
-    plt.subplot(2, 3, 3)
+    # 子图2: Top-K 注意力权重
+    plt.subplot(2, 2, 2)
     top_k = min(20, len(all_attention_weights))
     top_weights = sorted(all_attention_weights, reverse=True)[:top_k]
     plt.bar(range(top_k), top_weights, color='lightcoral')
     plt.xlabel('Edge Rank')
     plt.ylabel('Attention Weight')
     plt.title(f'Top-{top_k} Attention Weights')
-    plt.xticks(range(0, top_k, max(1, top_k//10)))
     plt.grid(True, alpha=0.3)
     
-    # 子图4: 箱线图
-    plt.subplot(2, 3, 4)
+    # 子图3: 箱线图
+    plt.subplot(2, 2, 3)
     plt.boxplot(all_attention_weights, vert=True)
     plt.ylabel('Attention Weight')
     plt.title('Box Plot of Attention Weights')
     plt.grid(True, alpha=0.3)
     
-    # 子图5: 对数直方图
-    plt.subplot(2, 3, 5)
-    log_weights = np.log10(np.array(all_attention_weights) + 1e-10)
-    plt.hist(log_weights, bins=50, alpha=0.7, edgecolor='black', color='lightgreen')
-    plt.xlabel('log10(Attention Weight)')
-    plt.ylabel('Frequency')
-    plt.title('Log-scale Distribution of Attention Weights')
-    plt.grid(True, alpha=0.3)
-    
-    # 子图6: 统计信息
-    plt.subplot(2, 3, 6)
+    # 子图4: 统计信息
+    plt.subplot(2, 2, 4)
     stats = f"""Statistics:
 Total Edges: {len(all_attention_weights):,}
 Mean: {np.mean(all_attention_weights):.6f}
@@ -289,10 +393,10 @@ Median: {np.median(all_attention_weights):.6f}
     
     plt.tight_layout()
     
-    save_path = os.path.join(save_dir, 'edge_attention_analysis.png')
+    save_path = os.path.join(save_dir, 'attention_statistics.png')
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
     plt.close()
-    print(f"✅ Edge attention visualization saved to {save_path}")
+    print(f"✅ Attention statistics plot saved to {save_path}")
 
 def print_top_attention_edges(results, top_k=10):
     """打印注意力权重最高的边信息"""

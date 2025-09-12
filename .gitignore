@@ -209,5 +209,7 @@ __marimo__/
 STimage-1K4M/
 npz_data/
 checkpoint/
-STEncoder/checkpoints
-database
+STEncoder/checkpoints/
+database/
+evaluation_results/
+trash/

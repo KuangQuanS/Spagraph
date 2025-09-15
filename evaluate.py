@@ -10,6 +10,13 @@ from torch.utils.data import DataLoader
 import matplotlib.pyplot as plt
 import networkx as nx
 import glob
+# 添加聚类相关导入
+import scanpy as sc
+import anndata as ad
+from sklearn.neighbors import kneighbors_graph
+import seaborn as sns
+from PIL import Image
+from matplotlib.colors import ListedColormap
 
 def load_lr_id_mapping(csv_path):
     """加载lr_id到ligand_receptor名称的映射"""
@@ -41,6 +48,13 @@ def parse_args():
     parser.add_argument('--min_node_labels', type=int, default=30, help='显示节点标签的最大节点数量')
     parser.add_argument('--attention_threshold', type=float, default=0.0, help='注意力权重阈值，仅保存大于此值的边')
     parser.add_argument('--filter_no_lr', action='store_true', help='是否过滤掉没有配体受体对的边')
+    
+    # 添加聚类相关参数
+    parser.add_argument('--enable_clustering', action='store_true', help='启用基于节点embedding的聚类分析')
+    parser.add_argument('--clustering_resolution', type=float, default=0.5, help='Leiden聚类分辨率参数')
+    parser.add_argument('--clustering_n_neighbors', type=int, default=15, help='聚类时构建邻接图的邻居数量')
+    parser.add_argument('--clustering_point_size', type=int, default=100, help='聚类可视化中点的大小')
+    parser.add_argument('--original_image_path', type=str, help='原始H&E图像路径（用于聚类可视化）')
     
     return parser.parse_args()
 
@@ -493,6 +507,302 @@ def print_top_attention_edges(results, top_k=10):
     
     print("=" * 120)
 
+# ==================== 聚类分析模块 ====================
+
+def extract_node_embeddings_for_clustering(model_path, data_path, device, bert_model_path, vocab_file, max_length=2048):
+    """从训练好的模型中提取节点embedding用于聚类"""
+    print("=== 提取节点embedding用于聚类 ===")
+    
+    # 加载模型
+    model = ST_COMM(
+        bert_model=bert_model_path,
+        vit_depth=6, 
+        vit_heads=6, 
+        hidden_size=384, 
+        vit_mlp_dim=1536
+    ).to(device)
+    
+    checkpoint = torch.load(model_path, map_location=device)
+    model.load_state_dict(checkpoint)
+    model.eval()
+    print(f"✅ 模型加载完成: {model_path}")
+    
+    # 加载数据
+    tokenizer = GeneTokenizer(vocab_file=vocab_file, max_length=max_length)
+    
+    # 获取NPZ文件
+    npz_files = glob.glob(os.path.join(data_path, "*.npz"))
+    npz_files = [file for file in npz_files if not file.endswith("_graph_data.npz")]
+    
+    if len(npz_files) == 0:
+        raise ValueError(f"No .npz files found in {data_path}")
+    
+    npz_file = npz_files[0]  # 使用第一个样本
+    dataset = ST_COMMDataset(
+        token_patch_npz_path=npz_file,
+        graph_npz_path=npz_file.replace(".npz", "_graph_data.npz"),
+        event_csv_path=npz_file.replace(".npz", "_lr.csv")
+    )
+    
+    dataloader = DataLoader(
+        dataset,
+        batch_size=1,  # 使用batch_size=1以便处理
+        shuffle=False,
+        collate_fn=lambda batch: comm_collate_fn(batch, tokenizer=tokenizer)
+    )
+    
+    all_node_embeddings = []
+    all_coordinates = []
+    all_spot_ids = []
+    
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(dataloader):
+            print(f"处理batch {batch_idx + 1}/{len(dataloader)}")
+            
+            # 获取batch数据
+            input_ids = batch['input_ids'].to(device)
+            images = batch['patches'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
+            coords = batch['coords'].to(device)
+            edge_index = batch['edge_index'].to(device)
+            edge_attr = batch['edge_attr'].to(device)
+            spot_ids = batch.get('spot_ids', None)
+            
+            # 模型前向传播
+            node_emb, attn_scores, attn_logistic, text_emb, image_emb, fusion_emb = model(
+                input_ids, attention_mask, images, edge_index, edge_attr, coords
+            )
+            
+            # 提取每个样本的节点embedding和坐标
+            B, N = coords.shape[:2]
+            for b in range(B):
+                # 提取节点embedding（使用center node，即第一个节点）
+                if node_emb is not None:
+                    if node_emb.dim() >= 2 and node_emb.shape[0] > b:
+                        node_embedding_b = node_emb[b].cpu().numpy()  # [N, hidden_size]
+                        # 只使用center node (第一个节点)
+                        center_embedding = node_embedding_b[0:1]  # [1, hidden_size]
+                        all_node_embeddings.append(center_embedding)
+                
+                # 提取坐标
+                coords_b = coords[b].cpu().numpy()  # [N, 2]
+                center_coord = coords_b[0:1]  # [1, 2]
+                all_coordinates.append(center_coord)
+                
+                # 提取spot_ids
+                if spot_ids is not None:
+                    spot_ids_b = spot_ids[b] if isinstance(spot_ids, list) else spot_ids
+                    center_spot_id = spot_ids_b[0] if hasattr(spot_ids_b, '__getitem__') else f"spot_{batch_idx}_{b}"
+                    all_spot_ids.append(center_spot_id)
+                else:
+                    all_spot_ids.append(f"spot_{batch_idx}_{b}")
+    
+    # 合并所有数据
+    if len(all_node_embeddings) > 0:
+        node_embeddings = np.vstack(all_node_embeddings)  # [total_spots, hidden_size]
+        coordinates = np.vstack(all_coordinates)  # [total_spots, 2]
+        
+        print(f"✅ 提取完成:")
+        print(f"  - 节点embedding形状: {node_embeddings.shape}")
+        print(f"  - 坐标形状: {coordinates.shape}")
+        print(f"  - spot数量: {len(all_spot_ids)}")
+        print(f"  - 坐标范围: X[{coordinates[:, 0].min():.1f}, {coordinates[:, 0].max():.1f}], Y[{coordinates[:, 1].min():.1f}, {coordinates[:, 1].max():.1f}]")
+        
+        return node_embeddings, coordinates, all_spot_ids
+    else:
+        raise ValueError("未能提取到节点embedding")
+
+def create_anndata_from_node_embeddings(embeddings, coordinates, spot_ids):
+    """从节点embedding创建AnnData对象用于scanpy分析"""
+    # 创建AnnData对象
+    adata = ad.AnnData(X=embeddings)
+    
+    # 添加obs信息
+    adata.obs['spot_id'] = spot_ids
+    adata.obs['x_coord'] = coordinates[:, 0]
+    adata.obs['y_coord'] = coordinates[:, 1]
+    adata.obs_names = [str(sid) for sid in spot_ids]
+    
+    # 添加var信息
+    adata.var_names = [f'node_feature_{i}' for i in range(embeddings.shape[1])]
+    
+    print(f"✅ 创建AnnData对象: {adata.n_obs} spots × {adata.n_vars} features")
+    
+    return adata
+
+def perform_leiden_clustering_on_embeddings(embeddings, coordinates, spot_ids, resolution=0.5, n_neighbors=15, output_dir='clustering_results'):
+    """对节点embedding进行Leiden聚类"""
+    print(f"=== 执行Leiden聚类 (resolution={resolution}, n_neighbors={n_neighbors}) ===")
+    
+    # 创建AnnData对象
+    adata = create_anndata_from_node_embeddings(embeddings, coordinates, spot_ids)
+    
+    # 计算邻居图
+    sc.pp.neighbors(adata, n_neighbors=n_neighbors, use_rep='X')
+    
+    # 进行Leiden聚类
+    sc.tl.leiden(adata, resolution=resolution, key_added='leiden')
+    
+    # 获取聚类结果
+    clusters = adata.obs['leiden'].astype(int)
+    n_clusters = len(np.unique(clusters))
+    
+    print(f"✅ 聚类完成，发现 {n_clusters} 个聚类")
+    print("聚类分布:")
+    cluster_counts = clusters.value_counts().sort_index()
+    for cluster_id, count in cluster_counts.items():
+        print(f"  聚类 {cluster_id}: {count} 个spots")
+    
+    # 保存聚类结果
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # 保存AnnData对象
+    adata_path = os.path.join(output_dir, 'fusion_embeddings_clustered.h5ad')
+    adata.write(adata_path)
+    print(f"✅ AnnData对象已保存: {adata_path}")
+    
+    # 保存CSV格式结果
+    results_df = pd.DataFrame({
+        'spot_id': spot_ids,
+        'x_coord': coordinates[:, 0],
+        'y_coord': coordinates[:, 1],
+        'leiden_cluster': clusters
+    })
+    
+    csv_path = os.path.join(output_dir, 'leiden_clustering_results.csv')
+    results_df.to_csv(csv_path, index=False)
+    print(f"✅ 聚类结果已保存: {csv_path}")
+    
+    return adata
+
+def visualize_clusters_on_tissue(adata, point_size=100, alpha=0.8, output_dir='clustering_results', image_path=None):
+    """在组织图像上可视化聚类结果"""
+    print("=== 生成聚类可视化图像 ===")
+    
+    coordinates = adata.obs[['x_coord', 'y_coord']].values
+    clusters = adata.obs['leiden'].astype(int).values
+    
+    # 获取聚类数量和颜色
+    unique_clusters = np.unique(clusters)
+    n_clusters = len(unique_clusters)
+    
+    # 创建图形
+    if image_path and os.path.exists(image_path):
+        print(f"使用背景图像: {image_path}")
+        image = Image.open(image_path)
+        image_array = np.array(image)
+        
+        fig, ax = plt.subplots(figsize=(16, 12))
+        ax.imshow(image_array)
+        ax.set_xlim(0, image.width)
+        ax.set_ylim(image.height, 0)  # 翻转Y轴
+    else:
+        print("未提供背景图像，使用空白背景")
+        fig, ax = plt.subplots(figsize=(16, 12))
+        ax.set_xlim(coordinates[:, 0].min() - 50, coordinates[:, 0].max() + 50)
+        ax.set_ylim(coordinates[:, 1].min() - 50, coordinates[:, 1].max() + 50)
+    
+    # 使用高对比度颜色
+    if n_clusters <= 10:
+        colors = plt.cm.tab10(np.linspace(0, 1, n_clusters))
+    elif n_clusters <= 20:
+        colors = plt.cm.tab20(np.linspace(0, 1, n_clusters))
+    else:
+        colors = plt.cm.hsv(np.linspace(0, 1, n_clusters))
+    
+    # 绘制每个聚类
+    for i, cluster_id in enumerate(unique_clusters):
+        cluster_mask = clusters == cluster_id
+        cluster_coords = coordinates[cluster_mask]
+        
+        ax.scatter(cluster_coords[:, 0], cluster_coords[:, 1], 
+                  c=[colors[i]], s=point_size, alpha=alpha, 
+                  label=f'Cluster {cluster_id} ({np.sum(cluster_mask)} spots)',
+                  edgecolors='white', linewidth=0.5)
+    
+    # 设置标题和标签
+    ax.set_title(f'Node Embedding Leiden Clustering\n({n_clusters} clusters, {len(coordinates)} spots)', 
+                fontsize=16)
+    ax.axis('off')
+    
+    # 添加图例
+    legend = ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=10)
+    legend.set_frame_on(True)
+    legend.get_frame().set_facecolor('white')
+    legend.get_frame().set_alpha(0.8)
+    
+    # 保存图像
+    plt.tight_layout()
+    cluster_vis_path = os.path.join(output_dir, 'fusion_embedding_leiden_clusters.png')
+    plt.savefig(cluster_vis_path, dpi=300, bbox_inches='tight')
+    print(f"✅ 聚类可视化已保存: {cluster_vis_path}")
+    
+    plt.show()
+    
+    return fig
+
+def plot_cluster_statistics_for_embeddings(adata, output_dir='clustering_results'):
+    """绘制聚类统计信息"""
+    clusters = adata.obs['leiden'].astype(int).values
+    
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+    
+    # 聚类大小分布
+    cluster_counts = pd.Series(clusters).value_counts().sort_index()
+    ax1.bar(cluster_counts.index, cluster_counts.values, alpha=0.7)
+    ax1.set_xlabel('Cluster ID')
+    ax1.set_ylabel('Number of Spots')
+    ax1.set_title('Cluster Size Distribution')
+    ax1.grid(True, alpha=0.3)
+    
+    # 聚类大小饼图
+    ax2.pie(cluster_counts.values, labels=[f'C{i}' for i in cluster_counts.index], 
+           autopct='%1.1f%%', startangle=90)
+    ax2.set_title('Cluster Proportions')
+    
+    plt.tight_layout()
+    stats_path = os.path.join(output_dir, 'cluster_statistics.png')
+    plt.savefig(stats_path, dpi=300, bbox_inches='tight')
+    print(f"✅ 聚类统计图已保存: {stats_path}")
+    
+    plt.show()
+
+def run_clustering_analysis(model_path, data_path, device, bert_model_path, vocab_file, 
+                           resolution=0.5, n_neighbors=15, point_size=100, 
+                           output_dir='clustering_results', image_path=None):
+    """运行完整的聚类分析流程"""
+    print("🔬 开始节点embedding聚类分析...")
+    
+    try:
+        # 1. 提取节点embedding
+        embeddings, coordinates, spot_ids = extract_node_embeddings_for_clustering(
+            model_path, data_path, device, bert_model_path, vocab_file
+        )
+        
+        # 2. 执行聚类
+        adata = perform_leiden_clustering_on_embeddings(
+            embeddings, coordinates, spot_ids, resolution, n_neighbors, output_dir
+        )
+        
+        # 3. 可视化
+        visualize_clusters_on_tissue(
+            adata, point_size, output_dir=output_dir, image_path=image_path
+        )
+        
+        # 4. 统计图
+        plot_cluster_statistics_for_embeddings(adata, output_dir)
+        
+        print(f"✅ 聚类分析完成！结果保存在 {output_dir}")
+        return adata
+        
+    except Exception as e:
+        print(f"❌ 聚类分析失败: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+# ==================== 原有评估模块 ====================
+
 def main():
     args = parse_args()
     
@@ -558,6 +868,38 @@ def main():
     eval_results = evaluate_model(model, dataloader, device, args.output_dir, args.save_detailed, lr_id_mapping, args.attention_threshold, args.filter_no_lr)
     
     print_top_attention_edges(eval_results, top_k=args.top_k_edges)
+    
+    # 如果启用聚类分析，运行聚类流程
+    if args.enable_clustering:
+        print("\n" + "="*60)
+        print("🔬 启动聚类分析...")
+        print("="*60)
+        
+        # 使用第一个NPZ文件作为示例
+        model_path = args.model_checkpoint
+        data_path = args.data_dir
+        
+        # 确定输出目录
+        clustering_output_dir = os.path.join(args.output_dir, 'clustering_results')
+        
+        # 运行聚类分析
+        clustering_result = run_clustering_analysis(
+            model_path=model_path,
+            data_path=data_path,
+            device=device,
+            bert_model_path=args.bert_pretrained_model,
+            vocab_file=args.vocab_file,
+            resolution=args.clustering_resolution,
+            n_neighbors=args.clustering_n_neighbors,
+            point_size=args.clustering_point_size,
+            output_dir=clustering_output_dir,
+            image_path=args.original_image_path
+        )
+        
+        if clustering_result is not None:
+            print("✅ 聚类分析成功完成！")
+        else:
+            print("❌ 聚类分析失败")
     
     print("✅ Evaluation completed!")
 

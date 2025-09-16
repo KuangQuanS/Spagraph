@@ -86,6 +86,18 @@ def process_single_npz(npz_path, save_json=False, neighbors=8, attention_thresho
     knn = kneighbors_graph(coords, n_neighbors=n_neighbors, mode="connectivity", include_self=False)
     # 上面得到一个 (N, N) 形状的稀疏矩阵，也就是KNN邻接矩阵，为1的说明是邻居
     knn_mask = knn.toarray() # toarray() 方法转换为稠密矩阵
+    
+    # 添加物理距离限制：不超过200μm
+    distance_threshold = 200.0  # 200μm
+    for i in range(N):
+        for j in range(N):
+            if knn_mask[i, j] == 1:  # 如果是KNN邻居
+                # 计算欧氏距离
+                dist = np.sqrt((coords[i, 0] - coords[j, 0])**2 + (coords[i, 1] - coords[j, 1])**2)
+                if dist > distance_threshold:  # 如果距离超过200μm
+                    knn_mask[i, j] = 0  # 移除这个连接
+    
+    print(f"📏 Applied distance filter: max {distance_threshold}μm")
     # 注意力得分阈值
     atten_thre = attention_threshold
     comm_event_records = [] # 记录配体受体名字

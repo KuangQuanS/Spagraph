@@ -95,8 +95,6 @@ def evaluate_model(model, dataloader, device, save_dir=None, detailed=False, lr_
     
     with torch.no_grad():
         for batch_idx, batch in enumerate(dataloader):
-            print(f"Processing batch {batch_idx + 1}/{len(dataloader)}")
-            
             # 获取 batch 数据
             input_ids = batch['input_ids'].to(device)
             images = batch['patches'].to(device)
@@ -170,7 +168,7 @@ def evaluate_model(model, dataloader, device, save_dir=None, detailed=False, lr_
             np.savez_compressed(save_path, results=all_results)
             print(f"✅ Detailed results saved to {save_path}")
         
-        visualize_edge_attention(all_results, save_dir, max_edges=50, min_nodes_for_labels=30)
+        create_attention_statistics_plot(all_results, save_dir)
         print(f"✅ Evaluation results saved to {save_dir}")
     
     return all_results
@@ -296,118 +294,6 @@ def save_edge_analysis_csv(results, save_dir, attention_threshold=0.0, filter_no
     
     return df_full, df_filtered if len(filtered_edges_data) > 0 else None
 
-def visualize_edge_attention(results, save_dir, max_edges=50, min_nodes_for_labels=30):
-    """绘制网络图，显示节点和边的注意力权重"""
-    if len(results) == 0:
-        print("⚠️ No results found for visualization")
-        return
-    
-    # 取第一个样本进行可视化
-    result = results[0]
-    if result['edge_attention_analysis'] is None:
-        print("⚠️ No edge attention analysis found for visualization")
-        return
-    
-    # 获取数据
-    edge_analysis = result['edge_attention_analysis']
-    coords = result['coords']
-    spot_ids = result['spot_ids']
-    
-    # 创建网络图
-    G = nx.Graph()
-    
-    # 添加节点
-    for i, spot_id in enumerate(spot_ids):
-        if coords is not None and i < len(coords):
-            pos = (coords[i][0], coords[i][1]) if coords[i].ndim > 0 else (i, 0)
-        else:
-            pos = (i, 0)
-        G.add_node(spot_id, pos=pos)
-    
-    # 添加边，按注意力权重排序，只取Top-K
-    top_k_edges = min(max_edges, len(edge_analysis))  # 限制显示的边数量
-    top_edges = edge_analysis[:top_k_edges]
-    
-    edge_weights = []
-    for edge_info in top_edges:
-        src_spot = edge_info['src_spot_id']
-        tgt_spot = edge_info['tgt_spot_id']
-        weight = edge_info['attention_weight']
-        
-        if src_spot in G.nodes and tgt_spot in G.nodes:
-            G.add_edge(src_spot, tgt_spot, weight=weight)
-            edge_weights.append(weight)
-    
-    if len(edge_weights) == 0:
-        print("⚠️ No valid edges found for visualization")
-        return
-    
-    # 设置图形大小
-    plt.figure(figsize=(16, 12))
-    ax = plt.gca()  # 获取当前axes
-    
-    # 获取节点位置
-    pos = nx.get_node_attributes(G, 'pos')
-    if not pos:  # 如果没有位置信息，使用spring layout
-        pos = nx.spring_layout(G, k=1, iterations=50)
-    
-    # 归一化边权重用于可视化
-    min_weight = min(edge_weights)
-    max_weight = max(edge_weights)
-    
-    # 绘制节点
-    node_sizes = [100] * len(G.nodes())  # 所有节点大小相同
-    nx.draw_networkx_nodes(G, pos, 
-                          node_size=node_sizes,
-                          node_color='lightblue',
-                          alpha=0.8,
-                          edgecolors='black',
-                          linewidths=0.5,
-                          ax=ax)
-    
-    # 绘制边，边的粗细和颜色反映注意力权重
-    edges = G.edges()
-    weights = [G[u][v]['weight'] for u, v in edges]
-    
-    # 归一化权重用于边的粗细
-    normalized_weights = [(w - min_weight) / (max_weight - min_weight) * 5 + 0.5 for w in weights]
-    
-    # 绘制边
-    nx.draw_networkx_edges(G, pos,
-                          width=normalized_weights,
-                          edge_color=weights,
-                          edge_cmap=plt.cm.Reds,
-                          alpha=0.7,
-                          ax=ax)
-    
-    # 添加节点标签（只显示部分以避免拥挤）
-    if len(G.nodes()) <= min_nodes_for_labels:  # 只有节点数量不多时才显示标签
-        labels = {node: str(node)[:8] for node in G.nodes()}  # 截断长标签
-        nx.draw_networkx_labels(G, pos, labels, font_size=8, font_weight='bold', ax=ax)
-    
-    plt.title(f'Attention Network Graph\n(Top-{top_k_edges} edges, Sample: {result["batch_idx"]}_{result["sample_idx"]})', 
-              fontsize=14, fontweight='bold')
-    
-    # 添加颜色条
-    sm = plt.cm.ScalarMappable(cmap=plt.cm.Reds, 
-                              norm=plt.Normalize(vmin=min_weight, vmax=max_weight))
-    sm.set_array([])
-    cbar = plt.colorbar(sm, ax=ax, shrink=0.8)
-    cbar.set_label('Attention Weight', rotation=270, labelpad=15)
-    
-    plt.axis('off')
-    plt.tight_layout()
-    
-    # 保存图像
-    save_path = os.path.join(save_dir, 'attention_network_graph.png')
-    plt.savefig(save_path, dpi=300, bbox_inches='tight')
-    plt.close()
-    
-    print(f"✅ Network graph saved to {save_path}")
-    
-    # 创建第二个图：显示所有样本的统计信息
-    create_attention_statistics_plot(results, save_dir)
-
 def create_attention_statistics_plot(results, save_dir):
     """创建注意力权重的统计图表"""
     all_attention_weights = []
@@ -522,10 +408,17 @@ def extract_node_embeddings_for_clustering(model_path, data_path, device, bert_m
         vit_mlp_dim=1536
     ).to(device)
     
-    checkpoint = torch.load(model_path, map_location=device)
-    model.load_state_dict(checkpoint)
+    checkpoint = torch.load(model_path, map_location=device, weights_only=True)
+    # 使用 strict=False 来兼容不同层数的模型
+    missing_keys, unexpected_keys = model.load_state_dict(checkpoint, strict=False)
+    
+    if missing_keys:
+        print(f"⚠️ Missing keys in clustering model: {len(missing_keys)} parameters not loaded")
+    if unexpected_keys:
+        print(f"⚠️ Unexpected keys in clustering model: {len(unexpected_keys)} parameters ignored")
+    
     model.eval()
-    print(f"✅ 模型加载完成: {model_path}")
+    print(f"✅ 聚类模型加载完成: {model_path}")
     
     # 加载数据
     tokenizer = GeneTokenizer(vocab_file=vocab_file, max_length=max_length)
@@ -557,7 +450,7 @@ def extract_node_embeddings_for_clustering(model_path, data_path, device, bert_m
     
     with torch.no_grad():
         for batch_idx, batch in enumerate(dataloader):
-            print(f"处理batch {batch_idx + 1}/{len(dataloader)}")
+            # print(f"处理batch {batch_idx + 1}/{len(dataloader)}")
             
             # 获取batch数据
             input_ids = batch['input_ids'].to(device)
@@ -837,8 +730,15 @@ def main():
         print(f"✅ Loaded pretrained ViT")
     
     # 加载模型检查点
-    checkpoint = torch.load(args.model_checkpoint, map_location=device)
-    model.load_state_dict(checkpoint)
+    checkpoint = torch.load(args.model_checkpoint, map_location=device, weights_only=True)
+    # 使用 strict=False 来兼容不同层数的模型
+    missing_keys, unexpected_keys = model.load_state_dict(checkpoint, strict=False)
+    
+    if missing_keys:
+        print(f"⚠️ Missing keys: {len(missing_keys)} parameters not loaded")
+    if unexpected_keys:
+        print(f"⚠️ Unexpected keys: {len(unexpected_keys)} parameters ignored (likely from different layer configuration)")
+    
     print(f"✅ Loaded model checkpoint from {args.model_checkpoint}")
     
     # 获取数据文件

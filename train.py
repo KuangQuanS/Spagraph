@@ -25,8 +25,9 @@ def parse_args():
     parser.add_argument('--vit_pretrained_model', type=str, default=None, help='VIT预训练模型路径或名称')
     parser.add_argument('--bert_pretrained_model', type=str, default=None, help='BERT预训练模型路径或名称')
     parser.add_argument('--pre_work', action='store_true',help='是否生成注意力得分以及配体受体')
+    parser.add_argument('--neighbors', type=int, default=8, help='KNN领居数量')
+    parser.add_argument('--attention_threshold', type=float, default=0.0005, help='注意力阈值')
     parser.add_argument('--save_json', action='store_true',help='是否生成注意力得分以及配体受体')
-    parser.add_argument('--contrast_loss', action='store_true',help='是否启用对比学习')
     parser.add_argument('--batch_size', type=int, default=16, help='批次大小')
     parser.add_argument('--epochs', type=int, default=50, help='训练轮数')
     parser.add_argument('--learning_rate', type=float, default=2e-5, help='学习率')
@@ -80,15 +81,16 @@ def train_one_sample(model, batch, optimizer, scheduler, device,
     node_emb2, attn_scores2, attn_logistic2, text_emb, image_emb, fusion_emb = model(input_ids, attention_mask, images, ei2, ea2, coords)
 
     # 计算损失
-    infonce_loss = info_nce_loss(node_emb1, node_emb2)
+    # 1. InfoNCE Loss - 图级别对比学习
+    # 将节点特征聚合为图级别特征 [B, N, D] -> [B, D]
+    graph_emb1 = node_emb1.mean(dim=1)  # 图级别池化
+    graph_emb2 = node_emb2.mean(dim=1)  # 图级别池化
+    infonce_loss = info_nce_loss(graph_emb1, graph_emb2)
 
-    B, N, D = text_emb.shape
-    text_emb_flat = text_emb.reshape(B * N, D)
-    image_emb_flat = image_emb.reshape(B * N, D)
-    logits_per_image = torch.matmul(image_emb_flat, text_emb_flat.T)
-    logits_per_text = logits_per_image.T
-
-    c_loss = clip_loss(logits_per_image, logits_per_text)
+    # 2. CLIP Loss - 节点内模态对齐
+    # 直接传入 [B, N, D] 形状的特征
+    c_loss = clip_loss(text_emb, image_emb)
+    
     loss = lambda_graph * infonce_loss + lambda_clip * c_loss
 
     # 反向传播和优化
@@ -151,7 +153,8 @@ def main():
         for npz_path in npz_files:
             process_single_npz(npz_path, 
                                save_json=args.save_json, 
-                               attention_threshold=0.0004, 
+                               neighbors=args.neighbors,
+                               attention_threshold=args.attention_threshold, 
                                lr_dict=lr_dict,
                                tokenizer=tokenizer, 
                                model=BERT_model, 

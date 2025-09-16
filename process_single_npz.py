@@ -8,7 +8,7 @@ from tqdm import tqdm
 from data_utils import Process_CC_Dataset,create_cc_batch_collate
 from sklearn.neighbors import kneighbors_graph
 
-def process_single_npz(npz_path, save_json=False, attention_threshold=0.2, lr_dict=None, tokenizer=None, model=None, device=None):
+def process_single_npz(npz_path, save_json=False, neighbors=8, attention_threshold=0.2, lr_dict=None, tokenizer=None, model=None, device=None):
     """
     针对单个 npz 样本：
     1. 逐spot跑 BERT 得注意力
@@ -18,6 +18,7 @@ def process_single_npz(npz_path, save_json=False, attention_threshold=0.2, lr_di
     # 1.先建 dataset + dataloader
     lr_dict=lr_dict
     tokenizer=tokenizer
+    n_neighbors=neighbors
     model=model
     device=device
     print(f"Processing {npz_path}...")
@@ -82,7 +83,7 @@ def process_single_npz(npz_path, save_json=False, attention_threshold=0.2, lr_di
     # 3.计算 knn 图 & 通信矩阵
     N = len(spot_ids)
     lr_score_mat = np.zeros((N, N), dtype=np.float32)
-    knn = kneighbors_graph(coords, n_neighbors=10, mode="connectivity", include_self=False)
+    knn = kneighbors_graph(coords, n_neighbors=n_neighbors, mode="connectivity", include_self=False)
     # 上面得到一个 (N, N) 形状的稀疏矩阵，也就是KNN邻接矩阵，为1的说明是邻居
     knn_mask = knn.toarray() # toarray() 方法转换为稠密矩阵
     # 注意力得分阈值

@@ -335,7 +335,7 @@ class ST_COMM(nn.Module):
                  vit_depth=12,
                  vit_heads=12,
                  vit_mlp_dim=3072,
-                 graphormer_layers=3,
+                 graphormer_layers=2,
                  graphormer_heads=4):
         super(ST_COMM, self).__init__()
 
@@ -402,29 +402,57 @@ class ST_COMM(nn.Module):
         
         return node_emb, attn_scores, attn_logistic, text_features, image_features, fusion_emb
 
-def clip_loss(logits_per_image, logits_per_text):
-    labels = torch.arange(logits_per_image.size(0), device=logits_per_image.device)
-    loss_img = F.cross_entropy(logits_per_image, labels)
-    loss_txt = F.cross_entropy(logits_per_text, labels)
-    return (loss_img + loss_txt) / 2
-
-def info_nce_loss(z1, z2, temperature=0.2):
+def clip_loss(text_features, image_features, temperature=0.07):
     """
-    批量计算 InfoNCE loss，避免使用循环
-    z1, z2: Tensor of shape [B, N, D]
+    节点级别的图像-文本对齐损失
+    让每个spot的图像特征和文本特征对齐，不涉及邻居
+    text_features: [B, N, D] - 每个spot的文本特征
+    image_features: [B, N, D] - 每个spot的图像特征
     """
-    B, N, D = z1.size()
-    z1 = F.normalize(z1, dim=-1)  # [B, N, D]
-    z2 = F.normalize(z2, dim=-1)  # [B, N, D]
-
-    # 计算每个 batch 的相似度矩阵
-    sim_matrix = torch.bmm(z1, z2.transpose(1, 2))  # [B, N, N]
-    sim_matrix = sim_matrix / temperature
-
-    # 创建标签：对角线上的元素是正样本
-    labels = torch.arange(N, device=z1.device).unsqueeze(0).expand(B, -1)  # [B, N]
+    B, N, D = text_features.shape
     
-    # 计算每个 batch 的 loss
-    loss = F.cross_entropy(sim_matrix.reshape(B*N, N), labels.reshape(-1))
+    # L2归一化
+    text_features = F.normalize(text_features, dim=-1)  # [B, N, D]
+    image_features = F.normalize(image_features, dim=-1)  # [B, N, D]
     
-    return loss
+    # 计算每个spot内部的相似度（只对齐自己的图像和文本）
+    # 重塑为 [B*N, D] 来批量计算
+    text_flat = text_features.view(B*N, D)  # [B*N, D]
+    image_flat = image_features.view(B*N, D)  # [B*N, D]
+    
+    # 计算相似度矩阵 [B*N, B*N]
+    logits_per_text = torch.matmul(text_flat, image_flat.T) / temperature
+    logits_per_image = logits_per_text.T
+    
+    # 标签：每个spot只与自己对应的模态特征对齐
+    labels = torch.arange(B*N, device=text_features.device)
+    
+    loss_text = F.cross_entropy(logits_per_text, labels)
+    loss_image = F.cross_entropy(logits_per_image, labels)
+    
+    return (loss_text + loss_image) / 2
+
+def info_nce_loss(graph_emb_before, graph_emb_after, temperature=0.2):
+    """
+    图级别的对比学习损失
+    比较图神经网络前后的图级别表示，增强图结构学习
+    graph_emb_before: [B, D] - 图神经网络前的图级别特征
+    graph_emb_after: [B, D] - 图神经网络后的图级别特征
+    """
+    B, D = graph_emb_before.shape
+    
+    # L2归一化
+    z1 = F.normalize(graph_emb_before, dim=-1)  # [B, D]
+    z2 = F.normalize(graph_emb_after, dim=-1)   # [B, D]
+    
+    # 计算相似度矩阵 [B, B]
+    sim_matrix = torch.matmul(z1, z2.T) / temperature
+    
+    # 标签：每个图只与自己的增强版本对齐
+    labels = torch.arange(B, device=z1.device)
+    
+    # 双向损失
+    loss_12 = F.cross_entropy(sim_matrix, labels)
+    loss_21 = F.cross_entropy(sim_matrix.T, labels)
+    
+    return (loss_12 + loss_21) / 2

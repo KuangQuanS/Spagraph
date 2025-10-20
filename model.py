@@ -6,18 +6,56 @@ import networkx as nx
 from transformers import BertModel, BertConfig
 from einops import rearrange, repeat
 from einops.layers.torch import Rearrange
-# -----------------------------------VIT-----------------------------------
-class PreNorm(nn.Module):
-    def __init__(self, dim, fn):
-        super().__init__()
-        self.norm = nn.LayerNorm(dim)
-        self.fn = fn
+import torchvision.models as models
+# -----------------------------------ResNet50-----------------------------------
+class ResNet50Encoder(nn.Module):
+    def __init__(self, input_channels=3, output_dim=384, pretrained=True):
+        super(ResNet50Encoder, self).__init__()
+        
+        # 加载预训练的ResNet50
+        self.resnet = models.resnet50(pretrained=pretrained)
+        
+        # 如果输入通道数不是3，修改第一层
+        if input_channels != 3:
+            self.resnet.conv1 = nn.Conv2d(
+                input_channels, 64, kernel_size=7, stride=2, padding=3, bias=False
+            )
+        
+        # 移除原来的分类层
+        self.resnet.fc = nn.Identity()
+        
+        # 添加适配层，将ResNet的2048维输出映射到指定维度
+        self.adaptor = nn.Sequential(
+            nn.Linear(2048, output_dim),
+            nn.LayerNorm(output_dim),
+            nn.ReLU(),
+            nn.Dropout(0.1)
+        )
+        
+        self.output_dim = output_dim
+        
+    def forward(self, img):
+        """
+        img: [B, N, C, H, W] - 批次中每个样本有N个图像
+        返回: [B, N, output_dim] - 每个图像的特征表示
+        """
+        B, N, C, H, W = img.shape
+        
+        # 重塑为 [B*N, C, H, W] 以便批量处理
+        img = img.view(B * N, C, H, W)
+        
+        # 通过ResNet提取特征
+        features = self.resnet(img)  # [B*N, 2048]
+        
+        # 通过适配层
+        features = self.adaptor(features)  # [B*N, output_dim]
+        
+        # 重塑回 [B, N, output_dim]
+        features = features.view(B, N, self.output_dim)
+        
+        return features
 
-    def forward(self, *args, **kwargs):
-        args = list(args)
-        args[0] = self.norm(args[0])
-        return self.fn(*args, **kwargs)
-
+# -----------------------------------保留的辅助类-----------------------------------
 class FeedForward(nn.Module):
     def __init__(self, dim, hidden_dim, dropout = 0.):
         super().__init__()
@@ -30,86 +68,6 @@ class FeedForward(nn.Module):
         )
     def forward(self, x):
         return self.net(x)
-
-class Attention(nn.Module):
-    def __init__(self, dim, heads = 8, dim_head = 64, dropout = 0.):
-        super().__init__()
-        inner_dim = dim_head * heads
-        self.heads = heads
-        self.scale = dim_head ** -0.5
-        self.attend = nn.Softmax(dim = -1)
-        self.dropout = nn.Dropout(dropout)
-        self.to_qkv = nn.Linear(dim, inner_dim * 3, bias = False)
-        self.to_out = nn.Sequential(
-            nn.Linear(inner_dim, dim),
-            nn.Dropout(dropout)
-        )
-
-    def forward(self, x):
-        qkv = self.to_qkv(x).chunk(3, dim = -1)
-        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h = self.heads), qkv)
-        dots = torch.matmul(q, k.transpose(-1, -2)) * self.scale
-        attn = self.attend(dots)
-        attn = self.dropout(attn)
-        out = torch.matmul(attn, v)
-        out = rearrange(out, 'b h n d -> b n (h d)')
-        return self.to_out(out)
-
-class Transformer(nn.Module):
-    def __init__(self, dim, depth, heads, dim_head, mlp_dim, dropout = 0.):
-        super().__init__()
-        self.layers = nn.ModuleList([])
-        for _ in range(depth):
-            self.layers.append(nn.ModuleList([
-                PreNorm(dim, Attention(dim, heads = heads, dim_head = dim_head, dropout = dropout)),
-                PreNorm(dim, FeedForward(dim, mlp_dim, dropout = dropout))
-            ]))
-    def forward(self, x):
-        for attn, ff in self.layers:
-            x = attn(x) + x
-            x = ff(x) + x
-        return x
-
-class ViT(nn.Module):
-    def __init__(self, *, image_size=32, patch_size=4, num_classes=None, dim=384, depth=12, 
-                 heads=12, mlp_dim=1536, channels=3, dim_head=64, dropout=0., emb_dropout=0.):
-        super().__init__()
-        image_height, image_width = (image_size, image_size)
-        patch_height, patch_width = (patch_size, patch_size)
-        
-        assert image_height % patch_height == 0 and image_width % patch_width == 0
-
-        num_patches = (image_height // patch_height) * (image_width // patch_width)
-        patch_dim = channels * patch_height * patch_width
-
-        self.to_patch_embedding = nn.Sequential(
-            Rearrange('b c (h p1) (w p2) -> b (h w) (p1 p2 c)', 
-                     p1=patch_height, p2=patch_width),
-            nn.LayerNorm(patch_dim),
-            nn.Linear(patch_dim, dim),
-            nn.LayerNorm(dim),
-        )
-
-        self.pos_embedding = nn.Parameter(torch.randn(1, num_patches + 1, dim))
-        self.cls_token = nn.Parameter(torch.randn(1, 1, dim))
-        self.dropout = nn.Dropout(emb_dropout)
-        self.transformer = Transformer(dim, depth, heads, dim_head, mlp_dim, dropout)
-
-    def forward(self, img):
-        B, N, C, H, W = img.shape  # B=16, N=11, C=3, H=W=32
-        img = img.view(B * N, C, H, W)
-        x = self.to_patch_embedding(img)
-        b, n, _ = x.shape
-
-        cls_tokens = repeat(self.cls_token, '1 1 d -> b 1 d', b = b)
-        x = torch.cat((cls_tokens, x), dim=1)
-        x += self.pos_embedding[:, :(n + 1)]
-        x = self.dropout(x)
-
-        x = self.transformer(x)
-        x = x[:, 0]   
-        x = x.view(B, N, -1) 
-        return x
 
 # -----------------------------------BERT-----------------------------------
 class BERTEncoder(nn.Module):
@@ -329,12 +287,8 @@ class ST_COMM(nn.Module):
                  intermediate_size=3072,
                  hidden_dropout_prob=0.1,
                  max_position_embeddings=1024,
-                 image_size=32,
-                 patch_size=4,
                  image_channels=3,
-                 vit_depth=12,
-                 vit_heads=12,
-                 vit_mlp_dim=3072,
+                 resnet_pretrained=True,
                  graphormer_layers=2,
                  graphormer_heads=4):
         super(ST_COMM, self).__init__()
@@ -349,17 +303,11 @@ class ST_COMM(nn.Module):
                 hidden_dropout_prob=hidden_dropout_prob,
                 max_position_embeddings=max_position_embeddings)
 
-        # ==== 2) ViT编码器 (图像 patch) ====
-        self.vit = ViT(
-            image_size=image_size,
-            patch_size=patch_size,
-            dim=hidden_size,
-            depth=vit_depth,
-            heads=vit_heads,
-            mlp_dim=vit_mlp_dim,
-            channels=image_channels,
-            dropout=hidden_dropout_prob,
-            emb_dropout=hidden_dropout_prob
+        # ==== 2) ResNet50编码器 (图像特征提取) ====
+        self.resnet = ResNet50Encoder(
+            input_channels=image_channels,
+            output_dim=hidden_size,
+            pretrained=resnet_pretrained
         )
 
         # ==== 3) 多模态融合 (Cross-Attention + CLS Concat) ====
@@ -385,12 +333,15 @@ class ST_COMM(nn.Module):
         # ==== Step 1: BERT编码 ====
         text_features = self.bert(input_ids, attention_mask)
         # text_features shape: torch.Size([16, 11, 384])
-        # ==== Step 2: ViT编码 ====
-        image_features = self.vit(images)
+        
+        # ==== Step 2: ResNet50编码 ====
+        image_features = self.resnet(images)
         # image_features shape: torch.Size([16, 11, 384])
+        
         # ==== Step 3: Cross-Attention + 融合 ====
         fusion_emb = self.fusion_module(text_features, image_features)
         # fusion_emb shape: torch.Size([16, 11, 384])
+        
         # ==== Step 4: Graphormer 编码图结构 ====
         node_emb, attn_scores, attn_logistic = self.graphormer(
             fusion_emb,

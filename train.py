@@ -22,7 +22,7 @@ def parse_args():
     parser.add_argument('--data_dir', type=str, required=True, help='数据目录路径')
     parser.add_argument('--vocab_file', type=str, required=True, help='词汇表文件路径')
     parser.add_argument('--output_dir', type=str, required=True, help='输出目录路径')
-    parser.add_argument('--vit_pretrained_model', type=str, default=None, help='VIT预训练模型路径或名称')
+    parser.add_argument('--resnet_pretrained', action='store_true', default=True, help='是否使用预训练的ResNet50')
     parser.add_argument('--bert_pretrained_model', type=str, default=None, help='BERT预训练模型路径或名称')
     parser.add_argument('--pre_work', action='store_true',help='是否生成注意力得分以及配体受体')
     parser.add_argument('--neighbors', type=int, default=8, help='KNN领居数量')
@@ -167,22 +167,14 @@ def main():
     # graphormer需要输入节点特征（node features）：融合embedding
     # 边信息（edge list / edge features）：edge_index用通讯得分矩阵，edge_features用score和ligand-receptor id
     # 位置编码、结构编码（如 shortest path distance）:坐标
-    model = ST_COMM(bert_model=args.bert_pretrained_model, vit_depth=6, vit_heads=6, hidden_size=384, vit_mlp_dim=1536).to(device)
+    model = ST_COMM(bert_model=args.bert_pretrained_model, hidden_size=384, resnet_pretrained=args.resnet_pretrained).to(device)
     print(f"✅ Loaded pretrained BERT from {args.bert_pretrained_model}")
 
-    # 加载 ViT 预训练权重
-    vit_ckpt = torch.load(args.vit_pretrained_model, map_location=device, weights_only=True)
-
-    new_vit_ckpt = {}
-    prefix_to_remove = 'vit.'
-    # 遍历加载的 state_dict，移除前缀
-    for key, value in vit_ckpt.items():
-        if key.startswith(prefix_to_remove):
-            new_key = key.removeprefix(prefix_to_remove)
-            new_vit_ckpt[new_key] = value
-
-    model.vit.load_state_dict(new_vit_ckpt)
-    print(f"✅ Loaded pretrained ViT from {args.vit_pretrained_model}")
+    # ResNet50 已经在模型初始化时加载了预训练权重
+    if args.resnet_pretrained:
+        print(f"✅ 使用预训练的ResNet50权重")
+    else:
+        print(f"⚠️  使用随机初始化的ResNet50权重")
 
     # 冻结 BERT 前 4 层，只微调后面2层
     for name, param in model.bert.named_parameters():
@@ -191,14 +183,15 @@ def main():
             param.requires_grad = False
 
 
-    # 冻结 ViT 前 4 层
-    for p in model.vit.to_patch_embedding.parameters():
-        p.requires_grad = False
+    param.requires_grad = False
 
-    for i, block in enumerate(model.vit.transformer.layers):
-        if i < 4 :
-            for p in block.parameters():
-                p.requires_grad = False
+    # 冻结 ResNet50 的前几层
+    for name, param in model.resnet.named_parameters():
+        # 冻结除了最后的适配层之外的所有层
+        if "adaptor" not in name:
+            param.requires_grad = False
+    
+    print(f"🔒 冻结了BERT前4层和ResNet50的backbone层")
 
     optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=args.learning_rate, weight_decay=args.weight_decay)
     scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-6)

@@ -197,17 +197,20 @@ class GATDeconvolution:
         return self.celltype_expressions
     
     def build_gat_model(self, n_cell_types: int, gat_hidden_dim=64, gat_layers=3, 
-                       gat_heads=4, dropout=0.1, loss_alpha=1.0, loss_beta=0.1):
+                       gat_heads=4, dropout=0.1, loss_lambda_pearson=1.0,
+                       loss_lambda_cosine=1.0, loss_lambda_align=1.0, 
+                       loss_lambda_reg=0.5, loss_lambda_sparse=0.01):
         """构建GAT解卷积模型"""
         print("build gat model")
         print(f"hidden dim: {gat_hidden_dim}")
         print(f"layers: {gat_layers}")
         print(f"attention heads: {gat_heads}")
         print(f"Dropout: {dropout}")
-        print(f"loss: α={loss_alpha}, β={loss_beta}")
+        print(f"loss: λ_pearson={loss_lambda_pearson}, λ_cosine={loss_lambda_cosine}, "
+              f"λ_align={loss_lambda_align}, λ_reg={loss_lambda_reg}, λ_sparse={loss_lambda_sparse}")
         
         self.gat_model = HeterogeneousGATDeconvolution(
-            embedding_dim=128,  # VAE embedding维度
+            embedding_dim=128,
             n_cell_types=n_cell_types,
             gat_hidden_dim=gat_hidden_dim,
             gat_layers=gat_layers,
@@ -217,7 +220,13 @@ class GATDeconvolution:
             similarity_threshold=self.similarity_threshold
         ).to(self.device)
         
-        self.loss_fn = SpatialDeconvolutionLoss(alpha=loss_alpha, beta=loss_beta)
+        self.loss_fn = SpatialDeconvolutionLoss(
+            lambda_pearson=loss_lambda_pearson,
+            lambda_cosine=loss_lambda_cosine,
+            lambda_align=loss_lambda_align,
+            lambda_reg=loss_lambda_reg,
+            lambda_sparse=loss_lambda_sparse
+        )
         
         gat_params = sum(p.numel() for p in self.gat_model.parameters())
         print(f"参数量: {gat_params:,}")
@@ -230,18 +239,21 @@ class GATDeconvolution:
         
         epoch_losses = {
             'total_loss': 0.0,
-            'pcc_loss': 0.0,
-            'cos_loss': 0.0,
+            'pearson_loss': 0.0,
+            'cosine_loss': 0.0,
+            'alignment_loss': 0.0,
             'weight_reg': 0.0,
-            'sparsity_reg': 0.0
+            'sparsity_loss': 0.0,
+            'pearson_corr': 0.0,
+            'cos_sim_rec': 0.0
         }
         
         num_batches = len(dataloader)
         
         for batch_idx, batch in enumerate(dataloader):
             # 提取批数据
-            batch_st_data = batch['expression'].to(self.device)  # [batch_size, n_genes]
-            batch_spatial_coords = batch['coords'].to(self.device)  # [batch_size, 2]
+            batch_st_data = batch['expression'].to(self.device)
+            batch_spatial_coords = batch['coords'].to(self.device)
             
             # 计算spot embeddings
             with torch.no_grad():
@@ -257,10 +269,11 @@ class GATDeconvolution:
             
             # 计算损失
             loss_outputs = self.loss_fn(
-                deconv_weights=gat_outputs['deconv_weights'],        # 解卷积权重（归一化后）
-                attention_scores=gat_outputs['attention_scores'],    # 原始分数（用于正则化）
-                celltype_expressions=self.celltype_expressions,
-                target_expressions=batch_st_data
+                attention_weights=gat_outputs['deconv_weights'],
+                celltype_expression=self.celltype_expressions,
+                true_spot_expression=batch_st_data,
+                spot_embedding=gat_outputs['spot_features'],
+                celltype_embedding=gat_outputs['celltype_features']
             )
             
             # 反向传播
@@ -270,7 +283,8 @@ class GATDeconvolution:
             
             # 累积损失
             for key in epoch_losses.keys():
-                epoch_losses[key] += loss_outputs[key].item()
+                if key in loss_outputs:
+                    epoch_losses[key] += loss_outputs[key].item()
         
         # 计算平均损失
         for key in epoch_losses.keys():
@@ -324,23 +338,23 @@ class GATDeconvolution:
             # 记录平均损失
             avg_total_loss = epoch_losses['total_loss']
             train_losses.append(avg_total_loss)
-            pcc_losses.append(epoch_losses['pcc_loss'])
-            cos_losses.append(epoch_losses['cos_loss'])
+            pcc_losses.append(epoch_losses['pearson_loss'])
+            cos_losses.append(epoch_losses['cosine_loss'])
             weight_regs.append(epoch_losses['weight_reg'])
-            sparsity_regs.append(epoch_losses['sparsity_reg'])
+            sparsity_regs.append(epoch_losses.get('sparsity_loss', 0.0))
             
             # 学习率调度
             scheduler.step(avg_total_loss)
             
             # 打印进度
             if (epoch + 1) % 5 == 0:
-                wr = epoch_losses['weight_reg']
-                sr = epoch_losses['sparsity_reg']
                 print(f"Epoch {epoch+1:3d}: Total Loss={avg_total_loss:.4f}, "
-                      f"PCC Loss={epoch_losses['pcc_loss']:.4f}, "
-                      f"Cos Loss={epoch_losses['cos_loss']:.4f}, "
-                      f"Weight Reg={wr:8.4f}, "
-                      f"Sparsity Reg={sr:8.4f}")
+                      f"Pearson={epoch_losses['pearson_loss']:.4f}, "
+                      f"Cosine={epoch_losses['cosine_loss']:.4f}, "
+                      f"Align={epoch_losses['alignment_loss']:.4f}, "
+                      f"WReg={epoch_losses['weight_reg']:.4f}, "
+                      f"Sparse={epoch_losses['sparsity_loss']:.4f} "
+                      f"(PCC={epoch_losses['pearson_corr']:.4f}, CosSim={epoch_losses['cos_sim_rec']:.4f})")
             
             # 保存最佳模型
             if avg_total_loss < best_loss:
@@ -517,10 +531,16 @@ def main():
                        help='批次大小')
     
     # 损失函数参数
-    parser.add_argument('--loss_alpha', type=float, default=1.0,
-                       help='重建损失权重')
-    parser.add_argument('--loss_beta', type=float, default=0.1,
-                       help='注意力损失权重')
+    parser.add_argument('--loss_lambda_pearson', type=float, default=1.0,
+                       help='Pearson相关系数损失权重')
+    parser.add_argument('--loss_lambda_cosine', type=float, default=1.0,
+                       help='Cosine相似度损失权重')
+    parser.add_argument('--loss_lambda_align', type=float, default=1.0,
+                       help='模态对齐损失权重')
+    parser.add_argument('--loss_lambda_reg', type=float, default=0.5,
+                       help='权重正则化权重')
+    parser.add_argument('--loss_lambda_sparse', type=float, default=0.01,
+                       help='稀疏性正则化权重（Shannon熵）')
     
     # 设备参数
     parser.add_argument('--device', type=str, default=None,
@@ -610,8 +630,11 @@ def main():
         gat_layers=args.gat_layers,
         gat_heads=args.gat_heads,
         dropout=args.dropout,
-        loss_alpha=args.loss_alpha,
-        loss_beta=args.loss_beta
+        loss_lambda_pearson=args.loss_lambda_pearson,
+        loss_lambda_cosine=args.loss_lambda_cosine,
+        loss_lambda_align=args.loss_lambda_align,
+        loss_lambda_reg=args.loss_lambda_reg,
+        loss_lambda_sparse=args.loss_lambda_sparse
     )
     
     # 开始训练

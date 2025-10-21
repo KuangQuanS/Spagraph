@@ -329,78 +329,99 @@ class HeterogeneousGATDeconvolution(nn.Module):
 # ================================
 
 class SpatialDeconvolutionLoss(nn.Module):
-    """空间解卷积损失函数"""
+    """空间解卷积损失函数
     
-    def __init__(self, alpha=1.0, beta=0.1):
+    L_total = λ_pearson·L_pearson + λ_cosine·L_cosine + λ_align·L_align + λ_reg·L_reg + λ_sparse·L_sparse
+    
+    其中：
+    - L_pearson: Pearson相关系数损失（基因表达相似性）
+    - L_cosine: Cosine相似度损失（基因表达相似性）
+    - L_align: Cosine Alignment模态对齐损失（embedding空间）
+    - L_reg: 权重正则化
+    - L_sparse: 稀疏性正则化
+    """
+    
+    def __init__(self, lambda_pearson=1.0, lambda_cosine=1.0, lambda_align=1.0, 
+                 lambda_reg=0.5, lambda_sparse=0.01):
         super().__init__()
-        self.alpha = alpha  # 重建损失权重
-        self.beta = beta   # 正则化权重
+        self.lambda_pearson = lambda_pearson  # Pearson损失权重
+        self.lambda_cosine = lambda_cosine    # Cosine损失权重
+        self.lambda_align = lambda_align      # 模态对齐权重
+        self.lambda_reg = lambda_reg          # 权重正则化权重
+        self.lambda_sparse = lambda_sparse    # 稀疏性正则化权重
         
     def forward(self, 
-               deconv_weights: torch.Tensor,
-               attention_scores: torch.Tensor,
-               celltype_expressions: torch.Tensor,
-               target_expressions: torch.Tensor) -> Dict[str, torch.Tensor]:
+               attention_weights: torch.Tensor,
+               celltype_expression: torch.Tensor,
+               true_spot_expression: torch.Tensor,
+               spot_embedding: torch.Tensor = None,
+               celltype_embedding: torch.Tensor = None) -> Dict[str, torch.Tensor]:
         """
-        简化的解卷积损失函数 - 遵循SpatialGCN原理
+        计算总损失
         
         Args:
-            deconv_weights: 解卷积权重 [n_spots, n_cell_types] (已softmax归一化)
-            attention_scores: 原始注意力分数 [n_spots, n_cell_types] (用于正则化)  
-            celltype_expressions: 细胞类型表达谱 [n_cell_types, n_genes]
-            target_expressions: 目标spot表达 [n_spots, n_genes]
+            attention_weights: 注意力权重 [n_spots, n_cell_types]（已softmax）
+            celltype_expression: 细胞类型表达 [n_cell_types, n_genes]
+            true_spot_expression: 真实spot表达 [n_spots, n_genes]
+            spot_embedding: spot embedding [n_spots, embedding_dim]（可选）
+            celltype_embedding: 细胞类型embedding [n_cell_types, embedding_dim]（可选）
             
         Returns:
             损失字典
         """
-        # 1. 核心解卷积重建: X̂_spot = P × X_celltype
-        reconstructed_expressions = torch.mm(deconv_weights, celltype_expressions)  # [n_spots, n_genes]
+        n_spots = attention_weights.shape[0]
         
-        # 2. 相关性损失（PCC - Pearson相关系数）
-        def pearson_correlation_loss(pred, target):
-            """计算Pearson相关系数损失"""
-            # 沿基因维度计算每个spot的相关性
-            pred_centered = pred - pred.mean(dim=1, keepdim=True)
-            target_centered = target - target.mean(dim=1, keepdim=True)
+        # 计算重建的spot表达
+        reconstructed_spot = torch.matmul(attention_weights, celltype_expression)  # [n_spots, n_genes]
+        
+        # ============ 1. Pearson Correlation Loss ============
+        # Pearson相关系数（衡量线性相关性）
+        pred_centered = reconstructed_spot - reconstructed_spot.mean(dim=1, keepdim=True)
+        target_centered = true_spot_expression - true_spot_expression.mean(dim=1, keepdim=True)
+        numerator = (pred_centered * target_centered).sum(dim=1)
+        denominator = torch.sqrt((pred_centered**2).sum(dim=1) * (target_centered**2).sum(dim=1) + 1e-8)
+        pearson_corr = numerator / denominator
+        L_pearson = 1.0 - pearson_corr.mean()
+        
+        # ============ 2. Cosine Similarity Loss ============
+        # Cosine相似度（越接近1越好）
+        cos_sim_rec = F.cosine_similarity(reconstructed_spot, true_spot_expression, dim=-1)
+        L_cosine = 1.0 - cos_sim_rec.mean()
+        
+        # ============ 3. Cosine Alignment Loss（可选） ============
+        L_align = torch.tensor(0.0, device=attention_weights.device)
+        
+        if spot_embedding is not None and celltype_embedding is not None:
+            # 计算重建的spot embedding
+            recon_embedding = torch.matmul(attention_weights, celltype_embedding)  # [n_spots, embedding_dim]
             
-            numerator = (pred_centered * target_centered).sum(dim=1)
-            pred_std = pred_centered.pow(2).sum(dim=1).sqrt()
-            target_std = target_centered.pow(2).sum(dim=1).sqrt()
-            
-            correlation = numerator / (pred_std * target_std + 1e-8)
-            return 1.0 - correlation.mean()  # 最大化相关性 = 最小化 1-correlation
+            # Cosine相似度
+            cos_sim_align = F.cosine_similarity(spot_embedding, recon_embedding, dim=-1)
+            L_align = 1.0 - cos_sim_align.mean()
         
-        pcc_loss = pearson_correlation_loss(reconstructed_expressions, target_expressions)
+        # ============ 4. Weight Regularization Loss ============
+        # 确保权重和为1（softmax已保证，但作为额外约束）
+        weight_sum_loss = F.mse_loss(attention_weights.sum(dim=1), 
+                                     torch.ones(n_spots, device=attention_weights.device))
         
-        # 4. 余弦相似度损失
-        def cosine_similarity_loss(pred, target):
-            """计算余弦相似度损失"""
-            pred_norm = F.normalize(pred, p=2, dim=1)
-            target_norm = F.normalize(target, p=2, dim=1)
-            cos_sim = (pred_norm * target_norm).sum(dim=1).mean()
-            return 1.0 - cos_sim  # 最大化相似度 = 最小化 1-similarity
+        # ============ 5. Sparsity Regularization Loss ============
+        # 鼓励稀疏的注意力分布
+        sparsity_loss = -torch.mean(attention_weights * torch.log(attention_weights + 1e-8))
         
-        cos_loss = cosine_similarity_loss(reconstructed_expressions, target_expressions)
-        
-        # 5. 权重正则化（确保权重和为1，虽然softmax已保证）
-        weight_reg = F.mse_loss(deconv_weights.sum(dim=1), 
-                               torch.ones(deconv_weights.shape[0], device=deconv_weights.device))
-        
-        # 6. 稀疏性正则化（鼓励稀疏的细胞类型分布）
-        sparsity_reg = torch.mean(deconv_weights * torch.log(deconv_weights + 1e-8))
-        
-        # 总损失：只使用PCC + CosSim，去掉MSE
-        total_loss = (self.alpha * pcc_loss +           # PCC损失（主要）
-                     self.alpha * cos_loss +            # 余弦相似度损失（主要）
-                     self.beta * weight_reg +           # 权重正则化
-                     0.01 * (-sparsity_reg))            # 稀疏性正则化
+        # ============ 总损失 ============
+        total_loss = (self.lambda_pearson * L_pearson +
+                     self.lambda_cosine * L_cosine +
+                     self.lambda_align * L_align +
+                     self.lambda_reg * weight_sum_loss +
+                     self.lambda_sparse * sparsity_loss)
         
         return {
             'total_loss': total_loss,
-            'pcc_loss': pcc_loss,
-            'cos_loss': cos_loss,
-            'weight_reg': weight_reg,
-            'sparsity_reg': sparsity_reg,
-            'reconstructed_expressions': reconstructed_expressions,
-            'deconv_weights': deconv_weights
+            'pearson_loss': L_pearson,
+            'cosine_loss': L_cosine,
+            'alignment_loss': L_align,
+            'weight_reg': weight_sum_loss,
+            'sparsity_loss': sparsity_loss,
+            'pearson_corr': pearson_corr.mean(),
+            'cos_sim_rec': cos_sim_rec.mean(),
         }

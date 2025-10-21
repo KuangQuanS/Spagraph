@@ -21,42 +21,66 @@ warnings.filterwarnings('ignore')
 # 导入统一的模型定义
 from model import VAE, vae_loss_function
 
-def compute_top_marker_genes(adata, top_n=100, min_fold_change=1.5, min_pct=0.25):
+def compute_clusters_and_marker_genes(adata, top_n=100, min_fold_change=1.5, resolution=0.5, save_path=None):
     """
-    计算每个细胞类型的top marker基因
+    计算聚类并提取每个cluster的top marker基因
     """
-    print(f"计算每个细胞类型的top {top_n} marker基因...")
+    print(f"🔍 进行聚类分析...")
     
     # 备份原始数据
     adata_backup = adata.copy()
     
-    # 标准化用于差异表达分析
+    # 预处理：标准化和主成分分析
     sc.pp.normalize_total(adata, target_sum=1e4)
     sc.pp.log1p(adata)
+    sc.pp.highly_variable_genes(adata, min_mean=0.0125, max_mean=3, min_disp=0.5)
+    adata.raw = adata
+    adata = adata[:, adata.var.highly_variable]
     
-    # 计算差异表达基因
+    # 主成分分析
+    sc.pp.scale(adata, max_value=10)
+    sc.tl.pca(adata, svd_solver='arpack')
+    
+    # 构建邻接图
+    sc.pp.neighbors(adata, n_neighbors=10, n_pcs=40)
+    
+    # Leiden聚类
+    sc.tl.leiden(adata, resolution=resolution)
+    
+    print(f"📊 聚类结果: {len(adata.obs['leiden'].unique())} 个clusters")
+    for cluster in sorted(adata.obs['leiden'].unique()):
+        count = (adata.obs['leiden'] == cluster).sum()
+        print(f"   Cluster {cluster}: {count} 细胞")
+    
+    # 恢复到原始基因集进行marker分析
+    adata_full = adata_backup.copy()
+    sc.pp.normalize_total(adata_full, target_sum=1e4)
+    sc.pp.log1p(adata_full)
+    
+    # 将聚类结果转移到完整数据
+    adata_full.obs['leiden'] = adata.obs['leiden'].copy()
+    
+    # 计算每个cluster的marker基因
     sc.tl.rank_genes_groups(
-        adata, 
-        'cell_type', 
+        adata_full, 
+        'leiden', 
         method='wilcoxon',
         key_added='rank_genes_groups',
-        n_genes=top_n * 2  # 计算更多基因以便筛选
+        n_genes=top_n * 2
     )
     
     # 提取marker基因
     marker_genes = set()
-    result = adata.uns['rank_genes_groups']
+    result = adata_full.uns['rank_genes_groups']
     
-    print(f"各细胞类型marker基因:")
-    for cell_type in adata.obs['cell_type'].unique():
-        if cell_type in result['names'].dtype.names:
-            # 获取基因名、分数和p值
-            genes = result['names'][cell_type]
-            scores = result['scores'][cell_type]
-            pvals = result['pvals_adj'][cell_type]
-            logfoldchanges = result['logfoldchanges'][cell_type]
+    print(f"🧬 各cluster的marker基因:")
+    for cluster in sorted(adata_full.obs['leiden'].unique()):
+        if cluster in result['names'].dtype.names:
+            genes = result['names'][cluster]
+            scores = result['scores'][cluster]
+            pvals = result['pvals_adj'][cluster]
+            logfoldchanges = result['logfoldchanges'][cluster]
             
-            # 筛选显著且高表达的基因
             selected_genes = []
             for i in range(len(genes)):
                 if (pvals[i] < 0.05 and 
@@ -68,15 +92,12 @@ def compute_top_marker_genes(adata, top_n=100, min_fold_change=1.5, min_pct=0.25
                     break
             
             marker_genes.update(selected_genes)
-            print(f"{cell_type}: {len(selected_genes)} 个基因")
+            print(f"   Cluster {cluster}: {len(selected_genes)} 个基因")
     
-    print(f"总计: {len(marker_genes)} 个marker基因")
+    print(f"🎯 总计: {len(marker_genes)} 个marker基因")
     
-    # 恢复原始数据
-    adata.X = adata_backup.X
-    adata.var = adata_backup.var
-    
-    return sorted(list(marker_genes))
+    # 返回聚类信息和marker基因
+    return sorted(list(marker_genes)), adata_full.obs['leiden'].copy()
 
 #--------------------------主模块-----------------------------
 class coEncoder:
@@ -135,7 +156,7 @@ class coEncoder:
                 st_adata.obs['sample'] = sample
                 st_adata.obs['modality'] = 'ST'
                 
-                print(f" SC: {sc_adata.shape}, 细胞类型: {len(sc_adata.obs['cell_type'].unique())}")
+                print(f" SC: {sc_adata.shape}")
                 print(f" ST: {st_adata.shape}")
                 
                 sc_data_list.append(sc_adata)
@@ -144,31 +165,42 @@ class coEncoder:
             else:
                 print(f" 未找到完整数据: {sample}")
         
-        # 合并SC数据
+        # 合并SC数据 - 使用inner join确保只保留所有样本共有的基因
         print(f"   合并 {len(sc_data_list)} 个SC样本...")
-        combined_sc = ad.concat(sc_data_list, axis=0, join='outer', 
+        combined_sc = ad.concat(sc_data_list, axis=0, join='inner', 
                                 keys=valid_samples, index_unique='-')
         
-        # 合并ST数据
+        # 合并ST数据 - 使用inner join确保只保留所有样本共有的基因  
         print(f"   合并 {len(st_data_list)} 个ST样本...")
-        combined_st = ad.concat(st_data_list, axis=0, join='outer', 
+        combined_st = ad.concat(st_data_list, axis=0, join='inner', 
                                 keys=valid_samples, index_unique='-')
         
         print(f"   SC总计: {combined_sc.shape}")
         print(f"   ST总计: {combined_st.shape}")
-        print(f"   细胞类型: {combined_sc.obs['cell_type'].unique()}")
+        # print(f"   细胞类型: {combined_sc.obs['cell_type'].unique()}")  # 将使用聚类代替
         
         return combined_sc, combined_st, valid_samples
 
     def prepare_marker_gene_data(self, sc_adata: ad.AnnData, st_adata: ad.AnnData, 
-                               top_n_per_type: int = 100) -> Tuple:
+                               top_n_per_type: int = 100, resolution: float = 0.5) -> Tuple:
         """基于marker基因准备训练数据"""
 
-        # 1. 计算marker基因
-        self.marker_genes = compute_top_marker_genes(sc_adata.copy(), top_n=top_n_per_type)
+        # 1. 计算聚类和marker基因  
+        print("📋 计算聚类和marker基因...")
+        cluster_save_path = f"{self.output_dir}/marker_genes.txt"
+        self.marker_genes, sc_clusters = compute_clusters_and_marker_genes(
+            sc_adata.copy(), 
+            top_n=top_n_per_type, 
+            resolution=resolution,
+            save_path=cluster_save_path
+        )
         
-        # 2. 处理SC数据 (normalized)
-        print("处理SC数据 (normalized)...")
+        # 保存聚类信息和分辨率
+        self.sc_clusters = sc_clusters
+        self.resolution = resolution
+        
+        # 2. 处理SC数据 (提取marker基因后标准化)
+        print("📋 处理SC数据...")
         sc_subset = sc_adata[:, sc_adata.var.index.isin(self.marker_genes)].copy()
         
         # SC标准化
@@ -176,59 +208,50 @@ class coEncoder:
         sc.pp.log1p(sc_subset)
         
         sc_X = sc_subset.X.toarray() if hasattr(sc_subset.X, 'toarray') else sc_subset.X
-        sc_labels = sc_subset.obs['cell_type'].values
+        sc_labels = sc_clusters.values  # 使用聚类标签
         
         # 编码标签
         self.label_encoder = LabelEncoder()
         sc_y = self.label_encoder.fit_transform(sc_labels)
         
-        print(f"SC数据: {sc_X.shape}")
-        print(f"细胞类型: {len(self.label_encoder.classes_)}")
+        print(f"   SC数据: {sc_X.shape}")
+        print(f"   聚类数: {len(self.label_encoder.classes_)} 个")
         
-        # 3. 处理ST数据 (counts)
-        print("   处理ST数据 (counts)...")
-        # 提取marker基因
+        # 3. 处理ST数据
+        print("📋 处理ST数据...")
         available_genes = [g for g in self.marker_genes if g in st_adata.var.index]
         st_subset = st_adata[:, available_genes].copy()
         
-        # ST使用原始counts
+        sc.pp.log1p(st_subset)
         st_X = st_subset.X.toarray() if hasattr(st_subset.X, 'toarray') else st_subset.X
         
-        print(f"ST数据: {st_X.shape}, 可用基因: {len(available_genes)}/{len(self.marker_genes)}")
+        print(f"   ST数据: {st_X.shape}, 可用基因: {len(available_genes)}/{len(self.marker_genes)}")
         
         # 4. 确保SC和ST特征维度一致
-        # 取SC和ST共有的marker基因
         final_genes = [g for g in self.marker_genes 
                       if g in sc_subset.var.index and g in st_subset.var.index]
         
-        # 获取基因索引并对齐数据（注意要基于已筛选的数据）
         sc_gene_indices = [list(sc_subset.var.index).index(g) for g in final_genes]
         st_gene_indices = [list(st_subset.var.index).index(g) for g in final_genes]
         
-        # 对齐数据到共有基因
         sc_X_final = sc_X[:, sc_gene_indices]
         st_X_final = st_X[:, st_gene_indices]
         
-        print(f"   最终特征维度: {len(final_genes)}")
-        print(f"   SC最终: {sc_X_final.shape}")
-        print(f"   ST最终: {st_X_final.shape}")
+        print(f"   最终基因数: {len(final_genes)}")
         
-        # 5. 合并SC和ST数据进行训练
-        # 分割SC数据
+        # 5. 分割数据
         sc_train, sc_test, y_train, y_test = train_test_split(
             sc_X_final, sc_y, test_size=0.2, stratify=sc_y, random_state=42
         )
         
-        # 分割ST数据 (ST数据没有标签，所以不需要stratify)
         st_train, st_test = train_test_split(
             st_X_final, test_size=0.2, random_state=42
         )
         
-        # 合并训练集和测试集
+        # 6. 合并训练集和测试集
         train_X = np.vstack([sc_train, st_train])
         test_X = np.vstack([sc_test, st_test])
         
-        # 创建模态标签 (0=SC, 1=ST)
         train_modality = np.concatenate([
             np.zeros(len(sc_train)), 
             np.ones(len(st_train))
@@ -244,11 +267,10 @@ class coEncoder:
         
         # 保存基因列表
         self.genes = final_genes
-        genes_file = f"{self.output_dir}/marker_genes.txt"
+        genes_file = f"{self.output_dir}/final_genes.txt"
         with open(genes_file, 'w') as f:
             for gene in self.genes:
                 f.write(f"{gene}\n")
-        print(f"Marker基因已保存: {genes_file} ({len(self.genes)}个基因)")
 
         return train_X, test_X, train_modality, test_modality, y_train, y_test
     
@@ -363,7 +385,7 @@ class coEncoder:
                 # 保存最佳模型
                 if test_loss < best_loss:
                     best_loss = test_loss
-                    self.save_vae(f"{self.output_dir}/best_vae.pth")
+                    # 这里不保存best_vae.pth，等到聚类中心计算完后再保存
                     patience_counter = 0
                 else:
                     patience_counter += 1
@@ -439,13 +461,32 @@ class coEncoder:
     
     def save_vae(self, filepath):
         """保存VAE模型"""
+        # 检查聚类信息是否存在
+        cluster_prototypes = getattr(self, 'cluster_prototypes', None)
+        cluster_expressions = getattr(self, 'cluster_expressions', None)
+        
+        print(f"💾 保存模型到: {filepath}")
+        if cluster_prototypes is not None:
+            print(f"   ✅ 包含聚类中心: {len(cluster_prototypes)} 个聚类")
+        else:
+            print(f"   ⚠️  缺少聚类中心")
+            
+        if cluster_expressions is not None:
+            print(f"   ✅ 包含聚类表达谱: {len(cluster_expressions)} 个聚类")
+        else:
+            print(f"   ⚠️  缺少聚类表达谱")
+        
         torch.save({
             'vae_state_dict': self.vae.state_dict(),
             'label_encoder': self.label_encoder,
             'marker_genes': self.marker_genes,
             'genes': self.genes,
             'input_dim': len(self.genes),
-            'latent_dim': self.vae.latent_dim
+            'latent_dim': self.vae.latent_dim,
+            'sc_clusters': getattr(self, 'sc_clusters', None),  # 保存聚类信息
+            'resolution': getattr(self, 'resolution', 0.5),    # 保存分辨率参数
+            'cluster_prototypes': cluster_prototypes,  # 保存聚类中心
+            'cluster_expressions': cluster_expressions  # 保存聚类表达谱
         }, filepath)
     
     def load_vae(self, filepath):
@@ -464,7 +505,7 @@ class coEncoder:
         
         print(f"📂 VAE模型已加载: {filepath}")
     
-    def run_stage1_training(self, top_n_per_type=100, batch_size=256, n_epochs=100, 
+    def run_stage1_training(self, top_n_per_type=100, resolution=0.5, batch_size=256, n_epochs=100, 
                            lr=1e-3, beta=1.0, hidden_dims=[512, 256], latent_dim=128):
         """运行第一阶段VAE训练"""
         print("开始第一阶段训练: VAE (SC + ST, Marker基因)")
@@ -484,7 +525,7 @@ class coEncoder:
         
         # 2. 基于marker基因准备数据
         train_X, test_X, train_modality, test_modality, y_train, y_test = self.prepare_marker_gene_data(
-            sc_adata, st_adata, top_n_per_type=top_n_per_type
+            sc_adata, st_adata, top_n_per_type=top_n_per_type, resolution=resolution
         )
         
         # 3. 构建VAE
@@ -495,16 +536,73 @@ class coEncoder:
         best_loss = self.train_vae(train_X, test_X, train_modality, test_modality,
                                   batch_size=batch_size, n_epochs=n_epochs, lr=lr, beta=beta)
         
-        # 5. 保存最终模型
+        # 保存训练数据以便计算聚类中心
+        self.train_X = train_X
+        self.train_modality = train_modality  
+        self.y_train = y_train
+        
+        # 5. 计算并保存聚类中心
+        print("🔄 计算聚类中心...")
+        
+        # 使用训练数据计算聚类中心（这些数据已经过marker基因筛选和标准化）
+        # 获取SC训练数据部分
+        sc_train_mask = train_modality == 0  # SC数据的mask
+        sc_train_data = train_X[sc_train_mask]  # SC训练数据
+        sc_train_labels = y_train  # SC训练标签
+        
+        print(f"   用于计算聚类中心的SC数据: {sc_train_data.shape}")
+        print(f"   聚类数: {len(np.unique(sc_train_labels))}")
+        
+        # 使用训练好的VAE计算embeddings
+        self.vae.eval()
+        with torch.no_grad():
+            # 分批处理以避免内存问题
+            batch_size = 1000
+            all_embeddings = []
+            
+            for i in range(0, len(sc_train_data), batch_size):
+                batch_data = sc_train_data[i:i+batch_size]
+                batch_tensor = torch.FloatTensor(batch_data).to(self.device)
+                
+                # 获取潜在表示
+                mu, log_var = self.vae.encoder(batch_tensor)
+                all_embeddings.append(mu.cpu().numpy())
+            
+            embeddings = np.vstack(all_embeddings)
+        
+        # 计算每个聚类的中心和表达谱
+        cluster_prototypes = {}
+        cluster_expressions = {}
+        
+        for cluster_id in np.unique(sc_train_labels):
+            cluster_mask = sc_train_labels == cluster_id
+            cluster_cells = np.sum(cluster_mask)
+            
+            # 计算聚类中心（潜在空间）
+            cluster_center = np.mean(embeddings[cluster_mask], axis=0)
+            cluster_prototypes[cluster_id] = cluster_center
+            
+            # 计算聚类表达谱（原始空间）
+            cluster_expression = np.mean(sc_train_data[cluster_mask], axis=0)
+            cluster_expressions[cluster_id] = cluster_expression
+            
+            print(f"     Cluster {cluster_id}: {cluster_cells} cells")
+        
+        # 保存聚类中心和表达谱
+        self.cluster_prototypes = cluster_prototypes
+        self.cluster_expressions = cluster_expressions
+        print(f"   ✅ 计算完成: {len(cluster_prototypes)} 个聚类中心和表达谱")
+        
+        # 6. 保存最终模型
         self.save_vae(f"{self.output_dir}/final_vae.pth")
         
         return {
             'best_loss': best_loss,
             'n_genes': len(self.genes),
-            'n_cell_types': len(self.label_encoder.classes_),
+            'n_clusters': len(self.label_encoder.classes_),
             'model_path': f"{self.output_dir}/final_vae.pth",
             'samples': samples,
-            'cell_types': list(self.label_encoder.classes_)
+            'clusters': list(self.label_encoder.classes_)
         }
 
 def main():
@@ -520,7 +618,9 @@ def main():
     
     # 模型参数
     parser.add_argument('--top_n_per_type', type=int, default=100,
-                       help='每个细胞类型的marker基因数')
+                       help='每个聚类的marker基因数')
+    parser.add_argument('--resolution', type=float, default=0.5,
+                       help='Leiden聚类分辨率')
     parser.add_argument('--hidden_dims', type=int, nargs='+', default=[512, 256],
                        help='VAE隐藏层维度')
     parser.add_argument('--latent_dim', type=int, default=128,
@@ -553,6 +653,7 @@ def main():
     # 运行第一阶段VAE训练
     results = co_encoder.run_stage1_training(
         top_n_per_type=args.top_n_per_type,
+        resolution=args.resolution,
         batch_size=args.batch_size,
         n_epochs=args.n_epochs,
         lr=args.lr,

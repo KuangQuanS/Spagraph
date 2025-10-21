@@ -66,8 +66,8 @@ class GATDeconvolution:
         self.celltype_expressions = None
         
         # 图构建参数（将在训练时设置）
-        self.k_spatial = 6
-        self.similarity_threshold = 0.1
+        self.k_spatial = 20
+        self.similarity_threshold = 0.4
         
     def load_vae_encoder(self):
         """加载第一阶段VAE组件"""
@@ -91,9 +91,49 @@ class GATDeconvolution:
         self.label_encoder = checkpoint['label_encoder']
         self.marker_genes = checkpoint['marker_genes']
         self.genes = checkpoint['genes']
+        self.sc_clusters = checkpoint.get('sc_clusters', None)  # 加载聚类信息
+        self.resolution = checkpoint.get('resolution', 0.5)     # 加载分辨率
+        
+        # 加载聚类中心
+        cluster_prototypes = checkpoint.get('cluster_prototypes', None)
+        if cluster_prototypes is not None:
+            # 转换为tensor格式
+            prototype_list = []
+            for i in range(len(self.label_encoder.classes_)):
+                cluster_id = i  # 使用索引i而不是类名
+                if cluster_id in cluster_prototypes:
+                    prototype_list.append(cluster_prototypes[cluster_id])
+                else:
+                    print(f"⚠️  缺少聚类 {cluster_id} 的中心，使用零向量")
+                    prototype_list.append(np.zeros(latent_dim))
+            
+            self.celltype_prototypes = torch.FloatTensor(np.array(prototype_list)).to(self.device)
+            print(f"✅ 加载预训练聚类中心: {self.celltype_prototypes.shape}")
+        else:
+            self.celltype_prototypes = None
+            print("⚠️  未找到预训练聚类中心，将重新计算")
+        
+        # 加载聚类表达谱
+        cluster_expressions = checkpoint.get('cluster_expressions', None)
+        if cluster_expressions is not None:
+            # 转换为tensor格式
+            expression_list = []
+            for i in range(len(self.label_encoder.classes_)):
+                cluster_id = i  # 使用索引i而不是类名
+                if cluster_id in cluster_expressions:
+                    expression_list.append(cluster_expressions[cluster_id])
+                else:
+                    print(f"⚠️  缺少聚类 {cluster_id} 的表达谱，使用零向量")
+                    expression_list.append(np.zeros(input_dim))
+            
+            self.celltype_expressions = torch.FloatTensor(np.array(expression_list)).to(self.device)
+            print(f"✅ 加载预训练聚类表达谱: {self.celltype_expressions.shape}")
+        else:
+            self.celltype_expressions = None
+            print("⚠️  未找到预训练聚类表达谱，将重新计算")
         
         print(f"VAE Encoder加载成功: {input_dim} -> {latent_dim}")
-        print(f"细胞类型: {list(self.label_encoder.classes_)}")
+        print(f"细胞聚类: {list(self.label_encoder.classes_)}")
         print(f"Marker基因数: {len(self.genes)}")
         
         # 冻结encoder参数
@@ -102,7 +142,7 @@ class GATDeconvolution:
     
     def compute_celltype_embedding(self, sc_data: np.ndarray, sc_labels: np.ndarray) -> torch.Tensor:
         """计算每个细胞类型的平均embedding"""
-        print("计算细胞类型embedding")
+        print("计算聚类embedding")
 
         # 转换为tensor
         sc_tensor = torch.FloatTensor(sc_data).to(self.device)
@@ -113,46 +153,46 @@ class GATDeconvolution:
             # 使用均值作为embedding
             sc_embeddings = mu
         
-        # 计算每个细胞类型的平均embedding
+        # 计算每个聚类的平均embedding
         prototypes = []
-        cell_types = self.label_encoder.classes_
+        clusters = self.label_encoder.classes_
         
-        for i, cell_type in enumerate(cell_types):
-            # 找到该细胞类型的所有细胞
+        for i, cluster in enumerate(clusters):
+            # 找到该聚类的所有细胞
             cell_mask = (sc_labels == i)
             if cell_mask.sum() > 0:
                 cell_embeddings = sc_embeddings[cell_mask]
                 prototype = cell_embeddings.mean(dim=0)
                 prototypes.append(prototype)
                 
-                print(f"{cell_type}: {cell_mask.sum()}  cells")
+                print(f"Cluster {cluster}: {cell_mask.sum()} cells")
         
-        self.celltype_prototypes = torch.stack(prototypes)  # [n_cell_types, embedding_dim]
+        self.celltype_prototypes = torch.stack(prototypes)  # [n_clusters, embedding_dim]
         
-        print(f" celltype embeddings: {self.celltype_prototypes.shape}")
+        print(f"聚类embeddings: {self.celltype_prototypes.shape}")
         
         return self.celltype_prototypes
     
     def compute_celltype_expressions(self, sc_data: np.ndarray, sc_labels: np.ndarray) -> torch.Tensor:
         """计算每个细胞类型的平均表达谱 """
-        print("计算细胞类型表达谱")
+        print("计算聚类表达谱")
         
-        cell_types = self.label_encoder.classes_
-        celltype_expressions = []
+        clusters = self.label_encoder.classes_
+        cluster_expressions = []
         
-        for i, cell_type in enumerate(cell_types):
-            # 找到该细胞类型的所有细胞
+        for i, cluster in enumerate(clusters):
+            # 找到该聚类的所有细胞
             cell_mask = (sc_labels == i)
             if cell_mask.sum() > 0:
-                cell_expression = sc_data[cell_mask].mean(axis=0)
-                celltype_expressions.append(cell_expression)
+                cluster_expression = sc_data[cell_mask].mean(axis=0)
+                cluster_expressions.append(cluster_expression)
                 
-        celltype_expressions = torch.FloatTensor(np.array(celltype_expressions)).to(self.device)
+        cluster_expressions = torch.FloatTensor(np.array(cluster_expressions)).to(self.device)
         
         # 存储在trainer中，与celltype_prototypes保持一致
-        self.celltype_expressions = celltype_expressions
+        self.celltype_expressions = cluster_expressions
         
-        print(f"celltype expression: {celltype_expressions.shape}")
+        print(f"聚类表达谱: {cluster_expressions.shape}")
         
         return self.celltype_expressions
     
@@ -190,7 +230,6 @@ class GATDeconvolution:
         
         epoch_losses = {
             'total_loss': 0.0,
-            'mse_loss': 0.0,
             'pcc_loss': 0.0,
             'cos_loss': 0.0,
             'weight_reg': 0.0,
@@ -266,7 +305,6 @@ class GATDeconvolution:
         
         # 训练历史
         train_losses = []
-        mse_losses = []
         pcc_losses = []
         cos_losses = []
         weight_regs = []
@@ -274,7 +312,7 @@ class GATDeconvolution:
         
         best_loss = float('inf')
         patience_counter = 0
-        patience = 10
+        patience = 50
         
         for epoch in range(n_epochs):
             # 训练一个epoch
@@ -286,7 +324,6 @@ class GATDeconvolution:
             # 记录平均损失
             avg_total_loss = epoch_losses['total_loss']
             train_losses.append(avg_total_loss)
-            mse_losses.append(epoch_losses['mse_loss'])
             pcc_losses.append(epoch_losses['pcc_loss'])
             cos_losses.append(epoch_losses['cos_loss'])
             weight_regs.append(epoch_losses['weight_reg'])
@@ -297,12 +334,13 @@ class GATDeconvolution:
             
             # 打印进度
             if (epoch + 1) % 5 == 0:
+                wr = epoch_losses['weight_reg']
+                sr = epoch_losses['sparsity_reg']
                 print(f"Epoch {epoch+1:3d}: Total Loss={avg_total_loss:.4f}, "
-                      f"MSE Loss={epoch_losses['mse_loss']:.4f}, "
                       f"PCC Loss={epoch_losses['pcc_loss']:.4f}, "
                       f"Cos Loss={epoch_losses['cos_loss']:.4f}, "
-                      f"Weight Reg={epoch_losses['weight_reg']:.4f}, "
-                      f"Sparsity Reg={epoch_losses['sparsity_reg']:.4f}")
+                      f"Weight Reg={wr:8.4f}, "
+                      f"Sparsity Reg={sr:8.4f}")
             
             # 保存最佳模型
             if avg_total_loss < best_loss:
@@ -318,7 +356,7 @@ class GATDeconvolution:
                 break
         
         # 绘制训练曲线
-        self.plot_training_curves(train_losses, mse_losses, pcc_losses, cos_losses, weight_regs, sparsity_regs, sample_name)
+        self.plot_training_curves(train_losses, pcc_losses, cos_losses, weight_regs, sparsity_regs, sample_name)
         
         # 保存最终模型
         self.save_model(f"{self.output_dir}/final_gat_model.pth")
@@ -361,9 +399,9 @@ class GATDeconvolution:
         
         # 保存结果
         results = {
-            'deconv_weights': deconv_weights,        # 解卷积权重（归一化后的细胞类型比例）
+            'deconv_weights': deconv_weights,        # 解卷积权重（归一化后的聚类比例）
             'attention_scores': attention_scores,    # 原始注意力分数
-            'cell_types': list(self.label_encoder.classes_),
+            'clusters': list(self.label_encoder.classes_),
             'sample_name': sample_name
         }
         
@@ -373,18 +411,18 @@ class GATDeconvolution:
         print(f"   💾 结果已保存: {results_file}")
         
         # 打印统计信息
-        print(f"   📈 解卷积权重统计 (细胞类型比例):")
-        for i, cell_type in enumerate(self.label_encoder.classes_):
+        print(f"   📈 解卷积权重统计 (聚类比例):")
+        for i, cluster in enumerate(self.label_encoder.classes_):
             weight_mean = deconv_weights[:, i].mean()
             weight_std = deconv_weights[:, i].std()
-            print(f"     {cell_type}: {weight_mean:.3f} ± {weight_std:.3f}")
+            print(f"     Cluster {cluster}: {weight_mean:.3f} ± {weight_std:.3f}")
         
         # 验证权重和是否为1
         weight_sums = deconv_weights.sum(axis=1)
         print(f"   🔍 解卷积权重和验证:")
         print(f"     权重和: {weight_sums.mean():.6f} ± {weight_sums.std():.6f} (应该等于1.0)")
     
-    def plot_training_curves(self, train_losses, mse_losses, pcc_losses, cos_losses, weight_regs, sparsity_regs, sample_name):
+    def plot_training_curves(self, train_losses, pcc_losses, cos_losses, weight_regs, sparsity_regs, sample_name):
         """绘制训练曲线"""
         fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(15, 10))
         
@@ -397,8 +435,7 @@ class GATDeconvolution:
         ax1.set_ylabel('Loss')
         ax1.grid(True)
         
-        # 重建损失（MSE + PCC + Cosine）
-        ax2.plot(epochs, mse_losses, 'g-', label='MSE')
+        # 重建损失（PCC + Cosine）
         ax2.plot(epochs, pcc_losses, 'orange', label='PCC')
         ax2.plot(epochs, cos_losses, 'red', label='Cosine')
         ax2.set_title('Reconstruction Losses')
@@ -443,10 +480,8 @@ def main():
     parser = argparse.ArgumentParser(description='Stage 2: GAT Deconvolution for Spatial Transcriptomics')
     # 模型和数据参数
     parser.add_argument('--stage1_model_path', type=str, 
-                       default="./stage1_results/best_vae.pth",
+                       default="./stage1_results/final_vae.pth",
                        help='第一阶段VAE模型路径')
-    parser.add_argument('--sc_file', type=str, required=True,
-                       help='单细胞数据文件路径 (.h5ad)')
     parser.add_argument('--st_file', type=str, required=True,
                        help='空间转录组数据文件路径 (.h5ad)')
     parser.add_argument('--output_dir', type=str, 
@@ -462,6 +497,10 @@ def main():
                        help='GAT注意力头数')
     parser.add_argument('--dropout', type=float, default=0.1,
                        help='Dropout率')
+    
+    # 聚类参数
+    parser.add_argument('--resolution', type=float, default=0.5,
+                       help='Leiden聚类分辨率')
     
     # 图构建参数
     parser.add_argument('--k_spatial', type=int, default=6,
@@ -490,8 +529,6 @@ def main():
     args = parser.parse_args()
     
     # 验证输入文件
-    if not os.path.exists(args.sc_file):
-        raise FileNotFoundError(f"❌ SC数据文件不存在: {args.sc_file}")
     if not os.path.exists(args.st_file):
         raise FileNotFoundError(f"❌ ST数据文件不存在: {args.st_file}")
     
@@ -517,28 +554,27 @@ def main():
     trainer.load_vae_encoder()
     print("=" * 60)
 
-    # 加载SC数据
-    print(f"加载SC数据: {args.sc_file}")
-    sc_adata = sc.read_h5ad(args.sc_file)
-    print(f"SC数据: {sc_adata.shape}, 细胞类型: {len(sc_adata.obs['cell_type'].unique())}")
+    # ✅ 第二阶段不需要加载SC数据
+    # 所有聚类信息（中心、表达谱、编码器）已在stage1中计算并保存
+    print("🔍 直接使用第一阶段的聚类中心和表达谱...")
     
-    # 提取SC marker基因数据
-    sc_subset = sc_adata[:, trainer.genes].copy()
-
-    # SC标准化（与第一阶段一致）
-    sc.pp.normalize_total(sc_subset, target_sum=1e4)
-    sc.pp.log1p(sc_subset)
+    if trainer.sc_clusters is None:
+        raise ValueError("❌ 第一阶段模型缺少聚类信息！请确保使用新版本训练的模型。")
     
-    sc_X = sc_subset.X.toarray() if hasattr(sc_subset.X, 'toarray') else sc_subset.X
-    sc_labels = sc_subset.obs['cell_type'].values
+    print(f"✅ 加载了 {len(trainer.label_encoder.classes_)} 个聚类")
+    print("=" * 60)
     
-    # 编码标签
-    sc_y = trainer.label_encoder.transform(sc_labels)
-    print(f"SC预处理完成: {sc_X.shape}")
+    # 检查是否已有预训练的聚类数据
+    has_prototypes = hasattr(trainer, 'celltype_prototypes') and trainer.celltype_prototypes is not None
+    has_expressions = hasattr(trainer, 'celltype_expressions') and trainer.celltype_expressions is not None
     
-    # 计算细胞类型原型和表达谱
-    trainer.compute_celltype_embedding(sc_X, sc_y)
-    trainer.compute_celltype_expressions(sc_X, sc_y)
+    if has_prototypes and has_expressions:
+        print("✅ 使用第一阶段预训练的聚类数据")
+        print(f"   聚类中心: {trainer.celltype_prototypes.shape}")
+        print(f"   聚类表达谱: {trainer.celltype_expressions.shape}")
+        n_clusters = trainer.celltype_prototypes.shape[0]
+    else:
+        raise ValueError("❌ 第一阶段模型缺少聚类中心或表达谱！")
     
     print("=" * 60)
     print("加载和处理空间转录组数据...")
@@ -553,9 +589,10 @@ def main():
     
     # 提取ST marker基因数据
     st_subset = st_adata[:, trainer.genes].copy()
-    print(f"ST匹配基因: {len(trainer.genes)}/{len(trainer.genes)} (100%)")
+    print(f"ST匹配基因: {len(trainer.genes)}/{len(trainer.genes)}")
     
     # 提取ST数据（使用原始counts）
+    sc.pp.log1p(st_subset)
     st_X = st_subset.X.toarray() if hasattr(st_subset.X, 'toarray') else st_subset.X
     
     # 提取空间坐标（不添加偏移，单样本训练）
@@ -565,12 +602,10 @@ def main():
   
     
     # 构建GAT模型和损失函数
-    n_cell_types = len(trainer.label_encoder.classes_)
     print("=" * 60)
-    print(f"构建GAT解卷积模型 (细胞类型数: {n_cell_types})...")
-
+    print(f"构建GAT解卷积模型 (聚类数: {n_clusters})...")
     trainer.build_gat_model(
-        n_cell_types=n_cell_types,
+        n_cell_types=n_clusters,
         gat_hidden_dim=args.gat_hidden_dim,
         gat_layers=args.gat_layers,
         gat_heads=args.gat_heads,

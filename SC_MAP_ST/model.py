@@ -356,10 +356,7 @@ class SpatialDeconvolutionLoss(nn.Module):
         # 1. 核心解卷积重建: X̂_spot = P × X_celltype
         reconstructed_expressions = torch.mm(deconv_weights, celltype_expressions)  # [n_spots, n_genes]
         
-        # 2. 主要重建损失（MSE）
-        mse_loss = F.mse_loss(reconstructed_expressions, target_expressions)
-        
-        # 3. 相关性损失（PCC - Pearson相关系数）
+        # 2. 相关性损失（PCC - Pearson相关系数）
         def pearson_correlation_loss(pred, target):
             """计算Pearson相关系数损失"""
             # 沿基因维度计算每个spot的相关性
@@ -392,16 +389,14 @@ class SpatialDeconvolutionLoss(nn.Module):
         # 6. 稀疏性正则化（鼓励稀疏的细胞类型分布）
         sparsity_reg = torch.mean(deconv_weights * torch.log(deconv_weights + 1e-8))
         
-        # 总损失：重建 + 相关性 + 稀疏性
-        total_loss = (self.alpha * mse_loss +           # MSE重建损失
-                     0.3 * pcc_loss +                   # PCC损失  
-                     0.2 * cos_loss +                   # 余弦相似度损失
-                     0.1 * weight_reg +                 # 权重正则化
+        # 总损失：只使用PCC + CosSim，去掉MSE
+        total_loss = (self.alpha * pcc_loss +           # PCC损失（主要）
+                     self.alpha * cos_loss +            # 余弦相似度损失（主要）
+                     self.beta * weight_reg +           # 权重正则化
                      0.01 * (-sparsity_reg))            # 稀疏性正则化
         
         return {
             'total_loss': total_loss,
-            'mse_loss': mse_loss,
             'pcc_loss': pcc_loss,
             'cos_loss': cos_loss,
             'weight_reg': weight_reg,

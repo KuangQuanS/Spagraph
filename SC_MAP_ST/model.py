@@ -136,7 +136,7 @@ def vae_loss_function(recon_x, x, mu, log_var, beta=1.0):
 class HeterogeneousGATDeconvolution(nn.Module):
     """异构图注意力网络解卷积模型"""
     def __init__(self, embedding_dim=128,n_cell_types=9,gat_hidden_dim=64,gat_layers=3,gat_heads=4,
-                 dropout=0.1,k_spatial=6,similarity_threshold=0.1):
+                 dropout=0.1,k_spatial=6,k_celltype=10):
         super().__init__()
         
         self.embedding_dim = embedding_dim
@@ -145,7 +145,7 @@ class HeterogeneousGATDeconvolution(nn.Module):
         self.gat_layers = gat_layers
         self.gat_heads = gat_heads
         self.k_spatial = k_spatial
-        self.similarity_threshold = similarity_threshold
+        self.k_celltype = k_celltype  # 每个spot连接最近的k个celltype
         
         # 1. 节点嵌入层
         # Spot节点：从VAE embedding到GAT输入
@@ -246,26 +246,33 @@ class HeterogeneousGATDeconvolution(nn.Module):
                     edge_indices.append([neighbor_idx, i])
                     edge_attrs.append([weight])
         
-        # 2.2 Spot-CellType边（基于余弦相似度）
+        # 2.2 Spot-CellType边（基于KNN，每个spot连接k个最近的celltype）
         # 计算spot与celltype原型的余弦相似度
         spot_emb_np = spot_embeddings.detach().cpu().numpy()
         celltype_emb_np = celltype_prototypes.detach().cpu().numpy()
         
         similarity_matrix = cosine_similarity(spot_emb_np, celltype_emb_np)  # [n_spots, n_cell_types]
         
+        # 对于每个spot，找到最相似的k个celltype
+        k_neighbors = min(self.k_celltype, n_cell_types)  # 防止k超过celltype数量
+        
         for spot_idx in range(n_spots):
-            for celltype_idx in range(n_cell_types):
-                similarity = similarity_matrix[spot_idx, celltype_idx]
+            # 获取该spot与所有celltype的相似度
+            similarities = similarity_matrix[spot_idx]
+            
+            # 找到最大的k个相似度的索引
+            top_k_indices = np.argsort(-similarities)[:k_neighbors]
+            
+            for celltype_idx in top_k_indices:
+                similarity = similarities[celltype_idx]
                 
-                # 只连接相似度超过阈值的边
-                if similarity > self.similarity_threshold:
-                    # Spot -> CellType
-                    edge_indices.append([spot_idx, n_spots + celltype_idx])
-                    edge_attrs.append([similarity])
-                    
-                    # CellType -> Spot
-                    edge_indices.append([n_spots + celltype_idx, spot_idx])
-                    edge_attrs.append([similarity])
+                # Spot -> CellType
+                edge_indices.append([spot_idx, n_spots + celltype_idx])
+                edge_attrs.append([similarity])
+                
+                # CellType -> Spot
+                edge_indices.append([n_spots + celltype_idx, spot_idx])
+                edge_attrs.append([similarity])
         
         # 转换为tensor
         if len(edge_indices) > 0:

@@ -18,11 +18,11 @@ import argparse
 import warnings
 warnings.filterwarnings('ignore')
 
-# 导入统一的模型定义
+# Import unified model definitions
 from model import VAE, HeterogeneousGATDeconvolution, SpatialDeconvolutionLoss
 
 class SpatialDataset(Dataset):
-    """空间转录组数据集"""
+    """Spatial transcriptomics dataset"""
     def __init__(self, st_data, spatial_coords, spot_ids):
         self.st_data = torch.FloatTensor(st_data)
         self.spatial_coords = torch.FloatTensor(spatial_coords)
@@ -39,24 +39,24 @@ class SpatialDataset(Dataset):
         }
 
 class GATDeconvolution:
-    """第二阶段GAT解卷积训练器"""
+    """Stage 2 GAT deconvolution trainer"""
     def __init__(self, stage1_model_path: str, output_dir: str = "./stage2_results/", device: str = None):
 
         self.stage1_model_path = stage1_model_path
         self.output_dir = output_dir
         os.makedirs(output_dir, exist_ok=True)
         
-        # 设备
+        # Device
         if device is None:
             self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         else:
             self.device = torch.device(device)
         
-        print(f"  第一阶段模型: {stage1_model_path}")
-        print(f"   输出目录: {output_dir}")
-        print(f"   设备: {self.device}")
+        print(f"Stage 1 model: {stage1_model_path}")
+        print(f"Output directory: {output_dir}")
+        print(f"Device: {self.device}")
     
-        # 模型组件
+        # Model components
         self.vae_encoder = None
         self.gat_model = None
         self.loss_fn = None
@@ -65,72 +65,102 @@ class GATDeconvolution:
         self.celltype_prototypes = None
         self.celltype_expressions = None
         
-        # 图构建参数（将在训练时设置）
+        # Graph building parameters (will be set during training)
         self.k_spatial = 20
-        self.similarity_threshold = 0.4
+        self.k_celltype = 10  # Connect each spot to k nearest cell types
         
     def load_vae_encoder(self):
-        """加载第一阶段VAE组件"""
-        print("loading pretrain VAE Encoder")
+        """Load Stage 1 VAE components"""
+        print("Loading pretrained VAE Encoder...")
         
         checkpoint = torch.load(self.stage1_model_path, map_location=self.device)
         
-        # 重建VAE
+        # Rebuild VAE
         input_dim = checkpoint['input_dim']
         latent_dim = checkpoint['latent_dim']
         
-        # 只使用encoder部分
+        # Only use the encoder part
         full_vae = VAE(input_dim=input_dim, latent_dim=latent_dim).to(self.device)
         full_vae.load_state_dict(checkpoint['vae_state_dict'])
         
-        # 提取encoder
+        # Extract encoder
         self.vae_encoder = full_vae.encoder
-        self.vae_encoder.eval()  # 冻结encoder
+        self.vae_encoder.eval()  # Freeze encoder
         
-        # 其他信息
+        # Other information
         self.label_encoder = checkpoint['label_encoder']
         self.marker_genes = checkpoint['marker_genes']
         self.genes = checkpoint['genes']
-        self.sc_clusters = checkpoint.get('sc_clusters', None)  # 加载聚类信息
-        self.resolution = checkpoint.get('resolution', 0.5)     # 加载分辨率
+        self.sc_clusters = checkpoint.get('sc_clusters', None)  # Load clustering info
+        self.resolution = checkpoint.get('resolution', 0.5)     # Load resolution
         
-        # 加载聚类中心
+        # Load cluster centers
         cluster_prototypes = checkpoint.get('cluster_prototypes', None)
         if cluster_prototypes is not None:
-            # 转换为tensor格式
+            # Convert to tensor format
             prototype_list = []
             for i in range(len(self.label_encoder.classes_)):
-                cluster_id = i  # 使用索引i而不是类名
+                cluster_id = i  # Use index instead of name
                 if cluster_id in cluster_prototypes:
                     prototype_list.append(cluster_prototypes[cluster_id])
                 else:
-                    print(f"⚠️  缺少聚类 {cluster_id} 的中心，使用零向量")
+                    print(f"Warning: Missing cluster {cluster_id} center, using zero vector")
                     prototype_list.append(np.zeros(latent_dim))
             
             self.celltype_prototypes = torch.FloatTensor(np.array(prototype_list)).to(self.device)
-            print(f"✅ 加载预训练聚类中心: {self.celltype_prototypes.shape}")
+            print(f"Loaded pretrained cluster centers: {self.celltype_prototypes.shape}")
         else:
             self.celltype_prototypes = None
-            print("⚠️  未找到预训练聚类中心，将重新计算")
+            print("Warning: Pretrained cluster centers not found, will recompute")
         
-        # 加载聚类表达谱
+        # Load cluster expression profiles
         cluster_expressions = checkpoint.get('cluster_expressions', None)
         if cluster_expressions is not None:
-            # 转换为tensor格式
+            # Convert to tensor format
             expression_list = []
             for i in range(len(self.label_encoder.classes_)):
-                cluster_id = i  # 使用索引i而不是类名
+                cluster_id = i  # Use index instead of name
                 if cluster_id in cluster_expressions:
                     expression_list.append(cluster_expressions[cluster_id])
                 else:
-                    print(f"⚠️  缺少聚类 {cluster_id} 的表达谱，使用零向量")
+                    print(f"Warning: Missing cluster {cluster_id} expression, using zero vector")
                     expression_list.append(np.zeros(input_dim))
             
             self.celltype_expressions = torch.FloatTensor(np.array(expression_list)).to(self.device)
-            print(f"✅ 加载预训练聚类表达谱: {self.celltype_expressions.shape}")
+            print(f"Loaded pretrained cluster expressions: {self.celltype_expressions.shape}")
         else:
             self.celltype_expressions = None
-            print("⚠️  未找到预训练聚类表达谱，将重新计算")
+            print("Warning: Pretrained cluster expressions not found, will recompute")
+        
+        # Load full-gene cluster expression profiles
+        cluster_expressions_full = checkpoint.get('cluster_expressions_full', None)
+        if cluster_expressions_full is not None:
+            # Convert to list format
+            expression_full_list = []
+            for i in range(len(self.label_encoder.classes_)):
+                cluster_id = i
+                if cluster_id in cluster_expressions_full:
+                    expression_full_list.append(cluster_expressions_full[cluster_id])
+                else:
+                    # If no full-gene version, use marker gene version (may cause gene count mismatch)
+                    print(f"Warning: Missing cluster {cluster_id} full-gene expression")
+                    expression_full_list.append(None)
+            
+            self.celltype_expressions_full = expression_full_list  # Save as list, different dimensions
+            full_gene_count = len(expression_full_list[0]) if expression_full_list[0] is not None else 0
+            print(f"Loaded pretrained cluster full-gene expressions: {len(expression_full_list)} clusters × {full_gene_count} genes")
+        else:
+            self.celltype_expressions_full = None
+            print("⚠️  未找到预训练聚类全基因表达谱")
+        
+        # 加载全基因列表
+        all_genes = checkpoint.get('all_genes', None)
+        if all_genes is not None:
+            self.all_genes = all_genes
+            print(f"✅ 加载全基因列表: {len(all_genes)} 个基因")
+        else:
+            self.all_genes = None
+            print("⚠️  未找到全基因列表")
         
         print(f"VAE Encoder加载成功: {input_dim} -> {latent_dim}")
         print(f"细胞聚类: {list(self.label_encoder.classes_)}")
@@ -139,62 +169,6 @@ class GATDeconvolution:
         # 冻结encoder参数
         for param in self.vae_encoder.parameters():
             param.requires_grad = False
-    
-    def compute_celltype_embedding(self, sc_data: np.ndarray, sc_labels: np.ndarray) -> torch.Tensor:
-        """计算每个细胞类型的平均embedding"""
-        print("计算聚类embedding")
-
-        # 转换为tensor
-        sc_tensor = torch.FloatTensor(sc_data).to(self.device)
-        
-        # 计算所有细胞的embedding
-        with torch.no_grad():
-            mu, log_var = self.vae_encoder(sc_tensor)
-            # 使用均值作为embedding
-            sc_embeddings = mu
-        
-        # 计算每个聚类的平均embedding
-        prototypes = []
-        clusters = self.label_encoder.classes_
-        
-        for i, cluster in enumerate(clusters):
-            # 找到该聚类的所有细胞
-            cell_mask = (sc_labels == i)
-            if cell_mask.sum() > 0:
-                cell_embeddings = sc_embeddings[cell_mask]
-                prototype = cell_embeddings.mean(dim=0)
-                prototypes.append(prototype)
-                
-                print(f"Cluster {cluster}: {cell_mask.sum()} cells")
-        
-        self.celltype_prototypes = torch.stack(prototypes)  # [n_clusters, embedding_dim]
-        
-        print(f"聚类embeddings: {self.celltype_prototypes.shape}")
-        
-        return self.celltype_prototypes
-    
-    def compute_celltype_expressions(self, sc_data: np.ndarray, sc_labels: np.ndarray) -> torch.Tensor:
-        """计算每个细胞类型的平均表达谱 """
-        print("计算聚类表达谱")
-        
-        clusters = self.label_encoder.classes_
-        cluster_expressions = []
-        
-        for i, cluster in enumerate(clusters):
-            # 找到该聚类的所有细胞
-            cell_mask = (sc_labels == i)
-            if cell_mask.sum() > 0:
-                cluster_expression = sc_data[cell_mask].mean(axis=0)
-                cluster_expressions.append(cluster_expression)
-                
-        cluster_expressions = torch.FloatTensor(np.array(cluster_expressions)).to(self.device)
-        
-        # 存储在trainer中，与celltype_prototypes保持一致
-        self.celltype_expressions = cluster_expressions
-        
-        print(f"聚类表达谱: {cluster_expressions.shape}")
-        
-        return self.celltype_expressions
     
     def build_gat_model(self, n_cell_types: int, gat_hidden_dim=64, gat_layers=3, 
                        gat_heads=4, dropout=0.1, loss_lambda_pearson=1.0,
@@ -217,7 +191,7 @@ class GATDeconvolution:
             gat_heads=gat_heads,
             dropout=dropout,
             k_spatial=self.k_spatial,
-            similarity_threshold=self.similarity_threshold
+            k_celltype=self.k_celltype
         ).to(self.device)
         
         self.loss_fn = SpatialDeconvolutionLoss(
@@ -296,11 +270,15 @@ class GATDeconvolution:
                                st_data: np.ndarray,
                                spatial_coords: np.ndarray,
                                sample_name: str,
+                               st_adata=None,
                                n_epochs: int = 50,
                                lr: float = 1e-3,
                                batch_size: int = 512):
         """训练GAT解卷积模型"""
         print(f"开始训练GAT解卷积模型...")
+        
+        # 保存 st_adata 供后续使用
+        self.st_adata = st_adata
  
         # 转换为tensor
         st_tensor = torch.FloatTensor(st_data).to(self.device)
@@ -376,7 +354,7 @@ class GATDeconvolution:
         self.save_model(f"{self.output_dir}/final_gat_model.pth")
         
         # 评估和可视化结果（使用全量数据）
-        self.evaluate_and_visualize(st_tensor, spatial_tensor, sample_name)
+        self.evaluate_and_visualize(st_data, self.st_adata, spatial_tensor, sample_name)
         
         print(f"✅ GAT解卷积训练完成! 最佳损失: {best_loss:.4f}")
         
@@ -387,17 +365,20 @@ class GATDeconvolution:
         }
     
     def evaluate_and_visualize(self, 
-                             st_data: torch.Tensor,
+                             st_data: np.ndarray,
+                             st_adata,
                              spatial_coords: torch.Tensor,
                              sample_name: str):
-        """评估模型并可视化结果"""
+        """评估模型并可视化结果，生成反卷积表达矩阵"""
         print("📊 评估模型结果...")
         
         self.gat_model.eval()
         
+        st_tensor = torch.FloatTensor(st_data).to(self.device)
+        
         with torch.no_grad():
             # 计算spot embeddings
-            mu, log_var = self.vae_encoder(st_data)
+            mu, log_var = self.vae_encoder(st_tensor)
             spot_embeddings = mu
             
             # GAT前向传播
@@ -411,30 +392,111 @@ class GATDeconvolution:
             deconv_weights = gat_outputs['deconv_weights'].detach().cpu().numpy()
             attention_scores = gat_outputs['attention_scores'].detach().cpu().numpy()
         
-        # 保存结果
+        # 保存解卷积权重
+        print("💾 保存反卷积结果...")
+        weights_file = f"{self.output_dir}/{sample_name}_deconv_weights.npz"
+        np.savez(weights_file, 
+                deconv_weights=deconv_weights,
+                attention_scores=attention_scores,
+                clusters=self.label_encoder.classes_)
+        print(f"   ✅ 权重已保存: {weights_file}")
+        
+        # ============ 生成表达矩阵 ============
+        n_spots = deconv_weights.shape[0]
+        n_clusters = deconv_weights.shape[1]
+        
+        print("\n🧬 生成反卷积表达矩阵...")
+        
+        # 获取 spot barcode
+        spot_barcodes = list(st_adata.obs.index)
+        
+        # 1. Marker基因表达矩阵（spot × marker基因）
+        print("   1️⃣  生成Marker基因表达矩阵...")
+        celltype_expr_marker = self.celltype_expressions.cpu().numpy()  # [n_clusters, n_marker_genes]
+        reconstructed_marker_expr = np.dot(deconv_weights, celltype_expr_marker)  # [n_spots, n_marker_genes]
+        
+        marker_expr_df = pd.DataFrame(
+            reconstructed_marker_expr,
+            columns=self.genes,
+            index=spot_barcodes
+        )
+        
+        # Filter out genes with zero expression across all spots
+        non_zero_genes_marker = (marker_expr_df != 0).any(axis=0)
+        marker_expr_df = marker_expr_df.loc[:, non_zero_genes_marker]
+        
+        marker_expr_file = f"{self.output_dir}/{sample_name}_reconstructed_marker_genes.csv"
+        marker_expr_df.to_csv(marker_expr_file)
+        print(f"      ✅ Marker基因表达: {marker_expr_df.shape} (移除了{sum(~non_zero_genes_marker)}个全零基因)")
+        
+        # 2. 全基因表达矩阵（需要celltype全基因表达）
+        if self.celltype_expressions_full is not None and all(expr is not None for expr in self.celltype_expressions_full):
+            print("   2️⃣  生成全基因表达矩阵...")
+            celltype_expr_full = np.array(self.celltype_expressions_full)  # [n_clusters, n_all_genes]
+            reconstructed_full_expr = np.dot(deconv_weights, celltype_expr_full)  # [n_spots, n_all_genes]
+            
+            # 获取全基因名称
+            if self.all_genes is not None:
+                all_gene_names = self.all_genes
+                print(f"      使用保存的基因名: {len(all_gene_names)} 个")
+            else:
+                # 备用方案：使用基因索引
+                all_gene_names = [f"Gene_{i}" for i in range(celltype_expr_full.shape[1])]
+                print(f"      ⚠️  使用基因索引 (Gene_0, Gene_1, ...)")
+            
+            full_expr_df = pd.DataFrame(
+                reconstructed_full_expr,
+                columns=all_gene_names,
+                index=spot_barcodes
+            )
+            
+            # Filter out genes with zero expression across all spots
+            non_zero_genes_full = (full_expr_df != 0).any(axis=0)
+            full_expr_df = full_expr_df.loc[:, non_zero_genes_full]
+            
+            full_expr_file = f"{self.output_dir}/{sample_name}_reconstructed_all_genes.csv"
+            full_expr_df.to_csv(full_expr_file)
+            print(f"      ✅ 全基因表达: {full_expr_df.shape} (移除了{sum(~non_zero_genes_full)}个全零基因)")
+        else:
+            print("      ⚠️  未加载全基因celltype表达，跳过全基因矩阵生成")
+        
+        # 3. 聚类组成矩阵（spot × 聚类）
+        print("   3️⃣  生成聚类组成矩阵...")
+        composition_df = pd.DataFrame(
+            deconv_weights,
+            columns=[f"Cluster_{int(c)}" for c in self.label_encoder.classes_],
+            index=spot_barcodes
+        )
+        composition_file = f"{self.output_dir}/{sample_name}_cell_composition.csv"
+        composition_df.to_csv(composition_file)
+        print(f"      ✅ 聚类组成: {composition_df.shape}")
+        
+        # 保存结果summary
         results = {
-            'deconv_weights': deconv_weights,        # 解卷积权重（归一化后的聚类比例）
-            'attention_scores': attention_scores,    # 原始注意力分数
+            'deconv_weights': deconv_weights,
+            'attention_scores': attention_scores,
             'clusters': list(self.label_encoder.classes_),
-            'sample_name': sample_name
+            'sample_name': sample_name,
+            'marker_genes': self.genes,
+            'n_spots': n_spots,
+            'n_clusters': n_clusters
         }
         
         results_file = f"{self.output_dir}/{sample_name}_deconvolution_results.npz"
         np.savez(results_file, **results)
-        
-        print(f"   💾 结果已保存: {results_file}")
+        print(f"\n   💾 完整结果已保存: {results_file}")
         
         # 打印统计信息
-        print(f"   📈 解卷积权重统计 (聚类比例):")
+        print(f"\n📈 解卷积权重统计 (聚类比例):")
         for i, cluster in enumerate(self.label_encoder.classes_):
             weight_mean = deconv_weights[:, i].mean()
             weight_std = deconv_weights[:, i].std()
-            print(f"     Cluster {cluster}: {weight_mean:.3f} ± {weight_std:.3f}")
+            print(f"   Cluster {cluster}: {weight_mean:.3f} ± {weight_std:.3f}")
         
         # 验证权重和是否为1
         weight_sums = deconv_weights.sum(axis=1)
-        print(f"   🔍 解卷积权重和验证:")
-        print(f"     权重和: {weight_sums.mean():.6f} ± {weight_sums.std():.6f} (应该等于1.0)")
+        print(f"\n🔍 解卷积权重和验证:")
+        print(f"   权重和: {weight_sums.mean():.6f} ± {weight_sums.std():.6f} (应该等于1.0)")
     
     def plot_training_curves(self, train_losses, pcc_losses, cos_losses, weight_regs, sparsity_regs, sample_name):
         """绘制训练曲线"""
@@ -483,6 +545,7 @@ class GATDeconvolution:
             'gat_state_dict': self.gat_model.state_dict(),
             'celltype_prototypes': self.celltype_prototypes,
             'celltype_expressions': self.celltype_expressions,
+            'celltype_expressions_full': getattr(self, 'celltype_expressions_full', None),
             'label_encoder': self.label_encoder,
             'marker_genes': self.marker_genes,
             'genes': self.genes,
@@ -519,8 +582,8 @@ def main():
     # 图构建参数
     parser.add_argument('--k_spatial', type=int, default=6,
                        help='空间邻居数 (KNN)')
-    parser.add_argument('--similarity_threshold', type=float, default=0.1,
-                       help='Spot-CellType相似度阈值')
+    parser.add_argument('--k_celltype', type=int, default=10,
+                       help='每个spot连接的最近celltype数量 (KNN)')
     
     # 训练参数
     parser.add_argument('--n_epochs', type=int, default=50,
@@ -568,19 +631,14 @@ def main():
     
     # 设置图构建参数
     trainer.k_spatial = args.k_spatial
-    trainer.similarity_threshold = args.similarity_threshold
+    trainer.k_celltype = args.k_celltype
     
     # 加载VAE Encoder
     trainer.load_vae_encoder()
     print("=" * 60)
 
-    # ✅ 第二阶段不需要加载SC数据
-    # 所有聚类信息（中心、表达谱、编码器）已在stage1中计算并保存
     print("🔍 直接使用第一阶段的聚类中心和表达谱...")
-    
-    if trainer.sc_clusters is None:
-        raise ValueError("❌ 第一阶段模型缺少聚类信息！请确保使用新版本训练的模型。")
-    
+
     print(f"✅ 加载了 {len(trainer.label_encoder.classes_)} 个聚类")
     print("=" * 60)
     
@@ -592,6 +650,8 @@ def main():
         print("✅ 使用第一阶段预训练的聚类数据")
         print(f"   聚类中心: {trainer.celltype_prototypes.shape}")
         print(f"   聚类表达谱: {trainer.celltype_expressions.shape}")
+        print(f"   聚类表达谱 (第一个): {trainer.celltype_expressions[0]}")
+        print(f"   聚类表达谱 (第二个): {trainer.celltype_expressions[1]}")
         n_clusters = trainer.celltype_prototypes.shape[0]
     else:
         raise ValueError("❌ 第一阶段模型缺少聚类中心或表达谱！")
@@ -645,6 +705,7 @@ def main():
         st_data=st_X,
         spatial_coords=spatial_coords,
         sample_name=sample_name,
+        st_adata=st_adata,
         n_epochs=args.n_epochs,
         lr=args.lr,
         batch_size=args.batch_size

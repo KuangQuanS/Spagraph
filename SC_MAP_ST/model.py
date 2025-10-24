@@ -288,44 +288,69 @@ class HeterogeneousGATDeconvolution(nn.Module):
                spot_embeddings: torch.Tensor,
                spatial_coords: torch.Tensor,
                celltype_prototypes: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """前向传播 """
+        """Forward pass"""
         n_spots = spot_embeddings.shape[0]
+        n_cell_types = celltype_prototypes.shape[0]
+        device = spot_embeddings.device
         
-        # 1. 构建异构图
+        # 1. Build heterogeneous graph
         edge_index, edge_attr, node_features = self.build_heterogeneous_graph(
             spot_embeddings, spatial_coords, celltype_prototypes
         )
         
-        # 2. GAT处理
+        # 2. Create sparse mask: which spot-celltype pairs are connected in the graph
+        # This is used to enforce k_celltype sparsity
+        sparse_mask = torch.zeros(n_spots, n_cell_types, dtype=torch.bool, device=device)
+        
+        # Extract spot-celltype edges from edge_index
+        n_nodes = n_spots + n_cell_types
+        for i in range(edge_index.shape[1]):
+            src, dst = edge_index[0, i].item(), edge_index[1, i].item()
+            # Spot -> CellType edge
+            if src < n_spots and dst >= n_spots:
+                celltype_idx = dst - n_spots
+                sparse_mask[src, celltype_idx] = True
+        
+        # 3. GAT processing
         x = node_features
         for i, gat_layer in enumerate(self.gat_layers_list):
             x = gat_layer(x, edge_index)
-            if i < len(self.gat_layers_list) - 1:  # 除了最后一层都用ReLU
+            if i < len(self.gat_layers_list) - 1:
                 x = F.relu(x)
         
-        # 3. 分离spot和celltype节点特征
+        # 4. Extract spot and celltype node features
         spot_features = x[:n_spots]  # [n_spots, gat_hidden_dim]
         celltype_features = x[n_spots:]  # [n_cell_types, gat_hidden_dim]
         
-        # 4. 向量化计算注意力权重（高效实现）
-        # 扩展维度进行批量计算: [n_spots, n_cell_types, gat_hidden_dim]
-        spot_expanded = spot_features.unsqueeze(1).expand(-1, self.n_cell_types, -1)  # [n_spots, n_cell_types, gat_hidden_dim]
-        cell_expanded = celltype_features.unsqueeze(0).expand(n_spots, -1, -1)        # [n_spots, n_cell_types, gat_hidden_dim]
+        # 5. Vectorized attention weight computation
+        # Expand dimensions for batch computation
+        spot_expanded = spot_features.unsqueeze(1).expand(-1, n_cell_types, -1)
+        cell_expanded = celltype_features.unsqueeze(0).expand(n_spots, -1, -1)
         
-        # 拼接特征: [n_spots, n_cell_types, 2*gat_hidden_dim]
+        # Concatenate features
         combined = torch.cat([spot_expanded, cell_expanded], dim=-1)
         
-        # 批量计算注意力分数
+        # Compute attention scores
         attention_scores = self.attention_mlp(combined).squeeze(-1)  # [n_spots, n_cell_types]
         
-        # softmax归一化，确保每个spot的权重和为1
-        deconv_weights = F.softmax(attention_scores, dim=1)  # [n_spots, n_cell_types]
+        # Apply sparse mask: set non-connected celltypes to -inf
+        # After softmax, -inf becomes 0
+        attention_scores_masked = attention_scores.clone()
+        attention_scores_masked[~sparse_mask] = float('-inf')
+        
+        # Softmax normalization (only over connected celltypes)
+        deconv_weights = F.softmax(attention_scores_masked, dim=1)
+        
+        # Handle any NaN from all -inf rows (shouldn't happen with k_celltype)
+        deconv_weights = torch.nan_to_num(deconv_weights, 0.0)
         
         return {
             'spot_features': spot_features,
             'celltype_features': celltype_features,
-            'attention_scores': attention_scores,    # 原始分数（用于正则化）
-            'deconv_weights': deconv_weights,        # 解卷积权重（归一化后，用于重建）
+            'attention_scores': attention_scores,    # Raw scores
+            'attention_scores_masked': attention_scores_masked,  # Masked scores
+            'deconv_weights': deconv_weights,        # Normalized weights (sparse)
+            'sparse_mask': sparse_mask,              # For debugging
             'edge_index': edge_index,
             'edge_attr': edge_attr
         }

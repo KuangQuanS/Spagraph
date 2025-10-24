@@ -16,51 +16,50 @@ from typing import List, Tuple, Dict, Optional
 import math
 import argparse
 import warnings
+from tqdm import tqdm
 warnings.filterwarnings('ignore')
 
-# 导入统一的模型定义
+# Import unified model definitions
 from model import VAE, vae_loss_function
 
 def compute_clusters_and_marker_genes(adata, top_n=100, min_fold_change=1.5, resolution=0.5, save_path=None):
     """
-    计算聚类并提取每个cluster的top marker基因
+    Compute clusters and extract top marker genes for each cluster
     """
-    print(f"🔍 进行聚类分析...")
+    print("="*60)
+    print("Starting clustering analysis...")
     
-    # 备份原始数据
+    # Backup original data
     adata_backup = adata.copy()
     
-    # 预处理：标准化和主成分分析
+    # Preprocessing: normalization and PCA
     sc.pp.normalize_total(adata, target_sum=1e4)
     sc.pp.log1p(adata)
     sc.pp.highly_variable_genes(adata, min_mean=0.0125, max_mean=3, min_disp=0.5)
     adata.raw = adata
     adata = adata[:, adata.var.highly_variable]
     
-    # 主成分分析
+    # PCA
     sc.pp.scale(adata, max_value=10)
     sc.tl.pca(adata, svd_solver='arpack')
     
-    # 构建邻接图
+    # Build neighbor graph
     sc.pp.neighbors(adata, n_neighbors=10, n_pcs=40)
     
-    # Leiden聚类
+    # Leiden clustering
     sc.tl.leiden(adata, resolution=resolution)
     
-    print(f"📊 聚类结果: {len(adata.obs['leiden'].unique())} 个clusters")
-    for cluster in sorted(adata.obs['leiden'].unique()):
-        count = (adata.obs['leiden'] == cluster).sum()
-        print(f"   Cluster {cluster}: {count} 细胞")
+    print(f"Clustering results: {len(adata.obs['leiden'].unique())} clusters")
     
-    # 恢复到原始基因集进行marker分析
+    # Restore to original gene set for marker analysis
     adata_full = adata_backup.copy()
     sc.pp.normalize_total(adata_full, target_sum=1e4)
     sc.pp.log1p(adata_full)
     
-    # 将聚类结果转移到完整数据
+    # Transfer clustering results to full dataset
     adata_full.obs['leiden'] = adata.obs['leiden'].copy()
     
-    # 计算每个cluster的marker基因
+    # Compute marker genes for each cluster
     sc.tl.rank_genes_groups(
         adata_full, 
         'leiden', 
@@ -69,11 +68,11 @@ def compute_clusters_and_marker_genes(adata, top_n=100, min_fold_change=1.5, res
         n_genes=top_n * 2
     )
     
-    # 提取marker基因
+    # Extract marker genes
     marker_genes = set()
     result = adata_full.uns['rank_genes_groups']
     
-    print(f"🧬 各cluster的marker基因:")
+    print(f"Marker genes per cluster:")
     for cluster in sorted(adata_full.obs['leiden'].unique()):
         if cluster in result['names'].dtype.names:
             genes = result['names'][cluster]
@@ -92,14 +91,15 @@ def compute_clusters_and_marker_genes(adata, top_n=100, min_fold_change=1.5, res
                     break
             
             marker_genes.update(selected_genes)
-            print(f"   Cluster {cluster}: {len(selected_genes)} 个基因")
     
-    print(f"🎯 总计: {len(marker_genes)} 个marker基因")
+    print(f"Total: {len(marker_genes)} marker genes")
     
-    # 返回聚类信息和marker基因
-    return sorted(list(marker_genes)), adata_full.obs['leiden'].copy()
+    # Return clustering info, marker genes, and full adata for annotation
+    return sorted(list(marker_genes)), adata_full.obs['leiden'].copy(), adata_full
 
-#--------------------------主模块-----------------------------
+#============================================================
+# Main Module
+#============================================================
 class coEncoder:
     def __init__(self, 
                  data_dir="/home/maweicheng/ST_Graduation_Project/database",
@@ -115,16 +115,17 @@ class coEncoder:
         else:
             self.device = torch.device(device)
         
-        print(f" use device: {self.device}")
+        print(f"Using device: {self.device}")
 
-        # 模型组件
+        # Model components
         self.vae = None
         self.label_encoder = None
         self.marker_genes = None
         
     def load_data(self) -> Tuple[ad.AnnData, ad.AnnData, List[str]]:
 
-        print("加载数据集...")
+        print("="*60)
+        print("Loading datasets...")
         
         wu_dir = os.path.join(self.data_dir, "Wu")
 
@@ -132,7 +133,7 @@ class coEncoder:
                       if os.path.isdir(os.path.join(wu_dir, d))]
         sample_dirs.sort()
         
-        print(f"   发现样本: {sample_dirs}")
+        print(f"   Found samples: {sample_dirs}")
         
         sc_data_list = []
         st_data_list = []
@@ -144,90 +145,106 @@ class coEncoder:
             st_file = os.path.join(sample_dir, f"{sample}_ST.h5ad")
             
             if os.path.exists(sc_file) and os.path.exists(st_file):
-                print(f"   加载 {sample}...")
+                print(f"   Loading {sample}...")
                 
-                # 加载SC数据
+                # Load SC data
                 sc_adata = sc.read_h5ad(sc_file)
                 sc_adata.obs['sample'] = sample
                 sc_adata.obs['modality'] = 'SC'
                 
-                # 加载ST数据
+                # Load ST data
                 st_adata = sc.read_h5ad(st_file)
                 st_adata.obs['sample'] = sample
                 st_adata.obs['modality'] = 'ST'
                 
-                print(f" SC: {sc_adata.shape}")
-                print(f" ST: {st_adata.shape}")
+                print(f"   SC: {sc_adata.shape}")
+                print(f"   ST: {st_adata.shape}")
                 
                 sc_data_list.append(sc_adata)
                 st_data_list.append(st_adata)
                 valid_samples.append(sample)
             else:
-                print(f" 未找到完整数据: {sample}")
+                print(f"   Complete data not found: {sample}")
         
-        # 合并SC数据 - 使用inner join确保只保留所有样本共有的基因
-        print(f"   合并 {len(sc_data_list)} 个SC样本...")
+        # Merge SC data - use inner join to keep common genes
+        print(f"   Merging {len(sc_data_list)} SC samples...")
         combined_sc = ad.concat(sc_data_list, axis=0, join='inner', 
                                 keys=valid_samples, index_unique='-')
         
-        # 合并ST数据 - 使用inner join确保只保留所有样本共有的基因  
-        print(f"   合并 {len(st_data_list)} 个ST样本...")
+        # Merge ST data - use inner join to keep common genes  
+        print(f"   Merging {len(st_data_list)} ST samples...")
         combined_st = ad.concat(st_data_list, axis=0, join='inner', 
                                 keys=valid_samples, index_unique='-')
         
-        print(f"   SC总计: {combined_sc.shape}")
-        print(f"   ST总计: {combined_st.shape}")
-        # print(f"   细胞类型: {combined_sc.obs['cell_type'].unique()}")  # 将使用聚类代替
+        print(f"   SC total: {combined_sc.shape}")
+        print(f"   ST total: {combined_st.shape}")
+        # print(f"   Cell types: {combined_sc.obs['cell_type'].unique()}")
         
         return combined_sc, combined_st, valid_samples
 
     def prepare_marker_gene_data(self, sc_adata: ad.AnnData, st_adata: ad.AnnData, 
                                top_n_per_type: int = 100, resolution: float = 0.5) -> Tuple:
-        """基于marker基因准备训练数据"""
+        """Prepare training data based on marker genes"""
 
-        # 1. 计算聚类和marker基因  
-        print("📋 计算聚类和marker基因...")
+        # 1. Compute clusters and marker genes  
+        print("="*60)
+        print("Computing clusters and marker genes...")
         cluster_save_path = f"{self.output_dir}/marker_genes.txt"
-        self.marker_genes, sc_clusters = compute_clusters_and_marker_genes(
+        self.marker_genes, sc_clusters, sc_adata_clustered = compute_clusters_and_marker_genes(
             sc_adata.copy(), 
             top_n=top_n_per_type, 
             resolution=resolution,
             save_path=cluster_save_path
         )
         
-        # 保存聚类信息和分辨率
+        # Save clustered adata for annotation
+        self.sc_adata_clustered = sc_adata_clustered
+        cluster_adata_file = f"{self.output_dir}/sc_adata_clustered.h5ad"
+        sc_adata_clustered.write_h5ad(cluster_adata_file)
+        print(f"Saved clustered SC adata: {cluster_adata_file}")
+        
+        # Save clustering info and resolution
         self.sc_clusters = sc_clusters
         self.resolution = resolution
         
-        # 2. 处理SC数据 (提取marker基因后标准化)
-        print("📋 处理SC数据...")
-        sc_subset = sc_adata[:, sc_adata.var.index.isin(self.marker_genes)].copy()
+        # 2. Process SC data (extract marker genes then normalize)
+        print("Processing SC data...")
+                
+        # SC normalization - process all genes first
+        sc_adata_normalized = sc_adata.copy()
+        sc.pp.normalize_total(sc_adata_normalized, target_sum=1e4)
+        sc.pp.log1p(sc_adata_normalized)
         
-        # SC标准化
-        sc.pp.normalize_total(sc_subset, target_sum=1e4)
-        sc.pp.log1p(sc_subset)
+        # Extract full gene expression for later use
+        sc_X_full = sc_adata_normalized.X.toarray() if hasattr(sc_adata_normalized.X, 'toarray') else sc_adata_normalized.X
+        sc_all_genes = list(sc_adata_normalized.var.index)
         
+        # Extract marker genes
+        sc_subset = sc_adata_normalized[:, sc_adata_normalized.var.index.isin(self.marker_genes)].copy()
         sc_X = sc_subset.X.toarray() if hasattr(sc_subset.X, 'toarray') else sc_subset.X
-        sc_labels = sc_clusters.values  # 使用聚类标签
-        
-        # 编码标签
+        sc_labels = sc_clusters.values
+        print("="*60)
+        print(f"SC data min: {np.min(sc_X)}, max: {np.max(sc_X)}")
+        print("="*60)
+        # Encode labels
         self.label_encoder = LabelEncoder()
         sc_y = self.label_encoder.fit_transform(sc_labels)
         
-        print(f"   SC数据: {sc_X.shape}")
-        print(f"   聚类数: {len(self.label_encoder.classes_)} 个")
-        
-        # 3. 处理ST数据
-        print("📋 处理ST数据...")
+        print(f"   SC data: {sc_X.shape}")
+        print(f"   Number of clusters: {len(self.label_encoder.classes_)}")
+
+        # ST
         available_genes = [g for g in self.marker_genes if g in st_adata.var.index]
         st_subset = st_adata[:, available_genes].copy()
         
         sc.pp.log1p(st_subset)
         st_X = st_subset.X.toarray() if hasattr(st_subset.X, 'toarray') else st_subset.X
+        print("="*60)
+        print(f"ST data min: {np.min(st_X)}, max: {np.max(st_X)}")
+        print("="*60)
+        print(f"   ST data: {st_X.shape}, available genes: {len(available_genes)}/{len(self.marker_genes)}")
         
-        print(f"   ST数据: {st_X.shape}, 可用基因: {len(available_genes)}/{len(self.marker_genes)}")
-        
-        # 4. 确保SC和ST特征维度一致
+        # 4. Ensure SC and ST feature dimensions are consistent
         final_genes = [g for g in self.marker_genes 
                       if g in sc_subset.var.index and g in st_subset.var.index]
         
@@ -237,18 +254,25 @@ class coEncoder:
         sc_X_final = sc_X[:, sc_gene_indices]
         st_X_final = st_X[:, st_gene_indices]
         
-        print(f"   最终基因数: {len(final_genes)}")
+        print(f"   Final gene count: {len(final_genes)}")
         
-        # 5. 分割数据
+        # 5. Split data
         sc_train, sc_test, y_train, y_test = train_test_split(
-            sc_X_final, sc_y, test_size=0.2, stratify=sc_y, random_state=42
+            sc_X_final, sc_y, test_size=0.1, stratify=sc_y, random_state=42
         )
+        
+        # Split full gene SC data with same indices
+        sc_train_indices = np.arange(len(sc_X_final))
+        sc_train_idx, sc_test_idx = train_test_split(
+            sc_train_indices, test_size=0.1, stratify=sc_y, random_state=42
+        )
+        sc_X_full_train = sc_X_full[sc_train_idx]
         
         st_train, st_test = train_test_split(
-            st_X_final, test_size=0.2, random_state=42
+            st_X_final, test_size=0.1, random_state=42
         )
         
-        # 6. 合并训练集和测试集
+        # 6. Combine train and test sets
         train_X = np.vstack([sc_train, st_train])
         test_X = np.vstack([sc_test, st_test])
         
@@ -262,21 +286,23 @@ class coEncoder:
             np.ones(len(st_test))
         ])
         
-        print(f"   训练集: {train_X.shape} (SC: {len(sc_train)}, ST: {len(st_train)})")
-        print(f"   测试集: {test_X.shape} (SC: {len(sc_test)}, ST: {len(st_test)})")
+        print(f"   Train set: {train_X.shape} (SC: {len(sc_train)}, ST: {len(st_train)})")
+        print(f"   Test set: {test_X.shape} (SC: {len(sc_test)}, ST: {len(st_test)})")
         
-        # 保存基因列表
+        # Save gene list
         self.genes = final_genes
+        self.all_genes = sc_all_genes  # Save all gene list
         genes_file = f"{self.output_dir}/final_genes.txt"
         with open(genes_file, 'w') as f:
             for gene in self.genes:
                 f.write(f"{gene}\n")
 
-        return train_X, test_X, train_modality, test_modality, y_train, y_test
+        return train_X, test_X, train_modality, test_modality, y_train, y_test, sc_X_full_train
     
     def build_vae(self, input_dim: int, hidden_dims=[512, 256], latent_dim=128, dropout=0.2):
-        """构建VAE模型"""
-        print("🏗️ 构建VAE模型...")
+        """Build VAE model"""
+        print("="*60)
+        print("Building VAE model...")
         
         self.vae = VAE(
             input_dim=input_dim,
@@ -285,18 +311,19 @@ class coEncoder:
             dropout=dropout
         ).to(self.device)
         
-        print(f"   VAE: {input_dim} -> {latent_dim}")
-        print(f"   隐藏层: {hidden_dims}")
+        print(f"   Input: {input_dim} -> Latent: {latent_dim}")
+        print(f"   Hidden layers: {hidden_dims}")
         vae_params = sum(p.numel() for p in self.vae.parameters())
-        print(f"   参数量: {vae_params:,}")
+        print(f"   Parameters: {vae_params:,}")
     
     def train_vae(self, train_X, test_X, train_modality, test_modality,
                   batch_size=256, n_epochs=100, lr=1e-3, beta=1.0):
-        """训练VAE"""
+        """Train VAE"""
 
-        print("开始VAE训练...")
-        print(f"   训练数据: {train_X.shape} (SC: {sum(train_modality==0)}, ST: {sum(train_modality==1)})")
-        print(f"   测试数据: {test_X.shape} (SC: {sum(test_modality==0)}, ST: {sum(test_modality==1)})")
+        print("="*60)
+        print("Starting VAE training...")
+        print(f"   Train data: {train_X.shape} (SC: {sum(train_modality==0)}, ST: {sum(train_modality==1)})")
+        print(f"   Test data: {test_X.shape} (SC: {sum(test_modality==0)}, ST: {sum(test_modality==1)})")
 
         class SimpleDataset(Dataset):
             def __init__(self, X, modality):
@@ -309,20 +336,20 @@ class coEncoder:
             def __getitem__(self, idx):
                 return self.X[idx], self.modality[idx]
 
-        # 数据加载器
+        # Data loader
         train_dataset = SimpleDataset(train_X, train_modality)
         test_dataset = SimpleDataset(test_X, test_modality)
         
         train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
         test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
         
-        # 优化器
+        # Optimizer
         optimizer = torch.optim.Adam(self.vae.parameters(), lr=lr)
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer, mode='min', patience=10, factor=0.5, verbose=True
         )
         
-        # 训练历史
+        # Training history
         train_losses = []
         test_losses = []
         recon_losses = []
@@ -332,8 +359,9 @@ class coEncoder:
         patience_counter = 0
         patience = 15
         
-        for epoch in range(n_epochs):
-            # 训练
+        pbar = tqdm(range(n_epochs), desc="VAE Training", unit="epoch")
+        for epoch in pbar:
+            # Training
             self.vae.train()
             epoch_loss = 0.0
             epoch_recon = 0.0
@@ -344,15 +372,15 @@ class coEncoder:
                 
                 optimizer.zero_grad()
                 
-                # VAE前向传播
+                # VAE forward pass
                 recon_data, mu, log_var, z = self.vae(batch_data)
                 
-                # 计算损失
+                # Compute loss
                 total_loss, recon_loss, kl_div = vae_loss_function(
                     recon_data, batch_data, mu, log_var, beta=beta
                 )
                 
-                # 归一化损失
+                # Normalize loss
                 total_loss = total_loss / len(batch_data)
                 recon_loss = recon_loss / len(batch_data)
                 kl_div = kl_div / len(batch_data)
@@ -372,37 +400,36 @@ class coEncoder:
             recon_losses.append(avg_recon)
             kl_losses.append(avg_kl)
             
-            # 评估
+            # Evaluate
             if (epoch + 1) % 5 == 0:
                 test_loss = self.evaluate_vae(test_loader, beta)
                 test_losses.append(test_loss)
                 
                 scheduler.step(test_loss)
                 
-                print(f"Epoch {epoch+1:3d}: Train Loss={avg_loss:.4f} (Recon={avg_recon:.4f}, "
-                      f"KL={avg_kl:.4f}), Test Loss={test_loss:.4f}")
+                pbar.set_postfix({'Train': f'{avg_loss:.4f}', 'Recon': f'{avg_recon:.4f}', 
+                                 'KL': f'{avg_kl:.4f}', 'Test': f'{test_loss:.4f}'})
                 
-                # 保存最佳模型
+                # Save best model
                 if test_loss < best_loss:
                     best_loss = test_loss
-                    # 这里不保存best_vae.pth，等到聚类中心计算完后再保存
+                    # Will save model after computing cluster centers
                     patience_counter = 0
                 else:
                     patience_counter += 1
                     
                 # Early stopping
                 if patience_counter >= patience:
-                    print(f"🛑 Early stopping at epoch {epoch+1}")
+                    pbar.close()
                     break
         
-        # 绘制训练曲线
+        # Plot training curves
         self.plot_vae_training_curves(train_losses, test_losses, recon_losses, kl_losses)
         
-        print(f"✅ VAE训练完成! 最佳测试损失: {best_loss:.4f}")
         return best_loss
     
     def evaluate_vae(self, test_loader, beta=1.0):
-        """评估VAE"""
+        """Evaluate VAE"""
         self.vae.eval()
         total_loss = 0.0
         
@@ -417,10 +444,10 @@ class coEncoder:
         return total_loss / len(test_loader)
     
     def plot_vae_training_curves(self, train_losses, test_losses, recon_losses, kl_losses):
-        """绘制VAE训练曲线"""
+        """Plot VAE training curves"""
         fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(15, 10))
         
-        # 总损失
+        # Total loss
         ax1.plot(train_losses, label='Train')
         if len(test_losses) > 0:
             test_epochs = range(5, len(train_losses)+1, 5)
@@ -432,21 +459,21 @@ class coEncoder:
         ax1.legend()
         ax1.grid(True)
         
-        # 重建损失
+        # Reconstruction loss
         ax2.plot(recon_losses, 'g-')
         ax2.set_title('Reconstruction Loss')
         ax2.set_xlabel('Epochs')
         ax2.set_ylabel('Loss')
         ax2.grid(True)
         
-        # KL散度
+        # KL divergence
         ax3.plot(kl_losses, 'r-')
         ax3.set_title('KL Divergence')
         ax3.set_xlabel('Epochs')
         ax3.set_ylabel('KL Div')
         ax3.grid(True)
         
-        # 损失组件对比
+        # Loss components comparison
         ax4.plot(recon_losses, label='Reconstruction', color='green')
         ax4.plot(kl_losses, label='KL Divergence', color='red')
         ax4.set_title('Loss Components')
@@ -460,27 +487,28 @@ class coEncoder:
         plt.show()
     
     def save_vae(self, filepath):
-        """保存VAE模型"""
-        # 检查聚类信息是否存在
+        """Save VAE model"""
+        # Check if cluster info exists
         cluster_prototypes = getattr(self, 'cluster_prototypes', None)
         cluster_expressions = getattr(self, 'cluster_expressions', None)
-        cluster_expressions_full = getattr(self, 'cluster_expressions_full', None)  # 全基因版本
+        cluster_expressions_full = getattr(self, 'cluster_expressions_full', None)
         
-        print(f"💾 保存模型到: {filepath}")
+        print("="*60)
+        print(f"Saving model to: {filepath}")
         if cluster_prototypes is not None:
-            print(f"   ✅ 包含聚类中心: {len(cluster_prototypes)} 个聚类")
+            print(f"   Cluster centers: {len(cluster_prototypes)} clusters")
         else:
-            print(f"   ⚠️  缺少聚类中心")
+            print(f"   Warning: cluster centers missing")
             
         if cluster_expressions is not None:
-            print(f"   ✅ 包含聚类表达谱 (marker基因): {len(cluster_expressions)} 个聚类")
+            print(f"   Cluster expressions (marker genes): {len(cluster_expressions)} clusters")
         else:
-            print(f"   ⚠️  缺少聚类表达谱")
+            print(f"   Warning: cluster expressions missing")
         
         if cluster_expressions_full is not None:
-            print(f"   ✅ 包含聚类表达谱 (全基因): {len(cluster_expressions_full)} 个聚类")
+            print(f"   Cluster expressions (all genes): {len(cluster_expressions_full)} clusters")
         else:
-            print(f"   ⚠️  缺少聚类全基因表达谱")
+            print(f"   Warning: full gene expressions missing")
         
         torch.save({
             'vae_state_dict': self.vae.state_dict(),
@@ -489,16 +517,16 @@ class coEncoder:
             'genes': self.genes,
             'input_dim': len(self.genes),
             'latent_dim': self.vae.latent_dim,
-            'sc_clusters': getattr(self, 'sc_clusters', None),  # 保存聚类信息
-            'resolution': getattr(self, 'resolution', 0.5),    # 保存分辨率参数
-            'cluster_prototypes': cluster_prototypes,  # 保存聚类中心
-            'cluster_expressions': cluster_expressions,  # 保存聚类表达谱 (marker基因)
-            'cluster_expressions_full': cluster_expressions_full,  # 保存聚类表达谱 (全基因)
-            'all_genes': getattr(self, 'all_genes', None)  # 保存所有基因列表
+            'sc_clusters': getattr(self, 'sc_clusters', None),
+            'resolution': getattr(self, 'resolution', 0.5),
+            'cluster_prototypes': cluster_prototypes,
+            'cluster_expressions': cluster_expressions,
+            'cluster_expressions_full': cluster_expressions_full,
+            'all_genes': getattr(self, 'all_genes', None)
         }, filepath)
     
     def load_vae(self, filepath):
-        """加载VAE模型"""
+        """Load VAE model"""
         checkpoint = torch.load(filepath, map_location=self.device)
         
         input_dim = checkpoint['input_dim']
@@ -511,60 +539,62 @@ class coEncoder:
         self.marker_genes = checkpoint['marker_genes']
         self.genes = checkpoint['genes']
         
-        print(f"📂 VAE模型已加载: {filepath}")
+        print(f"VAE model loaded: {filepath}")
     
     def run_stage1_training(self, top_n_per_type=100, resolution=0.5, batch_size=256, n_epochs=100, 
                            lr=1e-3, beta=1.0, hidden_dims=[512, 256], latent_dim=128):
-        """运行第一阶段VAE训练"""
-        print("开始第一阶段训练: VAE (SC + ST, Marker基因)")
+        """Run stage 1 training: VAE on SC + ST with marker genes"""
         print("="*60)
-        print(f"   参数配置:")
-        print(f"   - 每类型marker基因数: {top_n_per_type}")
-        print(f"   - 批次大小: {batch_size}")
-        print(f"   - 训练轮数: {n_epochs}")
-        print(f"   - 学习率: {lr}")
-        print(f"   - Beta (KL权重): {beta}")
-        print(f"   - 隐藏层维度: {hidden_dims}")
-        print(f"   - 潜在维度: {latent_dim}")
+        print("Stage 1 Training: VAE (SC + ST, Marker Genes)")
+        print("="*60)
+        print(f"Configuration:")
+        print(f"   Marker genes per type: {top_n_per_type}")
+        print(f"   Batch size: {batch_size}")
+        print(f"   Epochs: {n_epochs}")
+        print(f"   Learning rate: {lr}")
+        print(f"   Beta (KL weight): {beta}")
+        print(f"   Hidden dims: {hidden_dims}")
+        print(f"   Latent dim: {latent_dim}")
         print("="*60)
         
-        # 1. 加载数据
+        # 1. Load data
         sc_adata, st_adata, samples = self.load_data()
         
-        # 2. 基于marker基因准备数据
-        train_X, test_X, train_modality, test_modality, y_train, y_test = self.prepare_marker_gene_data(
+        # 2. Prepare data based on marker genes
+        train_X, test_X, train_modality, test_modality, y_train, y_test, sc_X_full_train = self.prepare_marker_gene_data(
             sc_adata, st_adata, top_n_per_type=top_n_per_type, resolution=resolution
         )
         
-        # 3. 构建VAE
+        # 3. Build VAE
         input_dim = len(self.genes)
         self.build_vae(input_dim, hidden_dims=hidden_dims, latent_dim=latent_dim)
         
-        # 4. 训练VAE
+        # 4. Train VAE
         best_loss = self.train_vae(train_X, test_X, train_modality, test_modality,
                                   batch_size=batch_size, n_epochs=n_epochs, lr=lr, beta=beta)
         
-        # 保存训练数据以便计算聚类中心
+        # Save training data for cluster center computation
         self.train_X = train_X
         self.train_modality = train_modality  
         self.y_train = y_train
+        self.sc_X_full_train = sc_X_full_train  # Full gene SC training data
         
-        # 5. 计算并保存聚类中心
-        print("🔄 计算聚类中心...")
+        # 5. Compute and save cluster centers
+        print("="*60)
+        print("Computing cluster centers...")
         
-        # 使用训练数据计算聚类中心（这些数据已经过marker基因筛选和标准化）
-        # 获取SC训练数据部分
-        sc_train_mask = train_modality == 0  # SC数据的mask
-        sc_train_data = train_X[sc_train_mask]  # SC训练数据
-        sc_train_labels = y_train  # SC训练标签
+        # Use training data to compute cluster centers (already preprocessed with marker genes)
+        sc_train_mask = train_modality == 0
+        sc_train_data = train_X[sc_train_mask]
+        sc_train_labels = y_train
         
-        print(f"   用于计算聚类中心的SC数据: {sc_train_data.shape}")
-        print(f"   聚类数: {len(np.unique(sc_train_labels))}")
+        print(f"   SC training data: {sc_train_data.shape}")
+        print(f"   Number of clusters: {len(np.unique(sc_train_labels))}")
         
-        # 使用训练好的VAE计算embeddings
+        # Use trained VAE to compute embeddings
         self.vae.eval()
         with torch.no_grad():
-            # 分批处理以避免内存问题
+            # Process in batches to avoid memory issues
             batch_size = 1000
             all_embeddings = []
             
@@ -572,63 +602,53 @@ class coEncoder:
                 batch_data = sc_train_data[i:i+batch_size]
                 batch_tensor = torch.FloatTensor(batch_data).to(self.device)
                 
-                # 获取潜在表示
+                # Get latent representation
                 mu, log_var = self.vae.encoder(batch_tensor)
                 all_embeddings.append(mu.cpu().numpy())
             
             embeddings = np.vstack(all_embeddings)
         
-        # 计算每个聚类的中心和表达谱
+        # Compute cluster centers and expressions
         cluster_prototypes = {}
         cluster_expressions = {}
-        cluster_expressions_full = {}  # 保存全基因表达
+        cluster_expressions_full = {}
         
         for cluster_id in np.unique(sc_train_labels):
             cluster_mask = sc_train_labels == cluster_id
-            cluster_cells = np.sum(cluster_mask)
-            
-            # 计算聚类中心（潜在空间）
+ 
+            # Compute cluster center (latent space)
             cluster_center = np.mean(embeddings[cluster_mask], axis=0)
             cluster_prototypes[cluster_id] = cluster_center
             
-            # 计算聚类表达谱（marker基因）
+            # Compute cluster expression (marker genes)
             cluster_expression = np.mean(sc_train_data[cluster_mask], axis=0)
             cluster_expressions[cluster_id] = cluster_expression
-            
-            print(f"     Cluster {cluster_id}: {cluster_cells} cells")
         
-        # 计算全基因表达（需要从原始SC数据中提取，并进行相同的预处理）
-        print("   📊 计算全基因聚类表达谱...")
-        # 获取原始SC数据，进行相同的预处理
-        sc_adata_full = self.load_data()[0].copy()
+        # Compute full gene expressions
+        print("   Computing full gene cluster expressions...")
+        print(f"      Total genes: {len(self.all_genes)}")
         
-        # 保存所有基因列表（用于后续输出）
-        self.all_genes = list(sc_adata_full.var.index)
-        print(f"      总基因数: {len(self.all_genes)}")
-        
-        # 进行相同的预处理（归一化和log变换）
-        sc.pp.normalize_total(sc_adata_full, target_sum=1e4)
-        sc.pp.log1p(sc_adata_full)
-        sc_full_X = sc_adata_full.X.toarray() if hasattr(sc_adata_full.X, 'toarray') else sc_adata_full.X
-        
+        # Use sc_X_full_train (already normalized and log1p transformed)
         for cluster_id in np.unique(sc_train_labels):
-            # 找到该聚类对应的所有单细胞
-            cluster_indices = np.where(sc_train_labels == cluster_id)[0]
-            
-            # 获取这些单细胞对应的完整基因表达（预处理后）
-            cluster_cells_full_expr = sc_full_X[cluster_indices]
-            
-            # 计算平均表达
-            cluster_expr_full = np.mean(cluster_cells_full_expr, axis=0)
+            cluster_mask = sc_train_labels == cluster_id
+            cluster_expr_full = np.mean(sc_X_full_train[cluster_mask], axis=0)
             cluster_expressions_full[cluster_id] = cluster_expr_full
         
-        # 保存聚类中心和表达谱
+        # Save cluster centers and expressions
         self.cluster_prototypes = cluster_prototypes
         self.cluster_expressions = cluster_expressions
-        self.cluster_expressions_full = cluster_expressions_full  # 保存全基因版本
-        print(f"   ✅ 计算完成: {len(cluster_prototypes)} 个聚类中心和表达谱（包含全基因）")
-        
-        # 6. 保存最终模型
+        self.cluster_expressions_full = cluster_expressions_full
+        print(f"   Completed: {len(cluster_prototypes)} clusters with center and expressions (all genes)")
+        df_marker = pd.DataFrame.from_dict(
+            self.cluster_expressions, orient='index', columns=self.genes
+        )
+        df_marker.index.name = 'cluster_id'
+        df_marker.to_csv(f"{self.output_dir}/cluster_marker_expressions.csv")
+        df_full = pd.DataFrame.from_dict(
+            self.cluster_expressions_full, orient='index', columns=self.all_genes
+        )
+        df_full.index.name = 'cluster_id'
+        df_full.to_csv(f"{self.output_dir}/cluster_full_expressions.csv")
         self.save_vae(f"{self.output_dir}/final_vae.pth")
         
         return {
@@ -641,51 +661,51 @@ class coEncoder:
         }
 
 def main():
-    """主函数"""
+    """Main function"""
     parser = argparse.ArgumentParser(description='Stage 1: VAE Training for SC-ST Integration')
     
-    # 数据参数
+    # Data arguments
     parser.add_argument('--data_dir', type=str, 
                        default="/home/maweicheng/ST_Graduation_Project/database",
-                       help='数据目录路径')
+                       help='Data directory path')
     parser.add_argument('--output_dir', type=str, default="./stage1_results",
-                       help='输出目录路径')
+                       help='Output directory path')
     
-    # 模型参数
+    # Model arguments
     parser.add_argument('--top_n_per_type', type=int, default=100,
-                       help='每个聚类的marker基因数')
+                       help='Marker genes per cluster')
     parser.add_argument('--resolution', type=float, default=0.5,
-                       help='Leiden聚类分辨率')
+                       help='Leiden clustering resolution')
     parser.add_argument('--hidden_dims', type=int, nargs='+', default=[512, 256],
-                       help='VAE隐藏层维度')
+                       help='VAE hidden layer dimensions')
     parser.add_argument('--latent_dim', type=int, default=128,
-                       help='VAE潜在空间维度')
+                       help='VAE latent space dimension')
     
-    # 训练参数
+    # Training arguments
     parser.add_argument('--batch_size', type=int, default=256,
-                       help='批次大小')
+                       help='Batch size')
     parser.add_argument('--n_epochs', type=int, default=100,
-                       help='训练轮数')
+                       help='Number of epochs')
     parser.add_argument('--lr', type=float, default=1e-3,
-                       help='学习率')
+                       help='Learning rate')
     parser.add_argument('--beta', type=float, default=1.0,
-                       help='KL散度权重 (β-VAE)')
+                       help='KL divergence weight (beta-VAE)')
     
-    # 设备参数
+    # Device argument
     parser.add_argument('--device', type=str, default=None,
-                       help='计算设备 (cuda/cpu，None为自动选择)')
+                       help='Computing device (cuda/cpu, None for auto-select)')
     
     args = parser.parse_args()
     
 
-    # 创建VAE映射器
+    # Create VAE encoder
     co_encoder = coEncoder(
         data_dir=args.data_dir,
         output_dir=args.output_dir,
         device=args.device
     )
     
-    # 运行第一阶段VAE训练
+    # Run stage 1 VAE training
     results = co_encoder.run_stage1_training(
         top_n_per_type=args.top_n_per_type,
         resolution=args.resolution,

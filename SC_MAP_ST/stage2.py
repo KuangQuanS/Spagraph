@@ -135,22 +135,27 @@ class GATDeconvolution:
             self.celltype_expressions = None
             print("Warning: cluster expressions not found, will recompute")
         
-        # Load full gene cluster expressions
-        cluster_expressions_full = checkpoint.get('cluster_expressions_full', None)
-        if cluster_expressions_full is not None:
+        # Load full gene cluster expressions (count version for reconstruction)
+        cluster_expressions_full_count = checkpoint.get('cluster_expressions_full_count', None)
+        if cluster_expressions_full_count is None:
+            # Fall back to log version if count not available
+            cluster_expressions_full_count = checkpoint.get('cluster_expressions_full', None)
+            print("Warning: Using log1p version as count version not found")
+        
+        if cluster_expressions_full_count is not None:
             # Convert to list format
             expression_full_list = []
             for i in range(len(self.label_encoder.classes_)):
                 cluster_id = i
-                if cluster_id in cluster_expressions_full:
-                    expression_full_list.append(cluster_expressions_full[cluster_id])
+                if cluster_id in cluster_expressions_full_count:
+                    expression_full_list.append(cluster_expressions_full_count[cluster_id])
                 else:
                     print(f"Warning: cluster {cluster_id} missing full gene expression")
                     expression_full_list.append(None)
             
             self.celltype_expressions_full = expression_full_list
             full_gene_count = len(expression_full_list[0]) if expression_full_list[0] is not None else 0
-            print(f"Loaded full gene expressions: {len(expression_full_list)} clusters × {full_gene_count} genes")
+            print(f"Loaded full gene expressions (count): {len(expression_full_list)} clusters × {full_gene_count} genes")
         else:
             self.celltype_expressions_full = None
             print("Warning: full gene expressions not found")
@@ -276,10 +281,16 @@ class GATDeconvolution:
                                st_adata=None,
                                n_epochs: int = 50,
                                lr: float = 1e-3,
-                               batch_size: int = 512):
-        """Train GAT deconvolution model"""
+                               batch_size: int = 512,
+                               cells_per_spot: float = 10.0):
+        """Train GAT deconvolution model
+        
+        Args:
+            cells_per_spot: Average number of cells per spot (default 10 for Visium)
+        """
         print("="*60)
         print("Starting GAT deconvolution training...")
+        print(f"Cells per spot: {cells_per_spot}")
         
         # Save st_adata for later use
         self.st_adata = st_adata
@@ -358,7 +369,7 @@ class GATDeconvolution:
         self.save_model(f"{self.output_dir}/final_gat_model.pth")
         
         # Evaluate and visualize results
-        self.evaluate_and_visualize(st_data, self.st_adata, spatial_tensor, sample_name)
+        self.evaluate_and_visualize(st_data, self.st_adata, spatial_tensor, sample_name, cells_per_spot)
         
         return {
             'best_loss': best_loss,
@@ -370,10 +381,16 @@ class GATDeconvolution:
                              st_data: np.ndarray,
                              st_adata,
                              spatial_coords: torch.Tensor,
-                             sample_name: str):
-        """Evaluate model and visualize results, generate deconvolution matrices"""
+                             sample_name: str,
+                             cells_per_spot: float = 10.0):
+        """Evaluate model and visualize results, generate deconvolution matrices
+        
+        Args:
+            cells_per_spot: Average number of cells per spot (default 10 for Visium)
+        """
         print("="*60)
         print("Evaluating model results...")
+        print(f"Cells per spot: {cells_per_spot}")
         
         self.gat_model.eval()
         
@@ -424,11 +441,15 @@ class GATDeconvolution:
         marker_expr_file = f"{self.output_dir}/{sample_name}_reconstructed_marker_genes.csv"
         marker_expr_df.to_csv(marker_expr_file)
         
-        # 2. Full gene expression matrix
+        # 2. Full gene expression matrix (use count version with cells_per_spot)
         if self.celltype_expressions_full is not None and all(expr is not None for expr in self.celltype_expressions_full):
             print("   Full gene expression...")
             celltype_expr_full = np.array(self.celltype_expressions_full)
-            reconstructed_full_expr = np.dot(deconv_weights, celltype_expr_full)
+            
+            # Key change: weight represents cell fraction, so multiply by cells_per_spot
+            # Example: if weight=0.1 and cells_per_spot=10, means 1 cell of this type
+            # Cluster expression is mean count per cell, so 1 cell contributes 1 × cluster_expr
+            reconstructed_full_expr = np.dot(deconv_weights * cells_per_spot, celltype_expr_full)
             
             # Get full gene names
             if self.all_genes is not None:
@@ -576,6 +597,10 @@ def main():
     parser.add_argument('--loss_lambda_sparse', type=float, default=0.01,
                        help='Sparsity regularization weight (Shannon entropy)')
     
+    # Spot composition argument
+    parser.add_argument('--cells_per_spot', type=float, default=10.0,
+                       help='Average number of cells per spot (default 10 for Visium)')
+    
     # Device argument
     parser.add_argument('--device', type=str, default=None,
                        help='Computing device (cuda/cpu, None for auto-select)')
@@ -644,7 +669,7 @@ def main():
     print(f"ST matching genes: {len(trainer.genes)}/{len(trainer.genes)}")
     
     # Extract ST data
-    sc.pp.log1p(st_subset)
+    # sc.pp.log1p(st_subset)
     st_X = st_subset.X.toarray() if hasattr(st_subset.X, 'toarray') else st_subset.X
     
     # Extract spatial coordinates
@@ -680,7 +705,8 @@ def main():
         st_adata=st_adata,
         n_epochs=args.n_epochs,
         lr=args.lr,
-        batch_size=args.batch_size
+        batch_size=args.batch_size,
+        cells_per_spot=args.cells_per_spot
     )
     
     print("="*60)

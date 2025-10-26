@@ -54,7 +54,7 @@ def compute_clusters_and_marker_genes(adata, top_n=100, min_fold_change=1.5, res
     # Restore to original gene set for marker analysis
     adata_full = adata_backup.copy()
     sc.pp.normalize_total(adata_full, target_sum=1e4)
-    sc.pp.log1p(adata_full)
+    # sc.pp.log1p(adata_full)
     
     # Transfer clustering results to full dataset
     adata_full.obs['leiden'] = adata.obs['leiden'].copy()
@@ -210,21 +210,21 @@ class coEncoder:
         # 2. Process SC data (extract marker genes then normalize)
         print("Processing SC data...")
                 
-        # SC normalization - process all genes first
-        sc_adata_normalized = sc_adata.copy()
-        sc.pp.normalize_total(sc_adata_normalized, target_sum=1e4)
-        sc.pp.log1p(sc_adata_normalized)
+        # SC normalization - use count space (no log1p) for VAE training
+        sc_adata_count = sc_adata.copy()
+        sc.pp.normalize_total(sc_adata_count, target_sum=1e4)
+        # NO log1p - use count directly for VAE
         
-        # Extract full gene expression for later use
-        sc_X_full = sc_adata_normalized.X.toarray() if hasattr(sc_adata_normalized.X, 'toarray') else sc_adata_normalized.X
-        sc_all_genes = list(sc_adata_normalized.var.index)
+        # Extract full gene expression (count version)
+        sc_X_full_count = sc_adata_count.X.toarray() if hasattr(sc_adata_count.X, 'toarray') else sc_adata_count.X
+        sc_all_genes = list(sc_adata_count.var.index)
         
-        # Extract marker genes
-        sc_subset = sc_adata_normalized[:, sc_adata_normalized.var.index.isin(self.marker_genes)].copy()
+        # Extract marker genes (count for training)
+        sc_subset = sc_adata_count[:, sc_adata_count.var.index.isin(self.marker_genes)].copy()
         sc_X = sc_subset.X.toarray() if hasattr(sc_subset.X, 'toarray') else sc_subset.X
         sc_labels = sc_clusters.values
         print("="*60)
-        print(f"SC data min: {np.min(sc_X)}, max: {np.max(sc_X)}")
+        print(f"SC data (count) min: {np.min(sc_X)}, max: {np.max(sc_X)}")
         print("="*60)
         # Encode labels
         self.label_encoder = LabelEncoder()
@@ -237,10 +237,10 @@ class coEncoder:
         available_genes = [g for g in self.marker_genes if g in st_adata.var.index]
         st_subset = st_adata[:, available_genes].copy()
         
-        sc.pp.log1p(st_subset)
+        # NO log1p - use count directly
         st_X = st_subset.X.toarray() if hasattr(st_subset.X, 'toarray') else st_subset.X
         print("="*60)
-        print(f"ST data min: {np.min(st_X)}, max: {np.max(st_X)}")
+        print(f"ST data (count) min: {np.min(st_X)}, max: {np.max(st_X)}")
         print("="*60)
         print(f"   ST data: {st_X.shape}, available genes: {len(available_genes)}/{len(self.marker_genes)}")
         
@@ -266,7 +266,7 @@ class coEncoder:
         sc_train_idx, sc_test_idx = train_test_split(
             sc_train_indices, test_size=0.1, stratify=sc_y, random_state=42
         )
-        sc_X_full_train = sc_X_full[sc_train_idx]
+        sc_X_full_train_count = sc_X_full_count[sc_train_idx]
         
         st_train, st_test = train_test_split(
             st_X_final, test_size=0.1, random_state=42
@@ -297,7 +297,7 @@ class coEncoder:
             for gene in self.genes:
                 f.write(f"{gene}\n")
 
-        return train_X, test_X, train_modality, test_modality, y_train, y_test, sc_X_full_train
+        return train_X, test_X, train_modality, test_modality, y_train, y_test, sc_X_full_train_count
     
     def build_vae(self, input_dim: int, hidden_dims=[512, 256], latent_dim=128, dropout=0.2):
         """Build VAE model"""
@@ -492,6 +492,7 @@ class coEncoder:
         cluster_prototypes = getattr(self, 'cluster_prototypes', None)
         cluster_expressions = getattr(self, 'cluster_expressions', None)
         cluster_expressions_full = getattr(self, 'cluster_expressions_full', None)
+        cluster_expressions_full_count = getattr(self, 'cluster_expressions_full_count', None)
         
         print("="*60)
         print(f"Saving model to: {filepath}")
@@ -501,14 +502,19 @@ class coEncoder:
             print(f"   Warning: cluster centers missing")
             
         if cluster_expressions is not None:
-            print(f"   Cluster expressions (marker genes): {len(cluster_expressions)} clusters")
+            print(f"   Cluster expressions (marker genes, count): {len(cluster_expressions)} clusters")
         else:
             print(f"   Warning: cluster expressions missing")
         
         if cluster_expressions_full is not None:
-            print(f"   Cluster expressions (all genes): {len(cluster_expressions_full)} clusters")
+            print(f"   Cluster expressions (all genes, count): {len(cluster_expressions_full)} clusters")
         else:
             print(f"   Warning: full gene expressions missing")
+        
+        if cluster_expressions_full_count is not None:
+            print(f"   Cluster expressions (all genes, count backup): {len(cluster_expressions_full_count)} clusters")
+        else:
+            print(f"   Warning: full gene expressions (count backup) missing")
         
         torch.save({
             'vae_state_dict': self.vae.state_dict(),
@@ -522,6 +528,7 @@ class coEncoder:
             'cluster_prototypes': cluster_prototypes,
             'cluster_expressions': cluster_expressions,
             'cluster_expressions_full': cluster_expressions_full,
+            'cluster_expressions_full_count': cluster_expressions_full_count,
             'all_genes': getattr(self, 'all_genes', None)
         }, filepath)
     
@@ -561,7 +568,7 @@ class coEncoder:
         sc_adata, st_adata, samples = self.load_data()
         
         # 2. Prepare data based on marker genes
-        train_X, test_X, train_modality, test_modality, y_train, y_test, sc_X_full_train = self.prepare_marker_gene_data(
+        train_X, test_X, train_modality, test_modality, y_train, y_test, sc_X_full_train_count = self.prepare_marker_gene_data(
             sc_adata, st_adata, top_n_per_type=top_n_per_type, resolution=resolution
         )
         
@@ -577,7 +584,7 @@ class coEncoder:
         self.train_X = train_X
         self.train_modality = train_modality  
         self.y_train = y_train
-        self.sc_X_full_train = sc_X_full_train  # Full gene SC training data
+        self.sc_X_full_train_count = sc_X_full_train_count  # Full gene SC training data (count, for reconstruction)
         
         # 5. Compute and save cluster centers
         print("="*60)
@@ -610,8 +617,8 @@ class coEncoder:
         
         # Compute cluster centers and expressions
         cluster_prototypes = {}
-        cluster_expressions = {}
-        cluster_expressions_full = {}
+        cluster_expressions = {}  # Count version for training
+        cluster_expressions_full_count = {}  # Count version (all genes)
         
         for cluster_id in np.unique(sc_train_labels):
             cluster_mask = sc_train_labels == cluster_id
@@ -620,35 +627,40 @@ class coEncoder:
             cluster_center = np.mean(embeddings[cluster_mask], axis=0)
             cluster_prototypes[cluster_id] = cluster_center
             
-            # Compute cluster expression (marker genes)
+            # Compute cluster expression (marker genes, count)
             cluster_expression = np.mean(sc_train_data[cluster_mask], axis=0)
             cluster_expressions[cluster_id] = cluster_expression
         
-        # Compute full gene expressions
+        # Compute full gene expressions (count version)
         print("   Computing full gene cluster expressions...")
         print(f"      Total genes: {len(self.all_genes)}")
         
-        # Use sc_X_full_train (already normalized and log1p transformed)
         for cluster_id in np.unique(sc_train_labels):
             cluster_mask = sc_train_labels == cluster_id
-            cluster_expr_full = np.mean(sc_X_full_train[cluster_mask], axis=0)
-            cluster_expressions_full[cluster_id] = cluster_expr_full
+            # Count version (for reconstruction)
+            cluster_expr_full_count = np.mean(sc_X_full_train_count[cluster_mask], axis=0)
+            cluster_expressions_full_count[cluster_id] = cluster_expr_full_count
         
         # Save cluster centers and expressions
         self.cluster_prototypes = cluster_prototypes
         self.cluster_expressions = cluster_expressions
-        self.cluster_expressions_full = cluster_expressions_full
+        self.cluster_expressions_full = cluster_expressions_full_count  # Use count version
+        self.cluster_expressions_full_count = cluster_expressions_full_count  # Also keep this for backward compatibility
         print(f"   Completed: {len(cluster_prototypes)} clusters with center and expressions (all genes)")
+        
+        # Save count version
         df_marker = pd.DataFrame.from_dict(
             self.cluster_expressions, orient='index', columns=self.genes
         )
         df_marker.index.name = 'cluster_id'
-        df_marker.to_csv(f"{self.output_dir}/cluster_marker_expressions.csv")
-        df_full = pd.DataFrame.from_dict(
-            self.cluster_expressions_full, orient='index', columns=self.all_genes
+        df_marker.to_csv(f"{self.output_dir}/cluster_marker_expressions_count.csv")
+        
+        df_full_count = pd.DataFrame.from_dict(
+            self.cluster_expressions_full_count, orient='index', columns=self.all_genes
         )
-        df_full.index.name = 'cluster_id'
-        df_full.to_csv(f"{self.output_dir}/cluster_full_expressions.csv")
+        df_full_count.index.name = 'cluster_id'
+        df_full_count.to_csv(f"{self.output_dir}/cluster_full_expressions_count.csv")
+        
         self.save_vae(f"{self.output_dir}/final_vae.pth")
         
         return {

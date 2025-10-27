@@ -12,7 +12,7 @@ from typing import List, Tuple, Dict, Optional
 # ================================
 
 class VAEEncoder(nn.Module):
-    """VAE编码器"""
+    """VAE编码器（多模态友好，使用LayerNorm）"""
     def __init__(self, input_dim, hidden_dims=[512, 256], latent_dim=128, dropout=0.2):
         super().__init__()
         
@@ -23,7 +23,7 @@ class VAEEncoder(nn.Module):
         for hidden_dim in hidden_dims:
             layers.extend([
                 nn.Linear(prev_dim, hidden_dim),
-                nn.BatchNorm1d(hidden_dim),
+                nn.LayerNorm(hidden_dim),  # LayerNorm for multi-modal data
                 nn.ReLU(),
                 nn.Dropout(dropout)
             ])
@@ -42,9 +42,11 @@ class VAEEncoder(nn.Module):
         return mu, log_var
 
 class VAEDecoder(nn.Module):
-    """VAE解码器"""
-    def __init__(self, latent_dim, hidden_dims=[256, 512], output_dim=None, dropout=0.2):
+    """VAE解码器（多模态友好，使用LayerNorm）"""
+    def __init__(self, latent_dim, hidden_dims=[256, 512], output_dim=None, dropout=0.2, output_type='mse'):
         super().__init__()
+        
+        self.output_type = output_type  # 'mse' or 'zinb'
         
         layers = []
         prev_dim = latent_dim
@@ -53,26 +55,41 @@ class VAEDecoder(nn.Module):
         for hidden_dim in hidden_dims:
             layers.extend([
                 nn.Linear(prev_dim, hidden_dim),
-                nn.BatchNorm1d(hidden_dim),
+                nn.LayerNorm(hidden_dim),  # LayerNorm for multi-modal data
                 nn.ReLU(),
                 nn.Dropout(dropout)
             ])
             prev_dim = hidden_dim
         
-        # 输出层
-        layers.append(nn.Linear(prev_dim, output_dim))
+        self.shared_decoder = nn.Sequential(*layers)
         
-        self.decoder = nn.Sequential(*layers)
+        if output_type == 'zinb':
+            # ZINB需要三个输出：mean, dispersion, dropout probability
+            self.mean_decoder = nn.Linear(prev_dim, output_dim)
+            self.disp_decoder = nn.Linear(prev_dim, output_dim)
+            self.pi_decoder = nn.Linear(prev_dim, output_dim)
+        else:
+            # MSE只需要一个输出
+            self.output_decoder = nn.Linear(prev_dim, output_dim)
         
     def forward(self, z):
-        return self.decoder(z)
+        h = self.shared_decoder(z)
+        
+        if self.output_type == 'zinb':
+            mean = self.mean_decoder(h)
+            disp = self.disp_decoder(h)
+            pi = self.pi_decoder(h)
+            return mean, disp, pi
+        else:
+            return self.output_decoder(h)
 
 class VAE(nn.Module):
     """变分自编码器"""
-    def __init__(self, input_dim, hidden_dims=[512, 256], latent_dim=128, dropout=0.2):
+    def __init__(self, input_dim, hidden_dims=[512, 256], latent_dim=128, dropout=0.2, output_type='mse'):
         super().__init__()
         
         self.latent_dim = latent_dim
+        self.output_type = output_type
         
         # 编码器
         self.encoder = VAEEncoder(
@@ -88,7 +105,8 @@ class VAE(nn.Module):
             latent_dim=latent_dim,
             hidden_dims=decoder_hidden,
             output_dim=input_dim,
-            dropout=dropout
+            dropout=dropout,
+            output_type=output_type
         )
         
     def reparameterize(self, mu, log_var):
@@ -105,9 +123,15 @@ class VAE(nn.Module):
         z = self.reparameterize(mu, log_var)
         
         # 解码
-        x_recon = self.decoder(z)
+        decoder_output = self.decoder(z)
         
-        return x_recon, mu, log_var, z
+        if self.output_type == 'zinb':
+            # ZINB模式：返回 mean, disp, pi
+            mean, disp, pi = decoder_output
+            return mean, disp, pi, mu, log_var, z
+        else:
+            # MSE模式：返回 x_recon
+            return decoder_output, mu, log_var, z
     
     def encode(self, x):
         """仅编码，返回潜在表示"""
@@ -117,7 +141,7 @@ class VAE(nn.Module):
 
 # Loss Functions
 def vae_loss_function(recon_x, x, mu, log_var, beta=1.0):
-    """VAE损失函数：重建损失 + KL散度"""
+    """VAE损失函数：重建损失 (MSE) + KL散度"""
     # 重建损失 (MSE)
     recon_loss = F.mse_loss(recon_x, x, reduction='sum')
     
@@ -128,6 +152,132 @@ def vae_loss_function(recon_x, x, mu, log_var, beta=1.0):
     total_loss = recon_loss + beta * kl_div
     
     return total_loss, recon_loss, kl_div
+
+def zinb_loss_function(mean, disp, pi, x, mu, log_var, beta=1.0, eps=1e-8, ridge_lambda=0.0):
+    """
+    VAE损失函数：ZINB重建损失 + KL散度
+    
+    Args:
+        mean: 预测的均值 (batch_size, n_genes)
+        disp: 预测的离散度 (batch_size, n_genes) 
+        pi: 预测的dropout概率 (batch_size, n_genes)
+        x: 真实count数据 (batch_size, n_genes)
+        mu: VAE编码器的均值 (batch_size, latent_dim)
+        log_var: VAE编码器的log方差 (batch_size, latent_dim)
+        beta: KL散度权重
+        eps: 数值稳定性常数
+        ridge_lambda: L2正则化参数
+    
+    Returns:
+        total_loss: 总损失
+        recon_loss: ZINB重建损失
+        kl_div: KL散度
+    """
+    # ZINB负对数似然
+    # 参考: https://github.com/gokceneraslan/neuralnet_countmodels
+    
+    # softplus确保参数为正
+    mean = F.softplus(mean) + eps
+    disp = F.softplus(disp) + eps
+    pi = torch.sigmoid(pi)
+    
+    # Negative Binomial部分
+    # NB(x; mu, theta) where theta is dispersion
+    t1 = torch.lgamma(disp + eps) + torch.lgamma(x + 1.0) - torch.lgamma(x + disp + eps)
+    t2 = (disp + x) * torch.log(1.0 + (mean / (disp + eps))) + (x * (torch.log(disp + eps) - torch.log(mean + eps)))
+    nb_log_likelihood = t1 + t2
+    
+    # Zero-inflation部分
+    # P(x=0) = pi + (1-pi)*NB(0)
+    nb_zero = -disp * torch.log(1.0 + mean / disp + eps)
+    zero_nb = torch.log(pi + (1.0 - pi) * torch.exp(nb_zero) + eps)
+    non_zero_nb = torch.log(1.0 - pi + eps) - nb_log_likelihood
+    
+    # 根据是否为0选择相应的似然
+    zinb_log_likelihood = torch.where(
+        x < 1e-8,
+        zero_nb,
+        non_zero_nb
+    )
+    
+    # 重建损失 (负对数似然)
+    recon_loss = -torch.sum(zinb_log_likelihood)
+    
+    # KL散度 (与标准正态分布)
+    kl_div = -0.5 * torch.sum(1 + log_var - mu.pow(2) - log_var.exp())
+    
+    # Ridge正则化 (可选)
+    ridge_loss = ridge_lambda * torch.sum(mean)
+    
+    # 总损失
+    total_loss = recon_loss + beta * kl_div + ridge_loss
+    
+    return total_loss, recon_loss, kl_div
+
+def compute_mmd(x, y, kernel='rbf', gamma=None):
+    """
+    Compute Maximum Mean Discrepancy (MMD) between two distributions
+    
+    Args:
+        x: Tensor of shape (n_samples_x, n_features) - SC embeddings
+        y: Tensor of shape (n_samples_y, n_features) - ST embeddings
+        kernel: Kernel type ('rbf' or 'linear')
+        gamma: RBF kernel bandwidth (if None, use median heuristic)
+    
+    Returns:
+        mmd_loss: Scalar MMD loss value
+    """
+    # Ensure tensors are on the same device
+    device = x.device
+    y = y.to(device)
+    
+    n_x = x.size(0)
+    n_y = y.size(0)
+    
+    if kernel == 'rbf':
+        # Compute pairwise distances
+        def compute_kernel(a, b, gamma):
+            """RBF kernel K(a,b) = exp(-gamma * ||a-b||^2)"""
+            # a: (n, d), b: (m, d)
+            # output: (n, m)
+            a_norm = (a ** 2).sum(1).view(-1, 1)  # (n, 1)
+            b_norm = (b ** 2).sum(1).view(1, -1)  # (1, m)
+            dist = a_norm + b_norm - 2.0 * torch.mm(a, b.transpose(0, 1))  # (n, m)
+            return torch.exp(-gamma * dist)
+        
+        # Use median heuristic for gamma if not specified
+        if gamma is None:
+            # Sample a subset for efficiency
+            n_samples = min(1000, n_x, n_y)
+            x_sample = x[:n_samples]
+            y_sample = y[:n_samples]
+            
+            # Compute pairwise distances
+            xy = torch.cat([x_sample, y_sample], dim=0)
+            dists = torch.cdist(xy, xy, p=2)
+            
+            # Median heuristic: gamma = 1 / (2 * median^2)
+            median_dist = torch.median(dists[dists > 0])
+            gamma = 1.0 / (2 * median_dist ** 2 + 1e-8)
+        
+        # Compute kernels
+        K_xx = compute_kernel(x, x, gamma)
+        K_yy = compute_kernel(y, y, gamma)
+        K_xy = compute_kernel(x, y, gamma)
+        
+        # MMD^2 = E[K(x,x')] + E[K(y,y')] - 2*E[K(x,y)]
+        mmd_loss = K_xx.sum() / (n_x * n_x) + K_yy.sum() / (n_y * n_y) - 2 * K_xy.sum() / (n_x * n_y)
+        
+    elif kernel == 'linear':
+        # Linear kernel: K(a,b) = <a,b>
+        mean_x = x.mean(0)
+        mean_y = y.mean(0)
+        mmd_loss = torch.sum((mean_x - mean_y) ** 2)
+    
+    else:
+        raise ValueError(f"Unknown kernel: {kernel}")
+    
+    return mmd_loss
 
 # ================================
 # Stage 2: GAT Models
@@ -420,7 +570,7 @@ class SpatialDeconvolutionLoss(nn.Module):
         cos_sim_rec = F.cosine_similarity(reconstructed_spot, true_spot_expression, dim=-1)
         L_cosine = 1.0 - cos_sim_rec.mean()
         
-        # ============ 3. Cosine Alignment Loss（可选） ============
+        # ============ 3. Cosine Alignment Loss embedding层面 ============
         L_align = torch.tensor(0.0, device=attention_weights.device)
         
         if spot_embedding is not None and celltype_embedding is not None:

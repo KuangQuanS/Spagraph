@@ -17,10 +17,11 @@ import math
 import argparse
 import warnings
 from tqdm import tqdm
+import umap
 warnings.filterwarnings('ignore')
 
 # Import unified model definitions
-from model import VAE, vae_loss_function
+from model import VAE, vae_loss_function, zinb_loss_function, compute_mmd
 
 def compute_clusters_and_marker_genes(adata, top_n=100, min_fold_change=1.5, resolution=0.5, save_path=None):
     """
@@ -97,16 +98,95 @@ def compute_clusters_and_marker_genes(adata, top_n=100, min_fold_change=1.5, res
     # Return clustering info, marker genes, and full adata for annotation
     return sorted(list(marker_genes)), adata_full.obs['leiden'].copy(), adata_full
 
+def extract_marker_genes_from_celltype(adata, celltype_col='cell_type', top_n=100, min_fold_change=1.5, save_path=None):
+    """
+    Extract marker genes using existing celltype annotation (no clustering)
+    
+    Args:
+        adata: AnnData object with celltype annotation
+        celltype_col: Column name in adata.obs containing celltype labels
+        top_n: Number of top marker genes per celltype
+        min_fold_change: Minimum log2 fold change threshold
+        save_path: Path to save marker genes
+    
+    Returns:
+        marker_genes: List of marker genes
+        celltype_labels: Series with celltype labels
+        adata: Annotated data
+    """
+    print("="*60)
+    print(f"Extracting marker genes using existing celltype annotation...")
+    print(f"   Celltype column: {celltype_col}")
+    
+    if celltype_col not in adata.obs.columns:
+        raise ValueError(f"Column '{celltype_col}' not found in adata.obs! Available columns: {list(adata.obs.columns)}")
+    
+    # Normalize
+    adata_work = adata.copy()
+    sc.pp.normalize_total(adata_work, target_sum=1e4)
+    
+    # Compute marker genes for each celltype
+    sc.tl.rank_genes_groups(
+        adata_work, 
+        celltype_col, 
+        method='wilcoxon',
+        key_added='rank_genes_groups',
+        n_genes=top_n * 2
+    )
+    
+    # Extract marker genes
+    marker_genes = set()
+    result = adata_work.uns['rank_genes_groups']
+    
+    print(f"Marker genes per celltype:")
+    for celltype in sorted(adata_work.obs[celltype_col].unique()):
+        if celltype in result['names'].dtype.names:
+            genes = result['names'][celltype]
+            scores = result['scores'][celltype]
+            pvals = result['pvals_adj'][celltype]
+            logfoldchanges = result['logfoldchanges'][celltype]
+            
+            selected_genes = []
+            for i in range(len(genes)):
+                if (pvals[i] < 0.05 and 
+                    scores[i] > 0 and 
+                    logfoldchanges[i] >= np.log2(min_fold_change)):
+                    selected_genes.append(genes[i])
+                    
+                if len(selected_genes) >= top_n:
+                    break
+            
+            marker_genes.update(selected_genes)
+    
+    print(f"Total: {len(marker_genes)} marker genes")
+    
+    if save_path:
+        with open(save_path, 'w') as f:
+            for gene in sorted(marker_genes):
+                f.write(f"{gene}\n")
+    
+    return sorted(list(marker_genes)), adata.obs[celltype_col].copy(), adata
+
 #============================================================
 # Main Module
 #============================================================
 class coEncoder:
     def __init__(self, 
-                 data_dir="/home/maweicheng/ST_Graduation_Project/database",
+                 sc_file=None,
+                 st_file=None,
                  output_dir="./stage1_results",
                  device=None):
-
-        self.data_dir = data_dir
+        """
+        Initialize co-encoder
+        
+        Args:
+            sc_file: Path to single-cell h5ad file
+            st_file: Path to spatial transcriptomics h5ad file
+            output_dir: Output directory path
+            device: Computing device (cuda/cpu, None for auto)
+        """
+        self.sc_file = sc_file
+        self.st_file = st_file
         self.output_dir = output_dir
         os.makedirs(output_dir, exist_ok=True)
         
@@ -121,81 +201,90 @@ class coEncoder:
         self.vae = None
         self.label_encoder = None
         self.marker_genes = None
+        self.celltype_key = None  # Track if using celltype annotation
         
-    def load_data(self) -> Tuple[ad.AnnData, ad.AnnData, List[str]]:
-
+    def load_data(self) -> Tuple[ad.AnnData, ad.AnnData]:
+        """Load SC and ST data from specified files"""
         print("="*60)
         print("Loading datasets...")
         
-        wu_dir = os.path.join(self.data_dir, "Wu")
-
-        sample_dirs = [d for d in os.listdir(wu_dir) 
-                      if os.path.isdir(os.path.join(wu_dir, d))]
-        sample_dirs.sort()
+        if self.sc_file is None or self.st_file is None:
+            raise ValueError("SC file and ST file must be specified!")
         
-        print(f"   Found samples: {sample_dirs}")
+        if not os.path.exists(self.sc_file):
+            raise FileNotFoundError(f"SC file not found: {self.sc_file}")
         
-        sc_data_list = []
-        st_data_list = []
-        valid_samples = []
+        if not os.path.exists(self.st_file):
+            raise FileNotFoundError(f"ST file not found: {self.st_file}")
         
-        for sample in sample_dirs:
-            sample_dir = os.path.join(wu_dir, sample)
-            sc_file = os.path.join(sample_dir, f"{sample}_SC.h5ad")
-            st_file = os.path.join(sample_dir, f"{sample}_ST.h5ad")
-            
-            if os.path.exists(sc_file) and os.path.exists(st_file):
-                print(f"   Loading {sample}...")
-                
-                # Load SC data
-                sc_adata = sc.read_h5ad(sc_file)
-                sc_adata.obs['sample'] = sample
-                sc_adata.obs['modality'] = 'SC'
-                
-                # Load ST data
-                st_adata = sc.read_h5ad(st_file)
-                st_adata.obs['sample'] = sample
-                st_adata.obs['modality'] = 'ST'
-                
-                print(f"   SC: {sc_adata.shape}")
-                print(f"   ST: {st_adata.shape}")
-                
-                sc_data_list.append(sc_adata)
-                st_data_list.append(st_adata)
-                valid_samples.append(sample)
-            else:
-                print(f"   Complete data not found: {sample}")
+        # Load SC data
+        print(f"   Loading SC: {self.sc_file}")
+        sc_adata = sc.read_h5ad(self.sc_file)
+        sc_adata.obs['modality'] = 'SC'
+        print(f"   SC shape: {sc_adata.shape}")
         
-        # Merge SC data - use inner join to keep common genes
-        print(f"   Merging {len(sc_data_list)} SC samples...")
-        combined_sc = ad.concat(sc_data_list, axis=0, join='inner', 
-                                keys=valid_samples, index_unique='-')
+        # Load ST data
+        print(f"   Loading ST: {self.st_file}")
+        st_adata = sc.read_h5ad(self.st_file)
+        st_adata.obs['modality'] = 'ST'
+        print(f"   ST shape: {st_adata.shape}")
         
-        # Merge ST data - use inner join to keep common genes  
-        print(f"   Merging {len(st_data_list)} ST samples...")
-        combined_st = ad.concat(st_data_list, axis=0, join='inner', 
-                                keys=valid_samples, index_unique='-')
+        # Find common genes
+        common_genes = list(set(sc_adata.var_names) & set(st_adata.var_names))
+        common_genes.sort()
+        print(f"   Common genes: {len(common_genes)}")
         
-        print(f"   SC total: {combined_sc.shape}")
-        print(f"   ST total: {combined_st.shape}")
-        # print(f"   Cell types: {combined_sc.obs['cell_type'].unique()}")
+        # Subset to common genes
+        sc_adata = sc_adata[:, common_genes].copy()
+        st_adata = st_adata[:, common_genes].copy()
         
-        return combined_sc, combined_st, valid_samples
+        print(f"   SC final: {sc_adata.shape}")
+        print(f"   ST final: {st_adata.shape}")
+        
+        return sc_adata, st_adata
+        return sc_adata, st_adata
 
     def prepare_marker_gene_data(self, sc_adata: ad.AnnData, st_adata: ad.AnnData, 
-                               top_n_per_type: int = 100, resolution: float = 0.5) -> Tuple:
-        """Prepare training data based on marker genes"""
+                               top_n_per_type: int = 100, resolution: float = 0.5,
+                               celltype_key: str = None) -> Tuple:
+        """Prepare training data based on marker genes
+        
+        Args:
+            sc_adata: Single cell AnnData object
+            st_adata: Spatial transcriptomics AnnData object
+            top_n_per_type: Number of marker genes per cluster/celltype
+            resolution: Leiden resolution (for auto-clustering mode)
+            celltype_key: Column name in sc_adata.obs for celltype annotation.
+                         If None, will auto-cluster using Leiden. If provided,
+                         will use existing celltype annotation from adata.obs[celltype_key]
+        """
 
         # 1. Compute clusters and marker genes  
         print("="*60)
-        print("Computing clusters and marker genes...")
-        cluster_save_path = f"{self.output_dir}/marker_genes.txt"
-        self.marker_genes, sc_clusters, sc_adata_clustered = compute_clusters_and_marker_genes(
-            sc_adata.copy(), 
-            top_n=top_n_per_type, 
-            resolution=resolution,
-            save_path=cluster_save_path
-        )
+        if celltype_key is not None:
+            # Use existing celltype annotation
+            print(f"Using existing celltype annotation from '{celltype_key}'...")
+            cluster_save_path = f"{self.output_dir}/marker_genes_celltype.txt"
+            self.marker_genes, sc_clusters, sc_adata_clustered = extract_marker_genes_from_celltype(
+                sc_adata.copy(),
+                celltype_col=celltype_key,
+                top_n=top_n_per_type,
+                save_path=cluster_save_path
+            )
+            # Rename the celltype column to 'leiden' for compatibility with downstream code
+            sc_adata_clustered.obs['leiden'] = sc_clusters.copy()
+            self.celltype_key = celltype_key  # Save celltype_key for checkpoint
+        else:
+            # Auto-cluster using Leiden
+            print("Computing clusters and marker genes...")
+            cluster_save_path = f"{self.output_dir}/marker_genes.txt"
+            self.marker_genes, sc_clusters, sc_adata_clustered = compute_clusters_and_marker_genes(
+                sc_adata.copy(), 
+                top_n=top_n_per_type, 
+                resolution=resolution,
+                save_path=cluster_save_path
+            )
+            self.celltype_key = None  # Not using celltype annotation
         
         # Save clustered adata for annotation
         self.sc_adata_clustered = sc_adata_clustered
@@ -213,8 +302,9 @@ class coEncoder:
         # SC normalization - use count space (no log1p) for VAE training
         sc_adata_count = sc_adata.copy()
         sc.pp.normalize_total(sc_adata_count, target_sum=1e4)
-        # NO log1p - use count directly for VAE
-        
+        # NO log1p - use count directly
+        # sc.pp.log1p(sc_adata_count)
+
         # Extract full gene expression (count version)
         sc_X_full_count = sc_adata_count.X.toarray() if hasattr(sc_adata_count.X, 'toarray') else sc_adata_count.X
         sc_all_genes = list(sc_adata_count.var.index)
@@ -234,10 +324,12 @@ class coEncoder:
         print(f"   Number of clusters: {len(self.label_encoder.classes_)}")
 
         # ST
+        sc.pp.normalize_total(st_adata, target_sum=1e4)
+        # NO log1p - use count directly
+        # sc.pp.log1p(st_adata)
         available_genes = [g for g in self.marker_genes if g in st_adata.var.index]
         st_subset = st_adata[:, available_genes].copy()
         
-        # NO log1p - use count directly
         st_X = st_subset.X.toarray() if hasattr(st_subset.X, 'toarray') else st_subset.X
         print("="*60)
         print(f"ST data (count) min: {np.min(st_X)}, max: {np.max(st_X)}")
@@ -299,16 +391,21 @@ class coEncoder:
 
         return train_X, test_X, train_modality, test_modality, y_train, y_test, sc_X_full_train_count
     
-    def build_vae(self, input_dim: int, hidden_dims=[512, 256], latent_dim=128, dropout=0.2):
+    def build_vae(self, input_dim: int, hidden_dims=[512, 256], latent_dim=128, dropout=0.2, loss_type='mse'):
         """Build VAE model"""
         print("="*60)
         print("Building VAE model...")
+        print(f"   Loss type: {loss_type.upper()}")
+        
+        # 根据loss_type设置output_type
+        output_type = 'zinb' if loss_type == 'zinb' else 'mse'
         
         self.vae = VAE(
             input_dim=input_dim,
             hidden_dims=hidden_dims,
             latent_dim=latent_dim,
-            dropout=dropout
+            dropout=dropout,
+            output_type=output_type
         ).to(self.device)
         
         print(f"   Input: {input_dim} -> Latent: {latent_dim}")
@@ -317,13 +414,15 @@ class coEncoder:
         print(f"   Parameters: {vae_params:,}")
     
     def train_vae(self, train_X, test_X, train_modality, test_modality,
-                  batch_size=256, n_epochs=100, lr=1e-3, beta=1.0):
-        """Train VAE"""
+                  batch_size=256, n_epochs=100, lr=1e-3, beta=1.0, loss_type='mse', lambda_mmd=1.0):
+        """Train VAE with optional MMD loss for modality alignment"""
 
         print("="*60)
         print("Starting VAE training...")
         print(f"   Train data: {train_X.shape} (SC: {sum(train_modality==0)}, ST: {sum(train_modality==1)})")
         print(f"   Test data: {test_X.shape} (SC: {sum(test_modality==0)}, ST: {sum(test_modality==1)})")
+        print(f"   Loss type: {loss_type.upper()}")
+        print(f"   MMD weight: {lambda_mmd}")
 
         class SimpleDataset(Dataset):
             def __init__(self, X, modality):
@@ -354,6 +453,7 @@ class coEncoder:
         test_losses = []
         recon_losses = []
         kl_losses = []
+        mmd_losses = []  # Track MMD loss
         
         best_loss = float('inf')
         patience_counter = 0
@@ -366,19 +466,41 @@ class coEncoder:
             epoch_loss = 0.0
             epoch_recon = 0.0
             epoch_kl = 0.0
+            epoch_mmd = 0.0
             
             for batch_data, batch_modality in train_loader:
                 batch_data = batch_data.to(self.device)
+                batch_modality = batch_modality.to(self.device)
                 
                 optimizer.zero_grad()
                 
                 # VAE forward pass
-                recon_data, mu, log_var, z = self.vae(batch_data)
+                if loss_type == 'zinb':
+                    mean, disp, pi, mu, log_var, z = self.vae(batch_data)
+                    total_loss, recon_loss, kl_div = zinb_loss_function(
+                        mean, disp, pi, batch_data, mu, log_var, beta=beta
+                    )
+                else:
+                    recon_data, mu, log_var, z = self.vae(batch_data)
+                    total_loss, recon_loss, kl_div = vae_loss_function(
+                        recon_data, batch_data, mu, log_var, beta=beta
+                    )
                 
-                # Compute loss
-                total_loss, recon_loss, kl_div = vae_loss_function(
-                    recon_data, batch_data, mu, log_var, beta=beta
-                )
+                # Compute MMD loss for modality alignment
+                mmd_loss = torch.tensor(0.0, device=self.device)
+                if lambda_mmd > 0:
+                    # Separate SC and ST embeddings in this batch
+                    sc_mask = batch_modality == 0
+                    st_mask = batch_modality == 1
+                    
+                    # Only compute MMD if both modalities present in batch
+                    if sc_mask.sum() > 0 and st_mask.sum() > 0:
+                        sc_embeddings = z[sc_mask]
+                        st_embeddings = z[st_mask]
+                        mmd_loss = compute_mmd(sc_embeddings, st_embeddings, kernel='rbf')
+                
+                # Total loss with MMD
+                total_loss = total_loss + lambda_mmd * mmd_loss
                 
                 # Normalize loss
                 total_loss = total_loss / len(batch_data)
@@ -391,24 +513,32 @@ class coEncoder:
                 epoch_loss += total_loss.item()
                 epoch_recon += recon_loss.item()
                 epoch_kl += kl_div.item()
+                epoch_mmd += mmd_loss.item() if lambda_mmd > 0 else 0.0
             
             avg_loss = epoch_loss / len(train_loader)
             avg_recon = epoch_recon / len(train_loader)
             avg_kl = epoch_kl / len(train_loader)
+            avg_mmd = epoch_mmd / len(train_loader)
             
             train_losses.append(avg_loss)
             recon_losses.append(avg_recon)
             kl_losses.append(avg_kl)
+            mmd_losses.append(avg_mmd)
             
             # Evaluate
             if (epoch + 1) % 5 == 0:
-                test_loss = self.evaluate_vae(test_loader, beta)
+                test_loss = self.evaluate_vae(test_loader, beta, loss_type)
                 test_losses.append(test_loss)
                 
                 scheduler.step(test_loss)
                 
-                pbar.set_postfix({'Train': f'{avg_loss:.4f}', 'Recon': f'{avg_recon:.4f}', 
-                                 'KL': f'{avg_kl:.4f}', 'Test': f'{test_loss:.4f}'})
+                # Update progress bar with MMD info
+                if lambda_mmd > 0:
+                    pbar.set_postfix({'Train': f'{avg_loss:.4f}', 'Recon': f'{avg_recon:.4f}', 
+                                     'KL': f'{avg_kl:.4f}', 'MMD': f'{avg_mmd:.4f}', 'Test': f'{test_loss:.4f}'})
+                else:
+                    pbar.set_postfix({'Train': f'{avg_loss:.4f}', 'Recon': f'{avg_recon:.4f}', 
+                                     'KL': f'{avg_kl:.4f}', 'Test': f'{test_loss:.4f}'})
                 
                 # Save best model
                 if test_loss < best_loss:
@@ -424,11 +554,11 @@ class coEncoder:
                     break
         
         # Plot training curves
-        self.plot_vae_training_curves(train_losses, test_losses, recon_losses, kl_losses)
+        self.plot_vae_training_curves(train_losses, test_losses, recon_losses, kl_losses, mmd_losses)
         
         return best_loss
     
-    def evaluate_vae(self, test_loader, beta=1.0):
+    def evaluate_vae(self, test_loader, beta=1.0, loss_type='mse'):
         """Evaluate VAE"""
         self.vae.eval()
         total_loss = 0.0
@@ -437,15 +567,27 @@ class coEncoder:
             for batch_data, _ in test_loader:
                 batch_data = batch_data.to(self.device)
                 
-                recon_data, mu, log_var, z = self.vae(batch_data)
-                loss, _, _ = vae_loss_function(recon_data, batch_data, mu, log_var, beta)
+                if loss_type == 'zinb':
+                    mean, disp, pi, mu, log_var, z = self.vae(batch_data)
+                    loss, _, _ = zinb_loss_function(mean, disp, pi, batch_data, mu, log_var, beta)
+                else:
+                    recon_data, mu, log_var, z = self.vae(batch_data)
+                    loss, _, _ = vae_loss_function(recon_data, batch_data, mu, log_var, beta)
+                    
                 total_loss += loss.item() / len(batch_data)
         
         return total_loss / len(test_loader)
     
-    def plot_vae_training_curves(self, train_losses, test_losses, recon_losses, kl_losses):
+    def plot_vae_training_curves(self, train_losses, test_losses, recon_losses, kl_losses, mmd_losses=None):
         """Plot VAE training curves"""
-        fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(15, 10))
+        # Determine if we need to plot MMD
+        has_mmd = mmd_losses is not None and len(mmd_losses) > 0 and max(mmd_losses) > 0
+        
+        if has_mmd:
+            fig, axes = plt.subplots(2, 3, figsize=(22, 10))
+            ((ax1, ax2, ax3), (ax4, ax5, ax6)) = axes
+        else:
+            fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(15, 10))
         
         # Total loss
         ax1.plot(train_losses, label='Train')
@@ -476,15 +618,134 @@ class coEncoder:
         # Loss components comparison
         ax4.plot(recon_losses, label='Reconstruction', color='green')
         ax4.plot(kl_losses, label='KL Divergence', color='red')
+        if has_mmd:
+            ax4.plot(mmd_losses, label='MMD', color='purple')
         ax4.set_title('Loss Components')
         ax4.set_xlabel('Epochs')
         ax4.set_ylabel('Loss')
         ax4.legend()
         ax4.grid(True)
         
+        if has_mmd:
+            # MMD loss
+            ax5.plot(mmd_losses, 'purple')
+            ax5.set_title('MMD Loss (Modality Alignment)')
+            ax5.set_xlabel('Epochs')
+            ax5.set_ylabel('MMD')
+            ax5.grid(True)
+            
+            # All components normalized
+            ax6.plot(np.array(recon_losses) / (max(recon_losses) + 1e-8), label='Recon (norm)', color='green')
+            ax6.plot(np.array(kl_losses) / (max(kl_losses) + 1e-8), label='KL (norm)', color='red')
+            ax6.plot(np.array(mmd_losses) / (max(mmd_losses) + 1e-8), label='MMD (norm)', color='purple')
+            ax6.set_title('Normalized Loss Components')
+            ax6.set_xlabel('Epochs')
+            ax6.set_ylabel('Normalized Loss')
+            ax6.legend()
+            ax6.grid(True)
+        
         plt.tight_layout()
         plt.savefig(f"{self.output_dir}/vae_training_curves.png", dpi=300, bbox_inches='tight')
         plt.show()
+    
+    def plot_modality_alignment_umap(self, train_X, train_modality, y_train=None):
+        """
+        Plot UMAP visualization of SC and ST modality alignment
+        
+        Args:
+            train_X: Training data (combined SC + ST)
+            train_modality: Modality labels (0=SC, 1=ST)
+            y_train: Optional cluster labels for SC samples
+        """
+        print("="*60)
+        print("Generating UMAP visualization for modality alignment...")
+        
+        # Get embeddings from trained VAE
+        self.vae.eval()
+        with torch.no_grad():
+            batch_size = 1000
+            all_embeddings = []
+            
+            for i in range(0, len(train_X), batch_size):
+                batch_data = train_X[i:i+batch_size]
+                batch_tensor = torch.FloatTensor(batch_data).to(self.device)
+                mu, log_var = self.vae.encoder(batch_tensor)
+                all_embeddings.append(mu.cpu().numpy())
+            
+            embeddings = np.vstack(all_embeddings)
+        
+        print(f"   Computing UMAP on {embeddings.shape[0]} samples with {embeddings.shape[1]} dims...")
+        
+        # Compute UMAP
+        reducer = umap.UMAP(n_neighbors=30, min_dist=0.3, metric='euclidean', random_state=42)
+        umap_coords = reducer.fit_transform(embeddings)
+        
+        # Create figure with subplots
+        fig, axes = plt.subplots(1, 2, figsize=(20, 8))
+        
+        # Plot 1: Color by modality (SC vs ST)
+        ax1 = axes[0]
+        sc_mask = train_modality == 0
+        st_mask = train_modality == 1
+        
+        ax1.scatter(umap_coords[sc_mask, 0], umap_coords[sc_mask, 1], 
+                   c='#1f77b4', s=20, alpha=0.6, label=f'SC (n={sum(sc_mask)})', edgecolors='none')
+        ax1.scatter(umap_coords[st_mask, 0], umap_coords[st_mask, 1], 
+                   c='#ff7f0e', s=20, alpha=0.6, label=f'ST (n={sum(st_mask)})', edgecolors='none')
+        
+        ax1.set_title('UMAP: SC vs ST Modality Alignment', fontsize=14, fontweight='bold')
+        ax1.set_xlabel('UMAP 1', fontsize=12)
+        ax1.set_ylabel('UMAP 2', fontsize=12)
+        ax1.legend(fontsize=11, markerscale=2)
+        ax1.grid(True, alpha=0.3)
+        
+        # Plot 2: Color by cluster (SC only) + ST
+        ax2 = axes[1]
+        
+        if y_train is not None:
+            # Get SC data with cluster labels
+            sc_clusters = y_train
+            n_clusters = len(np.unique(sc_clusters))
+            
+            # Use a colormap for clusters
+            cmap = plt.cm.get_cmap('tab20', n_clusters)
+            
+            # Plot each cluster
+            for cluster_id in np.unique(sc_clusters):
+                cluster_mask_in_sc = sc_clusters == cluster_id
+                # Convert to global index (all train_X)
+                sc_indices = np.where(sc_mask)[0]
+                cluster_global_mask = np.zeros(len(train_X), dtype=bool)
+                cluster_global_mask[sc_indices[cluster_mask_in_sc]] = True
+                
+                ax2.scatter(umap_coords[cluster_global_mask, 0], 
+                           umap_coords[cluster_global_mask, 1],
+                           c=[cmap(cluster_id)], s=20, alpha=0.6, 
+                           label=f'Cluster {cluster_id}', edgecolors='none')
+            
+            # Plot ST in gray
+            ax2.scatter(umap_coords[st_mask, 0], umap_coords[st_mask, 1], 
+                       c='lightgray', s=20, alpha=0.4, label=f'ST (n={sum(st_mask)})', edgecolors='none')
+            
+            ax2.set_title(f'UMAP: SC Clusters (n={n_clusters}) + ST', fontsize=14, fontweight='bold')
+        else:
+            # If no cluster labels, just plot SC and ST
+            ax2.scatter(umap_coords[sc_mask, 0], umap_coords[sc_mask, 1], 
+                       c='#1f77b4', s=20, alpha=0.6, label=f'SC', edgecolors='none')
+            ax2.scatter(umap_coords[st_mask, 0], umap_coords[st_mask, 1], 
+                       c='#ff7f0e', s=20, alpha=0.6, label=f'ST', edgecolors='none')
+            ax2.set_title('UMAP: SC + ST', fontsize=14, fontweight='bold')
+        
+        ax2.set_xlabel('UMAP 1', fontsize=12)
+        ax2.set_ylabel('UMAP 2', fontsize=12)
+        ax2.legend(fontsize=9, markerscale=2, ncol=2, loc='upper right')
+        ax2.grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        plt.savefig(f"{self.output_dir}/modality_alignment_umap.png", dpi=300, bbox_inches='tight')
+        plt.show()
+        
+        print(f"   UMAP visualization saved to: {self.output_dir}/modality_alignment_umap.png")
     
     def save_vae(self, filepath):
         """Save VAE model"""
@@ -523,8 +784,10 @@ class coEncoder:
             'genes': self.genes,
             'input_dim': len(self.genes),
             'latent_dim': self.vae.latent_dim,
+            'output_type': self.vae.output_type,
             'sc_clusters': getattr(self, 'sc_clusters', None),
             'resolution': getattr(self, 'resolution', 0.5),
+            'celltype_key': getattr(self, 'celltype_key', None),
             'cluster_prototypes': cluster_prototypes,
             'cluster_expressions': cluster_expressions,
             'cluster_expressions_full': cluster_expressions_full,
@@ -533,13 +796,16 @@ class coEncoder:
         }, filepath)
     
     def load_vae(self, filepath):
-        """Load VAE model"""
+        """Load VAE model (basic loading for inference)"""
         checkpoint = torch.load(filepath, map_location=self.device)
         
         input_dim = checkpoint['input_dim']
         latent_dim = checkpoint['latent_dim']
         
-        self.vae = VAE(input_dim=input_dim, latent_dim=latent_dim).to(self.device)
+        # Detect output_type from checkpoint
+        output_type = checkpoint.get('output_type', 'mse')
+        
+        self.vae = VAE(input_dim=input_dim, latent_dim=latent_dim, output_type=output_type).to(self.device)
         self.vae.load_state_dict(checkpoint['vae_state_dict'])
         
         self.label_encoder = checkpoint['label_encoder']
@@ -548,37 +814,131 @@ class coEncoder:
         
         print(f"VAE model loaded: {filepath}")
     
+    def load_pretrained(self, filepath):
+        """Load pretrained VAE weights for continued training"""
+        print("="*60)
+        print(f"Loading pretrained weights from: {filepath}")
+        
+        if not os.path.exists(filepath):
+            raise FileNotFoundError(f"Pretrained model not found: {filepath}")
+        
+        checkpoint = torch.load(filepath, map_location=self.device)
+        
+        # Load model architecture info
+        input_dim = checkpoint['input_dim']
+        latent_dim = checkpoint['latent_dim']
+        output_type = checkpoint.get('output_type', 'mse')
+        
+        print(f"   Input dim: {input_dim}")
+        print(f"   Latent dim: {latent_dim}")
+        print(f"   Output type: {output_type}")
+        
+        # Build VAE model with same architecture
+        self.vae = VAE(input_dim=input_dim, latent_dim=latent_dim, output_type=output_type).to(self.device)
+        self.vae.load_state_dict(checkpoint['vae_state_dict'])
+        
+        # Load other components
+        self.label_encoder = checkpoint.get('label_encoder', None)
+        self.marker_genes = checkpoint.get('marker_genes', None)
+        self.genes = checkpoint.get('genes', None)
+        self.all_genes = checkpoint.get('all_genes', None)
+        self.sc_clusters = checkpoint.get('sc_clusters', None)
+        self.resolution = checkpoint.get('resolution', 0.5)
+        self.celltype_key = checkpoint.get('celltype_key', None)
+        
+        # Load cluster info if available
+        self.cluster_prototypes = checkpoint.get('cluster_prototypes', None)
+        self.cluster_expressions = checkpoint.get('cluster_expressions', None)
+        self.cluster_expressions_full = checkpoint.get('cluster_expressions_full', None)
+        self.cluster_expressions_full_count = checkpoint.get('cluster_expressions_full_count', None)
+        
+        if self.cluster_prototypes is not None:
+            print(f"   Loaded {len(self.cluster_prototypes)} cluster prototypes")
+        
+        if self.celltype_key is not None:
+            print(f"   Using celltype annotation: {self.celltype_key}")
+        
+        print("   Pretrained weights loaded successfully!")
+        print("="*60)
+        
+        return output_type, latent_dim
+    
     def run_stage1_training(self, top_n_per_type=100, resolution=0.5, batch_size=256, n_epochs=100, 
-                           lr=1e-3, beta=1.0, hidden_dims=[512, 256], latent_dim=128):
-        """Run stage 1 training: VAE on SC + ST with marker genes"""
+                           lr=1e-3, beta=1.0, hidden_dims=[512, 256], latent_dim=128, loss_type='mse', 
+                           lambda_mmd=0.0, pretrained_path=None, celltype_key=None):
+        """Run stage 1 training: VAE on SC + ST with marker genes
+        
+        Args:
+            top_n_per_type: Number of marker genes per cluster/celltype
+            resolution: Leiden resolution (for auto-clustering, ignored if celltype_key provided)
+            batch_size: Training batch size
+            n_epochs: Number of training epochs
+            lr: Learning rate
+            beta: KL divergence weight
+            hidden_dims: Hidden layer dimensions
+            latent_dim: Latent dimension
+            loss_type: 'mse' or 'zinb'
+            lambda_mmd: MMD loss weight
+            pretrained_path: Path to pretrained checkpoint
+            celltype_key: Column name in sc_adata.obs for celltype annotation.
+                         If None, will auto-cluster using Leiden.
+                         If provided, will use existing celltype annotation.
+        """
         print("="*60)
         print("Stage 1 Training: VAE (SC + ST, Marker Genes)")
         print("="*60)
         print(f"Configuration:")
         print(f"   Marker genes per type: {top_n_per_type}")
+        print(f"   Clustering mode: {'Celltype' if celltype_key else 'Auto-cluster (Leiden)'}")
+        if celltype_key:
+            print(f"   Celltype column: {celltype_key}")
+        else:
+            print(f"   Leiden resolution: {resolution}")
         print(f"   Batch size: {batch_size}")
         print(f"   Epochs: {n_epochs}")
         print(f"   Learning rate: {lr}")
         print(f"   Beta (KL weight): {beta}")
         print(f"   Hidden dims: {hidden_dims}")
         print(f"   Latent dim: {latent_dim}")
+        print(f"   Loss type: {loss_type.upper()}")
+        print(f"   Lambda MMD: {lambda_mmd}")
+        if pretrained_path:
+            print(f"   Pretrained: {pretrained_path}")
         print("="*60)
         
         # 1. Load data
-        sc_adata, st_adata, samples = self.load_data()
+        sc_adata, st_adata = self.load_data()
         
         # 2. Prepare data based on marker genes
         train_X, test_X, train_modality, test_modality, y_train, y_test, sc_X_full_train_count = self.prepare_marker_gene_data(
-            sc_adata, st_adata, top_n_per_type=top_n_per_type, resolution=resolution
+            sc_adata, st_adata, top_n_per_type=top_n_per_type, resolution=resolution, celltype_key=celltype_key
         )
         
-        # 3. Build VAE
+        # 3. Build or load VAE
         input_dim = len(self.genes)
-        self.build_vae(input_dim, hidden_dims=hidden_dims, latent_dim=latent_dim)
+        
+        if pretrained_path and os.path.exists(pretrained_path):
+            # Load pretrained weights
+            pretrained_output_type, pretrained_latent_dim = self.load_pretrained(pretrained_path)
+            
+            # Verify architecture compatibility
+            if input_dim != self.vae.encoder.encoder[0].in_features:
+                print(f"   Warning: Input dim mismatch! Pretrained: {self.vae.encoder.encoder[0].in_features}, Current: {input_dim}")
+                print(f"   Rebuilding VAE from scratch...")
+                self.build_vae(input_dim, hidden_dims=hidden_dims, latent_dim=latent_dim, loss_type=loss_type)
+            else:
+                print(f"   Using pretrained VAE architecture")
+                # Update loss_type from pretrained if not specified
+                if loss_type == 'mse' and pretrained_output_type != 'mse':
+                    print(f"   Note: Pretrained model uses {pretrained_output_type}, current setting is {loss_type}")
+        else:
+            # Build from scratch
+            self.build_vae(input_dim, hidden_dims=hidden_dims, latent_dim=latent_dim, loss_type=loss_type)
         
         # 4. Train VAE
         best_loss = self.train_vae(train_X, test_X, train_modality, test_modality,
-                                  batch_size=batch_size, n_epochs=n_epochs, lr=lr, beta=beta)
+                                  batch_size=batch_size, n_epochs=n_epochs, lr=lr, beta=beta, 
+                                  loss_type=loss_type, lambda_mmd=lambda_mmd)
         
         # Save training data for cluster center computation
         self.train_X = train_X
@@ -661,6 +1021,11 @@ class coEncoder:
         df_full_count.index.name = 'cluster_id'
         df_full_count.to_csv(f"{self.output_dir}/cluster_full_expressions_count.csv")
         
+        # 6. Plot UMAP for modality alignment visualization
+        print("="*60)
+        print("Visualizing modality alignment...")
+        self.plot_modality_alignment_umap(train_X, train_modality, y_train)
+        
         self.save_vae(f"{self.output_dir}/final_vae.pth")
         
         return {
@@ -668,7 +1033,6 @@ class coEncoder:
             'n_genes': len(self.genes),
             'n_clusters': len(self.label_encoder.classes_),
             'model_path': f"{self.output_dir}/final_vae.pth",
-            'samples': samples,
             'clusters': list(self.label_encoder.classes_)
         }
 
@@ -677,17 +1041,23 @@ def main():
     parser = argparse.ArgumentParser(description='Stage 1: VAE Training for SC-ST Integration')
     
     # Data arguments
-    parser.add_argument('--data_dir', type=str, 
-                       default="/home/maweicheng/ST_Graduation_Project/database",
-                       help='Data directory path')
+    parser.add_argument('--sc_file', type=str, required=True,
+                       help='Path to single-cell h5ad file')
+    parser.add_argument('--st_file', type=str, required=True,
+                       help='Path to spatial transcriptomics h5ad file')
     parser.add_argument('--output_dir', type=str, default="./stage1_results",
                        help='Output directory path')
     
+    # Clustering arguments
+    parser.add_argument('--celltype_key', type=str, default=None,
+                       help='Column name in SC adata.obs for celltype annotation. '
+                            'If provided, uses existing celltype instead of auto-clustering (e.g., "cell_type")')
+    parser.add_argument('--resolution', type=float, default=0.5,
+                       help='Leiden clustering resolution (only used if celltype_key is not provided)')
+    
     # Model arguments
     parser.add_argument('--top_n_per_type', type=int, default=100,
-                       help='Marker genes per cluster')
-    parser.add_argument('--resolution', type=float, default=0.5,
-                       help='Leiden clustering resolution')
+                       help='Marker genes per cluster/celltype')
     parser.add_argument('--hidden_dims', type=int, nargs='+', default=[512, 256],
                        help='VAE hidden layer dimensions')
     parser.add_argument('--latent_dim', type=int, default=128,
@@ -702,6 +1072,12 @@ def main():
                        help='Learning rate')
     parser.add_argument('--beta', type=float, default=1.0,
                        help='KL divergence weight (beta-VAE)')
+    parser.add_argument('--loss_type', type=str, default='mse', choices=['mse', 'zinb'],
+                       help='Reconstruction loss type: mse (default) or zinb')
+    parser.add_argument('--lambda_mmd', type=float, default=0.0,
+                       help='MMD loss weight for modality alignment (0=disabled, 1.0=recommended)')
+    parser.add_argument('--pretrained_path', type=str, default=None,
+                       help='Path to pretrained VAE model to continue training')
     
     # Device argument
     parser.add_argument('--device', type=str, default=None,
@@ -712,7 +1088,8 @@ def main():
 
     # Create VAE encoder
     co_encoder = coEncoder(
-        data_dir=args.data_dir,
+        sc_file=args.sc_file,
+        st_file=args.st_file,
         output_dir=args.output_dir,
         device=args.device
     )
@@ -726,7 +1103,11 @@ def main():
         lr=args.lr,
         beta=args.beta,
         hidden_dims=args.hidden_dims,
-        latent_dim=args.latent_dim
+        latent_dim=args.latent_dim,
+        loss_type=args.loss_type,
+        lambda_mmd=args.lambda_mmd,
+        pretrained_path=args.pretrained_path,
+        celltype_key=args.celltype_key
     )
     
 if __name__ == "__main__":

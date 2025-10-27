@@ -41,7 +41,7 @@ class SpatialDataset(Dataset):
 
 class GATDeconvolution:
     """Stage 2: GAT deconvolution trainer"""
-    def __init__(self, stage1_model_path: str, output_dir: str = "./stage2_results/", device: str = None):
+    def __init__(self, stage1_model_path: str, output_dir: str = "./stage2_results/", device: str = None, weight_threshold: float = 0.01):
 
         self.stage1_model_path = stage1_model_path
         self.output_dir = output_dir
@@ -53,10 +53,14 @@ class GATDeconvolution:
         else:
             self.device = torch.device(device)
         
+        # Weight threshold for sparsification
+        self.weight_threshold = weight_threshold
+        
         print("="*60)
         print(f"Stage 1 model: {stage1_model_path}")
         print(f"Output directory: {output_dir}")
         print(f"Device: {self.device}")
+        print(f"Weight threshold: {weight_threshold}")
     
         # Model components
         self.vae_encoder = None
@@ -66,6 +70,8 @@ class GATDeconvolution:
         self.marker_genes = None
         self.celltype_prototypes = None
         self.celltype_expressions = None
+        self.cluster_to_celltype = None  # Mapping from cluster index to celltype name
+        self.celltype_key = None  # Track which celltype column was used
         
         # Graph construction parameters
         self.k_spatial = 20
@@ -81,9 +87,13 @@ class GATDeconvolution:
         # Rebuild VAE
         input_dim = checkpoint['input_dim']
         latent_dim = checkpoint['latent_dim']
+        output_type = checkpoint.get('output_type', 'mse')  # Get output_type from checkpoint
+        
+        print(f"   VAE architecture: {input_dim} -> {latent_dim}")
+        print(f"   Output type: {output_type}")
         
         # Use only encoder part
-        full_vae = VAE(input_dim=input_dim, latent_dim=latent_dim).to(self.device)
+        full_vae = VAE(input_dim=input_dim, latent_dim=latent_dim, output_type=output_type).to(self.device)
         full_vae.load_state_dict(checkpoint['vae_state_dict'])
         
         # Extract encoder
@@ -96,18 +106,29 @@ class GATDeconvolution:
         self.genes = checkpoint['genes']
         self.sc_clusters = checkpoint.get('sc_clusters', None)
         self.resolution = checkpoint.get('resolution', 0.5)
+        self.celltype_key = checkpoint.get('celltype_key', None)  # Get celltype mode info
+        
+        # Load cluster-to-celltype mapping if available
+        self.cluster_to_celltype = None
+        if self.celltype_key is not None:
+            # If using celltype mode, create mapping from label_encoder
+            # label_encoder.classes_ contains celltype names
+            self.cluster_to_celltype = {i: ct for i, ct in enumerate(self.label_encoder.classes_)}
+            print(f"Celltype mode: {self.celltype_key}")
+            print(f"Cluster → CellType mapping: {self.cluster_to_celltype}")
         
         # Load cluster prototypes
         cluster_prototypes = checkpoint.get('cluster_prototypes', None)
         if cluster_prototypes is not None:
             # Convert to tensor format
+            # cluster_prototypes is a dict with numeric keys (0, 1, 2, ...)
+            # regardless of whether using celltype annotation or auto-clustering
             prototype_list = []
             for i in range(len(self.label_encoder.classes_)):
-                cluster_id = i
-                if cluster_id in cluster_prototypes:
-                    prototype_list.append(cluster_prototypes[cluster_id])
+                if i in cluster_prototypes:
+                    prototype_list.append(cluster_prototypes[i])
                 else:
-                    print(f"Warning: cluster {cluster_id} missing center, using zero vector")
+                    print(f"Warning: cluster {i} missing center, using zero vector")
                     prototype_list.append(np.zeros(latent_dim))
             
             self.celltype_prototypes = torch.FloatTensor(np.array(prototype_list)).to(self.device)
@@ -120,13 +141,13 @@ class GATDeconvolution:
         cluster_expressions = checkpoint.get('cluster_expressions', None)
         if cluster_expressions is not None:
             # Convert to tensor format
+            # cluster_expressions is a dict with numeric keys (0, 1, 2, ...)
             expression_list = []
             for i in range(len(self.label_encoder.classes_)):
-                cluster_id = i
-                if cluster_id in cluster_expressions:
-                    expression_list.append(cluster_expressions[cluster_id])
+                if i in cluster_expressions:
+                    expression_list.append(cluster_expressions[i])
                 else:
-                    print(f"Warning: cluster {cluster_id} missing expression, using zero vector")
+                    print(f"Warning: cluster {i} missing expression, using zero vector")
                     expression_list.append(np.zeros(input_dim))
             
             self.celltype_expressions = torch.FloatTensor(np.array(expression_list)).to(self.device)
@@ -144,13 +165,13 @@ class GATDeconvolution:
         
         if cluster_expressions_full_count is not None:
             # Convert to list format
+            # cluster_expressions_full_count is a dict with numeric keys (0, 1, 2, ...)
             expression_full_list = []
             for i in range(len(self.label_encoder.classes_)):
-                cluster_id = i
-                if cluster_id in cluster_expressions_full_count:
-                    expression_full_list.append(cluster_expressions_full_count[cluster_id])
+                if i in cluster_expressions_full_count:
+                    expression_full_list.append(cluster_expressions_full_count[i])
                 else:
-                    print(f"Warning: cluster {cluster_id} missing full gene expression")
+                    print(f"Warning: cluster {i} missing full gene expression")
                     expression_full_list.append(None)
             
             self.celltype_expressions_full = expression_full_list
@@ -307,7 +328,7 @@ class GATDeconvolution:
         # Optimizer
         optimizer = torch.optim.Adam(self.gat_model.parameters(), lr=lr)
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode='min', patience=5, factor=0.5, verbose=True
+            optimizer, mode='min', patience=20, factor=0.5, verbose=True
         )
         
         # Training history
@@ -412,6 +433,18 @@ class GATDeconvolution:
             deconv_weights = gat_outputs['deconv_weights'].detach().cpu().numpy()
             attention_scores = gat_outputs['attention_scores'].detach().cpu().numpy()
         
+        # Apply weight threshold (sparsification)
+        print(f"Applying weight threshold: {self.weight_threshold}")
+        original_nonzero = np.count_nonzero(deconv_weights)
+        deconv_weights[deconv_weights < self.weight_threshold] = 0
+        new_nonzero = np.count_nonzero(deconv_weights)
+        print(f"   Non-zero elements: {original_nonzero} -> {new_nonzero} ({100*new_nonzero/deconv_weights.size:.1f}%)")
+        
+        # Renormalize weights to sum to 1 per spot (after thresholding)
+        row_sums = deconv_weights.sum(axis=1, keepdims=True)
+        row_sums[row_sums == 0] = 1  # Avoid division by zero
+        deconv_weights = deconv_weights / row_sums
+        
         print("Saving deconvolution results...")
         weights_file = f"{self.output_dir}/{sample_name}_deconv_weights.npz"
         np.savez(weights_file, 
@@ -465,15 +498,68 @@ class GATDeconvolution:
             full_expr_file = f"{self.output_dir}/{sample_name}_reconstructed_all_genes.csv"
             full_expr_df.to_csv(full_expr_file)
         
-        # 3. Cell type composition matrix (spot × cluster)
+        # 3. Cell type composition matrix (spot × cluster/celltype)
         print("   Cell type composition...")
-        composition_df = pd.DataFrame(
-            deconv_weights,
-            columns=[f"Cluster_{int(c)}" for c in self.label_encoder.classes_],
-            index=spot_barcodes
-        )
-        composition_file = f"{self.output_dir}/{sample_name}_cell_composition.csv"
-        composition_df.to_csv(composition_file)
+        
+        if self.cluster_to_celltype is not None:
+            # Celltype mode: only save celltype composition
+            columns = [self.cluster_to_celltype[i] for i in range(len(self.label_encoder.classes_))]
+            composition_df = pd.DataFrame(
+                deconv_weights,
+                columns=columns,
+                index=spot_barcodes
+            )
+            composition_file = f"{self.output_dir}/{sample_name}_celltype_composition.csv"
+            composition_df.to_csv(composition_file)
+            print(f"   Saved celltype composition: {composition_file}")
+        else:
+            # Auto-cluster mode: map clusters to celltypes
+            # First, load the cluster-celltype mapping from checkpoint
+            cluster_list = list(self.label_encoder.classes_)
+            
+            # Get cluster-to-celltype mapping from checkpoint if available
+            checkpoint_cluster_to_celltype = {}
+            checkpoint = torch.load(self.stage1_model_path, map_location=self.device)
+            sc_clustered_path = f"{os.path.dirname(self.stage1_model_path)}/sc_adata_clustered.h5ad"
+            
+            if os.path.exists(sc_clustered_path):
+                # Load the clustered adata to get cluster-celltype mapping
+                sc_clustered = sc.read_h5ad(sc_clustered_path)
+                if 'leiden' in sc_clustered.obs.columns and 'cell_type' in sc_clustered.obs.columns:
+                    for cluster_id in sorted(sc_clustered.obs['leiden'].unique()):
+                        cluster_mask = sc_clustered.obs['leiden'] == cluster_id
+                        celltype_counts = sc_clustered.obs[cluster_mask]['cell_type'].value_counts()
+                        major_celltype = celltype_counts.index[0]
+                        checkpoint_cluster_to_celltype[str(cluster_id)] = major_celltype
+            
+            # Map cluster columns to celltype names
+            celltype_columns = []
+            cluster_columns = []
+            for cluster_id in cluster_list:
+                cluster_columns.append(str(cluster_id))
+                # Use the mapping if available, otherwise use cluster ID as is
+                celltype_name = checkpoint_cluster_to_celltype.get(str(cluster_id), f"Cluster_{cluster_id}")
+                celltype_columns.append(celltype_name)
+            
+            # cell_composition.csv (with celltype names)
+            composition_df = pd.DataFrame(
+                deconv_weights,
+                columns=celltype_columns,
+                index=spot_barcodes
+            )
+            composition_file = f"{self.output_dir}/{sample_name}_cell_composition.csv"
+            composition_df.to_csv(composition_file)
+            print(f"   Saved cell composition (celltype): {composition_file}")
+            
+            # cluster_composition.csv (with cluster IDs)
+            cluster_composition_df = pd.DataFrame(
+                deconv_weights,
+                columns=cluster_columns,
+                index=spot_barcodes
+            )
+            cluster_file = f"{self.output_dir}/{sample_name}_cluster_composition.csv"
+            cluster_composition_df.to_csv(cluster_file)
+            print(f"   Saved cluster composition: {cluster_file}")
         
         # Save results summary
         results = {
@@ -601,6 +687,10 @@ def main():
     parser.add_argument('--cells_per_spot', type=float, default=10.0,
                        help='Average number of cells per spot (default 10 for Visium)')
     
+    # Weight thresholding argument
+    parser.add_argument('--weight_threshold', type=float, default=0.01,
+                       help='Weight threshold for sparsification (default 0.01, i.e., 1%)')
+    
     # Device argument
     parser.add_argument('--device', type=str, default=None,
                        help='Computing device (cuda/cpu, None for auto-select)')
@@ -622,7 +712,8 @@ def main():
     trainer = GATDeconvolution(
         stage1_model_path=args.stage1_model_path,
         output_dir=args.output_dir,
-        device=args.device
+        device=args.device,
+        weight_threshold=args.weight_threshold
     )
     
     # Set graph construction parameters

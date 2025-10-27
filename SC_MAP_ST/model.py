@@ -41,6 +41,40 @@ class VAEEncoder(nn.Module):
         log_var = self.fc_var(h)
         return mu, log_var
 
+
+class ImageEncoder(nn.Module):
+    """图像编码器 - 使用预训练 ResNet"""
+    def __init__(self, latent_dim=128, pretrained=True):
+        super().__init__()
+        
+        # 使用 ResNet18 作为 backbone
+        import torchvision.models as models
+        resnet = models.resnet18(pretrained=pretrained)
+        
+        # 移除最后的全连接层
+        self.features = nn.Sequential(*list(resnet.children())[:-1])
+        
+        # ResNet18 最后的特征维度是 512
+        self.fc_mu = nn.Linear(512, latent_dim)
+        self.fc_var = nn.Linear(512, latent_dim)
+        
+    def forward(self, x):
+        """
+        Args:
+            x: [batch_size, 3, H, W] 图像 patch
+        Returns:
+            mu, log_var: 潜在空间的均值和方差
+        """
+        # 提取特征
+        features = self.features(x)  # [batch_size, 512, 1, 1]
+        features = features.view(features.size(0), -1)  # [batch_size, 512]
+        
+        # 编码到潜在空间
+        mu = self.fc_mu(features)
+        log_var = self.fc_var(features)
+        
+        return mu, log_var
+
 class VAEDecoder(nn.Module):
     """VAE解码器"""
     def __init__(self, latent_dim, hidden_dims=[256, 512], output_dim=None, dropout=0.2):
@@ -115,6 +149,122 @@ class VAE(nn.Module):
         z = self.reparameterize(mu, log_var)
         return z, mu, log_var
 
+
+class MultiModalVAE(nn.Module):
+    """多模态 VAE - 融合基因表达和图像特征
+    
+    用于 ST 数据：基因表达 + 图像 patch → 共享 latent space
+    """
+    def __init__(self, gene_input_dim, latent_dim=128, 
+                 hidden_dims=[512, 256], dropout=0.2, 
+                 fusion_method='concat', pretrained_resnet=True):
+        super().__init__()
+        
+        self.latent_dim = latent_dim
+        self.fusion_method = fusion_method  # 'concat', 'add', 'product'
+        
+        # 1. 基因表达编码器
+        self.gene_encoder = VAEEncoder(
+            input_dim=gene_input_dim,
+            hidden_dims=hidden_dims,
+            latent_dim=latent_dim,
+            dropout=dropout
+        )
+        
+        # 2. 图像编码器
+        self.image_encoder = ImageEncoder(
+            latent_dim=latent_dim,
+            pretrained=pretrained_resnet
+        )
+        
+        # 3. 融合层
+        if fusion_method == 'concat':
+            # 拼接后再融合
+            self.fusion_mu = nn.Linear(latent_dim * 2, latent_dim)
+            self.fusion_var = nn.Linear(latent_dim * 2, latent_dim)
+        elif fusion_method == 'add':
+            # 直接相加（需要归一化）
+            self.fusion_norm = nn.LayerNorm(latent_dim)
+        elif fusion_method == 'product':
+            # 逐元素乘积
+            self.fusion_scale = nn.Parameter(torch.ones(latent_dim))
+        
+        # 4. 解码器（只重建基因表达）
+        decoder_hidden = hidden_dims[::-1]
+        self.decoder = VAEDecoder(
+            latent_dim=latent_dim,
+            hidden_dims=decoder_hidden,
+            output_dim=gene_input_dim,
+            dropout=dropout
+        )
+        
+    def reparameterize(self, mu, log_var):
+        """重参数化技巧"""
+        std = torch.exp(0.5 * log_var)
+        eps = torch.randn_like(std)
+        return mu + eps * std
+    
+    def fuse_modalities(self, gene_mu, gene_log_var, image_mu, image_log_var):
+        """融合基因和图像的潜在表示"""
+        if self.fusion_method == 'concat':
+            # 拼接
+            combined = torch.cat([gene_mu, image_mu], dim=-1)
+            fused_mu = self.fusion_mu(combined)
+            fused_log_var = self.fusion_var(combined)
+            
+        elif self.fusion_method == 'add':
+            # 加权平均
+            fused_mu = self.fusion_norm(gene_mu + image_mu)
+            # 方差取平均
+            fused_log_var = (gene_log_var + image_log_var) / 2
+            
+        elif self.fusion_method == 'product':
+            # 逐元素乘积（Product of Experts）
+            # 1/σ² = 1/σ₁² + 1/σ₂²
+            prec_gene = torch.exp(-gene_log_var)
+            prec_image = torch.exp(-image_log_var)
+            fused_prec = prec_gene + prec_image
+            fused_log_var = -torch.log(fused_prec + 1e-8)
+            
+            # μ = (μ₁/σ₁² + μ₂/σ₂²) / (1/σ₁² + 1/σ₂²)
+            fused_mu = (gene_mu * prec_gene + image_mu * prec_image) / (fused_prec + 1e-8)
+            fused_mu = fused_mu * self.fusion_scale
+            
+        return fused_mu, fused_log_var
+        
+    def forward(self, gene_x, image_x):
+        """
+        Args:
+            gene_x: [batch_size, n_genes] 基因表达
+            image_x: [batch_size, 3, H, W] 图像 patch
+        """
+        # 1. 分别编码
+        gene_mu, gene_log_var = self.gene_encoder(gene_x)
+        image_mu, image_log_var = self.image_encoder(image_x)
+        
+        # 2. 融合
+        fused_mu, fused_log_var = self.fuse_modalities(
+            gene_mu, gene_log_var, image_mu, image_log_var
+        )
+        
+        # 3. 重参数化
+        z = self.reparameterize(fused_mu, fused_log_var)
+        
+        # 4. 解码（重建基因表达）
+        gene_recon = self.decoder(z)
+        
+        return gene_recon, fused_mu, fused_log_var, z, gene_mu, image_mu
+    
+    def encode(self, gene_x, image_x):
+        """仅编码，返回融合的潜在表示"""
+        gene_mu, gene_log_var = self.gene_encoder(gene_x)
+        image_mu, image_log_var = self.image_encoder(image_x)
+        fused_mu, fused_log_var = self.fuse_modalities(
+            gene_mu, gene_log_var, image_mu, image_log_var
+        )
+        z = self.reparameterize(fused_mu, fused_log_var)
+        return z, fused_mu, fused_log_var
+
 # Loss Functions
 def vae_loss_function(recon_x, x, mu, log_var, beta=1.0):
     """VAE损失函数：重建损失 + KL散度"""
@@ -128,6 +278,82 @@ def vae_loss_function(recon_x, x, mu, log_var, beta=1.0):
     total_loss = recon_loss + beta * kl_div
     
     return total_loss, recon_loss, kl_div
+
+
+def multimodal_vae_loss(recon_x, x, mu, log_var, beta=1.0):
+    """多模态 VAE 损失（与单模态相同，但用于多模态模型）"""
+    return vae_loss_function(recon_x, x, mu, log_var, beta)
+
+
+def alignment_loss(sc_mu, st_mu, method='mmd', temperature=0.1):
+    """SC-ST 对齐损失
+    
+    Args:
+        sc_mu: SC 的潜在表示 [batch_sc, latent_dim]
+        st_mu: ST 的潜在表示 [batch_st, latent_dim]
+        method: 'mmd' (Maximum Mean Discrepancy) 或 'contrastive' (对比学习)
+        temperature: 对比学习的温度参数
+    
+    Returns:
+        alignment_loss: 对齐损失值
+    """
+    if method == 'mmd':
+        # Maximum Mean Discrepancy (MMD)
+        # 衡量两个分布的距离
+        
+        def gaussian_kernel(x, y, sigma=1.0):
+            """高斯核"""
+            x_size = x.size(0)
+            y_size = y.size(0)
+            dim = x.size(1)
+            
+            x = x.unsqueeze(1)  # [x_size, 1, dim]
+            y = y.unsqueeze(0)  # [1, y_size, dim]
+            
+            tiled_x = x.expand(x_size, y_size, dim)
+            tiled_y = y.expand(x_size, y_size, dim)
+            
+            kernel_input = torch.pow(tiled_x - tiled_y, 2).sum(2)
+            return torch.exp(-kernel_input / (2 * sigma))
+        
+        # 计算 MMD
+        xx = gaussian_kernel(sc_mu, sc_mu).mean()
+        yy = gaussian_kernel(st_mu, st_mu).mean()
+        xy = gaussian_kernel(sc_mu, st_mu).mean()
+        
+        mmd_loss = xx + yy - 2 * xy
+        return mmd_loss
+        
+    elif method == 'contrastive':
+        # 对比学习：拉近 SC-ST 的距离，推远不匹配的对
+        # 这里假设 batch 内的 SC 和 ST 是对齐的（同一个样本的不同模态）
+        
+        # 归一化
+        sc_norm = F.normalize(sc_mu, p=2, dim=1)
+        st_norm = F.normalize(st_mu, p=2, dim=1)
+        
+        # 计算相似度矩阵
+        similarity = torch.matmul(sc_norm, st_norm.T) / temperature  # [batch_sc, batch_st]
+        
+        # 对角线是正样本对，其他是负样本
+        batch_size = sc_mu.size(0)
+        labels = torch.arange(batch_size, device=sc_mu.device)
+        
+        # InfoNCE 损失（双向）
+        loss_sc_to_st = F.cross_entropy(similarity, labels)
+        loss_st_to_sc = F.cross_entropy(similarity.T, labels)
+        
+        contrastive_loss = (loss_sc_to_st + loss_st_to_sc) / 2
+        return contrastive_loss
+        
+    elif method == 'kl':
+        # KL 散度（假设都是高斯分布）
+        # 简化版本：直接计算均值的 L2 距离
+        kl_loss = F.mse_loss(sc_mu, st_mu)
+        return kl_loss
+        
+    else:
+        raise ValueError(f"Unknown alignment method: {method}")
 
 # ================================
 # Stage 2: GAT Models

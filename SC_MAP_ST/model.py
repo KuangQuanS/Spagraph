@@ -513,20 +513,20 @@ class HeterogeneousGATDeconvolution(nn.Module):
 class SpatialDeconvolutionLoss(nn.Module):
     """空间解卷积损失函数
     
-    L_total = λ_pearson·L_pearson + λ_cosine·L_cosine + λ_align·L_align + λ_reg·L_reg + λ_sparse·L_sparse
+    L_total = λ_mse·L_mse + λ_cosine·L_cosine + λ_align·L_align + λ_reg·L_reg + λ_sparse·L_sparse
     
     其中：
-    - L_pearson: Pearson相关系数损失（基因表达相似性）
+    - L_mse: 均方误差损失（基因表达重建误差）
     - L_cosine: Cosine相似度损失（基因表达相似性）
     - L_align: Cosine Alignment模态对齐损失（embedding空间）
     - L_reg: 权重正则化
     - L_sparse: 稀疏性正则化
     """
     
-    def __init__(self, lambda_pearson=1.0, lambda_cosine=1.0, lambda_align=1.0, 
+    def __init__(self, lambda_mse=1.0, lambda_cosine=1.0, lambda_align=1.0, 
                  lambda_reg=0.5, lambda_sparse=0.01):
         super().__init__()
-        self.lambda_pearson = lambda_pearson  # Pearson损失权重
+        self.lambda_mse = lambda_mse          # MSE损失权重
         self.lambda_cosine = lambda_cosine    # Cosine损失权重
         self.lambda_align = lambda_align      # 模态对齐权重
         self.lambda_reg = lambda_reg          # 权重正则化权重
@@ -556,14 +556,8 @@ class SpatialDeconvolutionLoss(nn.Module):
         # 计算重建的spot表达
         reconstructed_spot = torch.matmul(attention_weights, celltype_expression)  # [n_spots, n_genes]
         
-        # ============ 1. Pearson Correlation Loss ============
-        # Pearson相关系数（衡量线性相关性）
-        pred_centered = reconstructed_spot - reconstructed_spot.mean(dim=1, keepdim=True)
-        target_centered = true_spot_expression - true_spot_expression.mean(dim=1, keepdim=True)
-        numerator = (pred_centered * target_centered).sum(dim=1)
-        denominator = torch.sqrt((pred_centered**2).sum(dim=1) * (target_centered**2).sum(dim=1) + 1e-8)
-        pearson_corr = numerator / denominator
-        L_pearson = 1.0 - pearson_corr.mean()
+        # ============ 1. MSE Loss (重建误差) ============
+        L_mse = F.mse_loss(reconstructed_spot, true_spot_expression)
         
         # ============ 2. Cosine Similarity Loss ============
         # Cosine相似度（越接近1越好）
@@ -591,7 +585,7 @@ class SpatialDeconvolutionLoss(nn.Module):
         sparsity_loss = -torch.mean(attention_weights * torch.log(attention_weights + 1e-8))
         
         # ============ 总损失 ============
-        total_loss = (self.lambda_pearson * L_pearson +
+        total_loss = (self.lambda_mse * L_mse +
                      self.lambda_cosine * L_cosine +
                      self.lambda_align * L_align +
                      self.lambda_reg * weight_sum_loss +
@@ -599,11 +593,10 @@ class SpatialDeconvolutionLoss(nn.Module):
         
         return {
             'total_loss': total_loss,
-            'pearson_loss': L_pearson,
+            'mse_loss': L_mse,
             'cosine_loss': L_cosine,
             'alignment_loss': L_align,
             'weight_reg': weight_sum_loss,
             'sparsity_loss': sparsity_loss,
-            'pearson_corr': pearson_corr.mean(),
             'cos_sim_rec': cos_sim_rec.mean(),
         }

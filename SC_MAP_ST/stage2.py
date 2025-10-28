@@ -199,7 +199,7 @@ class GATDeconvolution:
             param.requires_grad = False
        
     def build_gat_model(self, n_cell_types: int, gat_hidden_dim=64, gat_layers=3, 
-                       gat_heads=4, dropout=0.1, loss_lambda_pearson=1.0,
+                       gat_heads=4, dropout=0.1, loss_lambda_mse=1.0,
                        loss_lambda_cosine=1.0, loss_lambda_align=1.0, 
                        loss_lambda_reg=0.5, loss_lambda_sparse=0.01):
         """Build GAT deconvolution model"""
@@ -209,7 +209,7 @@ class GATDeconvolution:
         print(f"Layers: {gat_layers}")
         print(f"Attention heads: {gat_heads}")
         print(f"Dropout: {dropout}")
-        print(f"Loss: λ_pearson={loss_lambda_pearson}, λ_cosine={loss_lambda_cosine}, "
+        print(f"Loss: λ_mse={loss_lambda_mse}, λ_cosine={loss_lambda_cosine}, "
               f"λ_align={loss_lambda_align}, λ_reg={loss_lambda_reg}, λ_sparse={loss_lambda_sparse}")
         
         self.gat_model = HeterogeneousGATDeconvolution(
@@ -224,7 +224,7 @@ class GATDeconvolution:
         ).to(self.device)
         
         self.loss_fn = SpatialDeconvolutionLoss(
-            lambda_pearson=loss_lambda_pearson,
+            lambda_mse=loss_lambda_mse,
             lambda_cosine=loss_lambda_cosine,
             lambda_align=loss_lambda_align,
             lambda_reg=loss_lambda_reg,
@@ -242,12 +242,11 @@ class GATDeconvolution:
         
         epoch_losses = {
             'total_loss': 0.0,
-            'pearson_loss': 0.0,
+            'mse_loss': 0.0,
             'cosine_loss': 0.0,
             'alignment_loss': 0.0,
             'weight_reg': 0.0,
             'sparsity_loss': 0.0,
-            'pearson_corr': 0.0,
             'cos_sim_rec': 0.0
         }
         
@@ -333,7 +332,7 @@ class GATDeconvolution:
         
         # Training history
         train_losses = []
-        pcc_losses = []
+        mse_losses = []
         cos_losses = []
         weight_regs = []
         sparsity_regs = []
@@ -353,7 +352,7 @@ class GATDeconvolution:
             # Record average loss
             avg_total_loss = epoch_losses['total_loss']
             train_losses.append(avg_total_loss)
-            pcc_losses.append(epoch_losses['pearson_loss'])
+            mse_losses.append(epoch_losses['mse_loss'])
             cos_losses.append(epoch_losses['cosine_loss'])
             weight_regs.append(epoch_losses['weight_reg'])
             sparsity_regs.append(epoch_losses.get('sparsity_loss', 0.0))
@@ -364,7 +363,7 @@ class GATDeconvolution:
             # Update progress bar with loss info
             pbar.set_postfix({
                 'Total': f'{avg_total_loss:.4f}',
-                'Pearson': f'{epoch_losses["pearson_loss"]:.4f}',
+                'MSE': f'{epoch_losses["mse_loss"]:.4f}',
                 'Cosine': f'{epoch_losses["cosine_loss"]:.4f}',
                 'Align': f'{epoch_losses["alignment_loss"]:.4f}'
             })
@@ -384,7 +383,7 @@ class GATDeconvolution:
                 break
         
         # Plot training curves
-        self.plot_training_curves(train_losses, pcc_losses, cos_losses, weight_regs, sparsity_regs, sample_name)
+        self.plot_training_curves(train_losses, mse_losses, cos_losses, weight_regs, sparsity_regs, sample_name)
         
         # Save final model
         self.save_model(f"{self.output_dir}/final_gat_model.pth")
@@ -540,18 +539,30 @@ class GATDeconvolution:
                 # Use the mapping if available, otherwise use cluster ID as is
                 celltype_name = checkpoint_cluster_to_celltype.get(str(cluster_id), f"Cluster_{cluster_id}")
                 celltype_columns.append(celltype_name)
-            
-            # cell_composition.csv (with celltype names)
+
+            # Create DataFrame with possibly duplicate column names (multiple clusters -> same celltype)
             composition_df = pd.DataFrame(
                 deconv_weights,
                 columns=celltype_columns,
                 index=spot_barcodes
             )
+
+            # 如果存在重复的 celltype 名称，则将对应列合并（按列求和）并记录日志
+            dup_names = [name for name in set(celltype_columns) if celltype_columns.count(name) > 1]
+            if len(dup_names) > 0:
+                print(f"   Found duplicate celltype names: {dup_names}. Merging corresponding cluster columns by summing weights.")
+                # groupby on columns will sum duplicated-named columns
+                composition_by_celltype = composition_df.groupby(by=composition_df.columns, axis=1).sum()
+                print(f"   Columns before: {len(composition_df.columns)}, after merge: {len(composition_by_celltype.columns)}")
+            else:
+                composition_by_celltype = composition_df
+
+            # Save aggregated celltype composition
             composition_file = f"{self.output_dir}/{sample_name}_cell_composition.csv"
-            composition_df.to_csv(composition_file)
+            composition_by_celltype.to_csv(composition_file)
             print(f"   Saved cell composition (celltype): {composition_file}")
-            
-            # cluster_composition.csv (with cluster IDs)
+
+            # Also save cluster-level composition (columns are cluster IDs) for reproducibility
             cluster_composition_df = pd.DataFrame(
                 deconv_weights,
                 columns=cluster_columns,
@@ -576,7 +587,7 @@ class GATDeconvolution:
         np.savez(results_file, **results)
         print(f"   Complete results saved: {results_file}")
     
-    def plot_training_curves(self, train_losses, pcc_losses, cos_losses, weight_regs, sparsity_regs, sample_name):
+    def plot_training_curves(self, train_losses, mse_losses, cos_losses, weight_regs, sparsity_regs, sample_name):
         """Plot training curves"""
         fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(15, 10))
         
@@ -590,7 +601,7 @@ class GATDeconvolution:
         ax1.grid(True)
         
         # Reconstruction losses
-        ax2.plot(epochs, pcc_losses, 'orange', label='PCC')
+        ax2.plot(epochs, mse_losses, 'green', label='MSE')
         ax2.plot(epochs, cos_losses, 'red', label='Cosine')
         ax2.set_title('Reconstruction Losses')
         ax2.set_xlabel('Epochs')
@@ -672,8 +683,8 @@ def main():
                        help='Batch size')
     
     # Loss function arguments
-    parser.add_argument('--loss_lambda_pearson', type=float, default=1.0,
-                       help='Pearson correlation loss weight')
+    parser.add_argument('--loss_lambda_mse', type=float, default=1.0,
+                       help='MSE reconstruction loss weight')
     parser.add_argument('--loss_lambda_cosine', type=float, default=1.0,
                        help='Cosine similarity loss weight')
     parser.add_argument('--loss_lambda_align', type=float, default=1.0,
@@ -760,6 +771,7 @@ def main():
     print(f"ST matching genes: {len(trainer.genes)}/{len(trainer.genes)}")
     
     # Extract ST data
+
     # sc.pp.log1p(st_subset)
     st_X = st_subset.X.toarray() if hasattr(st_subset.X, 'toarray') else st_subset.X
     
@@ -778,7 +790,7 @@ def main():
         gat_layers=args.gat_layers,
         gat_heads=args.gat_heads,
         dropout=args.dropout,
-        loss_lambda_pearson=args.loss_lambda_pearson,
+        loss_lambda_mse=args.loss_lambda_mse,
         loss_lambda_cosine=args.loss_lambda_cosine,
         loss_lambda_align=args.loss_lambda_align,
         loss_lambda_reg=args.loss_lambda_reg,

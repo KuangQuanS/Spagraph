@@ -1,1 +1,0 @@
-python train.py --data_dir ./breast_data  --vocab_file ./STEncoder/gene_tokenizer_vocab_nolab.json  --output_dir ./checkpoint/20250729/  --bert_pretrained_model /home/maweicheng/ST_COMM/STEncoder/checkpoints/attention_pretrain/breast/nolab/bert_20250728_2205/bert_mlm_final  --resnet_pretrained --contrast_loss

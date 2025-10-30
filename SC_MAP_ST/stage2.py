@@ -445,11 +445,11 @@ class GATDeconvolution:
         deconv_weights = deconv_weights / row_sums
         
         print("Saving deconvolution results...")
-        weights_file = f"{self.output_dir}/{sample_name}_deconv_weights.npz"
-        np.savez(weights_file, 
-                deconv_weights=deconv_weights,
-                attention_scores=attention_scores,
-                clusters=self.label_encoder.classes_)
+        # weights_file = f"{self.output_dir}/{sample_name}_deconv_weights.npz"
+        # np.savez(weights_file, 
+        #         deconv_weights=deconv_weights,
+        #         attention_scores=attention_scores,
+        #         clusters=self.label_encoder.classes_)
         
         # ============ Generate expression matrices ============
         n_spots = deconv_weights.shape[0]
@@ -573,19 +573,87 @@ class GATDeconvolution:
             print(f"   Saved cluster composition: {cluster_file}")
         
         # Save results summary
-        results = {
-            'deconv_weights': deconv_weights,
-            'attention_scores': attention_scores,
-            'clusters': list(self.label_encoder.classes_),
-            'sample_name': sample_name,
-            'marker_genes': self.genes,
-            'n_spots': n_spots,
-            'n_clusters': n_clusters
-        }
+        # results = {
+        #     'deconv_weights': deconv_weights,
+        #     'attention_scores': attention_scores,
+        #     'clusters': list(self.label_encoder.classes_),
+        #     'sample_name': sample_name,
+        #     'marker_genes': self.genes,
+        #     'n_spots': n_spots,
+        #     'n_clusters': n_clusters
+        # }
         
-        results_file = f"{self.output_dir}/{sample_name}_deconvolution_results.npz"
-        np.savez(results_file, **results)
-        print(f"   Complete results saved: {results_file}")
+        # results_file = f"{self.output_dir}/{sample_name}_deconvolution_results.npz"
+        # np.savez(results_file, **results)
+        # print(f"   Complete results saved: {results_file}")
+        
+        # ========== 额外保存 CSV 供 train.py 使用 ==========
+        print("\nSaving cluster expression data for train.py...")
+        
+        # 1. 保存 cluster 平均 marker 基因表达 CSV
+        cluster_list = list(self.label_encoder.classes_)
+        celltype_expr_marker = self.celltype_expressions.cpu().numpy()
+        
+        marker_expr_df = pd.DataFrame(
+            celltype_expr_marker,
+            columns=self.genes,
+            index=[f"Cluster_{i}" for i in cluster_list]
+        )
+        marker_expr_file = f"{self.output_dir}/{sample_name}_cluster_marker_expr.csv"
+        marker_expr_df.to_csv(marker_expr_file)
+        print(f"   ✅ Cluster marker gene expression: {marker_expr_file}")
+        
+        # 2. 保存 cluster 平均全基因表达 CSV
+        if self.celltype_expressions_full is not None and all(expr is not None for expr in self.celltype_expressions_full):
+            celltype_expr_full = np.array(self.celltype_expressions_full)
+            
+            # Get full gene names
+            if self.all_genes is not None:
+                all_gene_names = self.all_genes
+            else:
+                all_gene_names = [f"Gene_{i}" for i in range(celltype_expr_full.shape[1])]
+            
+            full_expr_df = pd.DataFrame(
+                celltype_expr_full,
+                columns=all_gene_names,
+                index=[f"Cluster_{i}" for i in cluster_list]
+            )
+            full_expr_file = f"{self.output_dir}/{sample_name}_cluster_full_expr.csv"
+            full_expr_df.to_csv(full_expr_file)
+            print(f"   ✅ Cluster full gene expression: {full_expr_file}")
+        
+        # 3. 保存 celltype-cluster 映射 TXT
+        if self.cluster_to_celltype is not None:
+            # Celltype mode: 直接从 cluster_to_celltype 映射保存
+            mapping_file = f"{self.output_dir}/{sample_name}_celltype_cluster_mapping.txt"
+            with open(mapping_file, 'w') as f:
+                f.write("cluster_id\tcelltype_name\n")
+                for cluster_id in cluster_list:
+                    celltype_name = self.cluster_to_celltype.get(cluster_id, f"Cluster_{cluster_id}")
+                    f.write(f"{cluster_id}\t{celltype_name}\n")
+            print(f"   ✅ Celltype-cluster mapping: {mapping_file}")
+        else:
+            # Auto-cluster mode: 从 checkpoint 加载映射
+            checkpoint_cluster_to_celltype = {}
+            checkpoint = torch.load(self.stage1_model_path, map_location=self.device)
+            sc_clustered_path = f"{os.path.dirname(self.stage1_model_path)}/sc_adata_clustered.h5ad"
+            
+            if os.path.exists(sc_clustered_path):
+                sc_clustered = sc.read_h5ad(sc_clustered_path)
+                if 'leiden' in sc_clustered.obs.columns and 'cell_type' in sc_clustered.obs.columns:
+                    for cluster_id in sorted(sc_clustered.obs['leiden'].unique()):
+                        cluster_mask = sc_clustered.obs['leiden'] == cluster_id
+                        celltype_counts = sc_clustered.obs[cluster_mask]['cell_type'].value_counts()
+                        major_celltype = celltype_counts.index[0]
+                        checkpoint_cluster_to_celltype[str(cluster_id)] = major_celltype
+            
+            mapping_file = f"{self.output_dir}/{sample_name}_celltype_cluster_mapping.txt"
+            with open(mapping_file, 'w') as f:
+                f.write("cluster_id\tcelltype_name\n")
+                for cluster_id in cluster_list:
+                    celltype_name = checkpoint_cluster_to_celltype.get(str(cluster_id), f"Cluster_{cluster_id}")
+                    f.write(f"{cluster_id}\t{celltype_name}\n")
+            print(f"   ✅ Celltype-cluster mapping: {mapping_file}")
     
     def plot_training_curves(self, train_losses, mse_losses, cos_losses, weight_regs, sparsity_regs, sample_name):
         """Plot training curves"""

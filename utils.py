@@ -40,8 +40,11 @@ def setup_logging(log_file):
     console_handler.setFormatter(formatter)
     logger.addHandler(console_handler)
 
-    # 避免tqdm进度条被日志覆盖
-    logging.getLogger('tqdm').addHandler(console_handler)
+    # 配置tqdm logger避免冲突
+    tqdm_logger = logging.getLogger('tqdm')
+    tqdm_logger.setLevel(logging.WARNING)  # 只显示警告和错误
+    tqdm_logger.addHandler(console_handler)
+    tqdm_logger.propagate = False  # 防止向上传播
 
 # def compute_rwpe(adj_matrix, steps=5, dim=32):
 #     """

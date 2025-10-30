@@ -1008,19 +1008,6 @@ class coEncoder:
         self.cluster_expressions_full_count = cluster_expressions_full_count  # Also keep this for backward compatibility
         print(f"   Completed: {len(cluster_prototypes)} clusters with center and expressions (all genes)")
         
-        # Save count version
-        df_marker = pd.DataFrame.from_dict(
-            self.cluster_expressions, orient='index', columns=self.genes
-        )
-        df_marker.index.name = 'cluster_id'
-        df_marker.to_csv(f"{self.output_dir}/cluster_marker_expressions_count.csv")
-        
-        df_full_count = pd.DataFrame.from_dict(
-            self.cluster_expressions_full_count, orient='index', columns=self.all_genes
-        )
-        df_full_count.index.name = 'cluster_id'
-        df_full_count.to_csv(f"{self.output_dir}/cluster_full_expressions_count.csv")
-        
         # 6. Plot UMAP for modality alignment visualization
         print("="*60)
         print("Visualizing modality alignment...")

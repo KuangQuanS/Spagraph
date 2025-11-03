@@ -100,6 +100,9 @@ class GATDeconvolution:
         self.vae_encoder = full_vae.encoder
         self.vae_encoder.eval()  # Freeze encoder
         
+        # Get latent dimension from the loaded VAE model
+        self.latent_dim = full_vae.encoder.fc_mu.out_features
+        
         # Other information
         self.label_encoder = checkpoint['label_encoder']
         self.marker_genes = checkpoint['marker_genes']
@@ -199,21 +202,27 @@ class GATDeconvolution:
             param.requires_grad = False
        
     def build_gat_model(self, n_cell_types: int, gat_hidden_dim=64, gat_layers=3, 
-                       gat_heads=4, dropout=0.1, loss_lambda_mse=1.0,
+                       gat_heads=4, dropout=0.1, loss_lambda_pearson=1.0, loss_lambda_mse=1.0,
                        loss_lambda_cosine=1.0, loss_lambda_align=1.0, 
                        loss_lambda_reg=0.5, loss_lambda_sparse=0.01):
         """Build GAT deconvolution model"""
         print("="*60)
         print("Building GAT model...")
-        print(f"Hidden dim: {gat_hidden_dim}")
-        print(f"Layers: {gat_layers}")
+        
+        # Get embedding dimension from VAE encoder
+        embedding_dim = self.latent_dim
+        print(f"VAE latent dimension: {embedding_dim}")
+        
+        print(f"GAT hidden dim: {gat_hidden_dim}")
+        print(f"GAT layers: {gat_layers}")
         print(f"Attention heads: {gat_heads}")
         print(f"Dropout: {dropout}")
-        print(f"Loss: λ_mse={loss_lambda_mse}, λ_cosine={loss_lambda_cosine}, "
-              f"λ_align={loss_lambda_align}, λ_reg={loss_lambda_reg}, λ_sparse={loss_lambda_sparse}")
+        print(f"Loss weights: λ_pearson={loss_lambda_pearson}, λ_mse={loss_lambda_mse}, "
+              f"λ_cosine={loss_lambda_cosine}, λ_align={loss_lambda_align}, "
+              f"λ_reg={loss_lambda_reg}, λ_sparse={loss_lambda_sparse}")
         
         self.gat_model = HeterogeneousGATDeconvolution(
-            embedding_dim=128,
+            embedding_dim=embedding_dim,  # Use actual VAE latent dimension
             n_cell_types=n_cell_types,
             gat_hidden_dim=gat_hidden_dim,
             gat_layers=gat_layers,
@@ -224,6 +233,7 @@ class GATDeconvolution:
         ).to(self.device)
         
         self.loss_fn = SpatialDeconvolutionLoss(
+            lambda_pearson=loss_lambda_pearson,
             lambda_mse=loss_lambda_mse,
             lambda_cosine=loss_lambda_cosine,
             lambda_align=loss_lambda_align,
@@ -232,7 +242,7 @@ class GATDeconvolution:
         )
         
         gat_params = sum(p.numel() for p in self.gat_model.parameters())
-        print(f"Parameters: {gat_params:,}")
+        print(f"GAT parameters: {gat_params:,}")
     
     def train_epoch_batched(self, 
                            dataloader: DataLoader,
@@ -242,6 +252,7 @@ class GATDeconvolution:
         
         epoch_losses = {
             'total_loss': 0.0,
+            'pearson_loss': 0.0,
             'mse_loss': 0.0,
             'cosine_loss': 0.0,
             'alignment_loss': 0.0,
@@ -332,8 +343,10 @@ class GATDeconvolution:
         
         # Training history
         train_losses = []
+        pearson_losses = []
         mse_losses = []
         cos_losses = []
+        align_losses = []
         weight_regs = []
         sparsity_regs = []
         
@@ -352,8 +365,10 @@ class GATDeconvolution:
             # Record average loss
             avg_total_loss = epoch_losses['total_loss']
             train_losses.append(avg_total_loss)
+            pearson_losses.append(epoch_losses['pearson_loss'])
             mse_losses.append(epoch_losses['mse_loss'])
             cos_losses.append(epoch_losses['cosine_loss'])
+            align_losses.append(epoch_losses['alignment_loss'])
             weight_regs.append(epoch_losses['weight_reg'])
             sparsity_regs.append(epoch_losses.get('sparsity_loss', 0.0))
             
@@ -363,6 +378,7 @@ class GATDeconvolution:
             # Update progress bar with loss info
             pbar.set_postfix({
                 'Total': f'{avg_total_loss:.4f}',
+                'Pearson': f'{epoch_losses["pearson_loss"]:.4f}',
                 'MSE': f'{epoch_losses["mse_loss"]:.4f}',
                 'Cosine': f'{epoch_losses["cosine_loss"]:.4f}',
                 'Align': f'{epoch_losses["alignment_loss"]:.4f}'
@@ -383,7 +399,8 @@ class GATDeconvolution:
                 break
         
         # Plot training curves
-        self.plot_training_curves(train_losses, mse_losses, cos_losses, weight_regs, sparsity_regs, sample_name)
+        self.plot_training_curves(train_losses, pearson_losses, mse_losses, cos_losses, 
+                                 align_losses, weight_regs, sparsity_regs, sample_name)
         
         # Save final model
         self.save_model(f"{self.output_dir}/final_gat_model.pth")
@@ -655,41 +672,66 @@ class GATDeconvolution:
                     f.write(f"{cluster_id}\t{celltype_name}\n")
             print(f"   ✅ Celltype-cluster mapping: {mapping_file}")
     
-    def plot_training_curves(self, train_losses, mse_losses, cos_losses, weight_regs, sparsity_regs, sample_name):
+    def plot_training_curves(self, train_losses, pearson_losses, mse_losses, cos_losses, 
+                           align_losses, weight_regs, sparsity_regs, sample_name):
         """Plot training curves"""
-        fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(15, 10))
+        fig, axes = plt.subplots(2, 3, figsize=(20, 10))
         
         epochs = range(1, len(train_losses) + 1)
         
         # Total loss
-        ax1.plot(epochs, train_losses, 'b-')
-        ax1.set_title('Total Loss')
-        ax1.set_xlabel('Epochs')
-        ax1.set_ylabel('Loss')
-        ax1.grid(True)
+        axes[0, 0].plot(epochs, train_losses, 'b-', linewidth=2)
+        axes[0, 0].set_title('Total Loss')
+        axes[0, 0].set_xlabel('Epochs')
+        axes[0, 0].set_ylabel('Loss')
+        axes[0, 0].grid(True)
         
         # Reconstruction losses
-        ax2.plot(epochs, mse_losses, 'green', label='MSE')
-        ax2.plot(epochs, cos_losses, 'red', label='Cosine')
-        ax2.set_title('Reconstruction Losses')
-        ax2.set_xlabel('Epochs')
-        ax2.set_ylabel('Loss')
-        ax2.legend()
-        ax2.grid(True)
+        axes[0, 1].plot(epochs, pearson_losses, 'orange', label='Pearson', linewidth=2)
+        axes[0, 1].plot(epochs, mse_losses, 'green', label='MSE', linewidth=2)
+        axes[0, 1].plot(epochs, cos_losses, 'red', label='Cosine', linewidth=2)
+        axes[0, 1].set_title('Reconstruction Losses')
+        axes[0, 1].set_xlabel('Epochs')
+        axes[0, 1].set_ylabel('Loss')
+        axes[0, 1].legend()
+        axes[0, 1].grid(True)
+        
+        # Alignment loss
+        axes[0, 2].plot(epochs, align_losses, 'cyan', linewidth=2)
+        axes[0, 2].set_title('Alignment Loss')
+        axes[0, 2].set_xlabel('Epochs')
+        axes[0, 2].set_ylabel('Loss')
+        axes[0, 2].grid(True)
         
         # Weight regularization
-        ax3.plot(epochs, weight_regs, 'r-')
-        ax3.set_title('Weight Regularization')
-        ax3.set_xlabel('Epochs')
-        ax3.set_ylabel('Loss')
-        ax3.grid(True)
+        axes[1, 0].plot(epochs, weight_regs, 'brown', linewidth=2)
+        axes[1, 0].set_title('Weight Regularization')
+        axes[1, 0].set_xlabel('Epochs')
+        axes[1, 0].set_ylabel('Loss')
+        axes[1, 0].grid(True)
         
         # Sparsity regularization
-        ax4.plot(epochs, sparsity_regs, 'purple')
-        ax4.set_title('Sparsity Regularization')
-        ax4.set_xlabel('Epochs')
-        ax4.set_ylabel('Loss')
-        ax4.grid(True)
+        axes[1, 1].plot(epochs, sparsity_regs, 'purple', linewidth=2)
+        axes[1, 1].set_title('Sparsity Regularization')
+        axes[1, 1].set_xlabel('Epochs')
+        axes[1, 1].set_ylabel('Loss')
+        axes[1, 1].grid(True)
+        
+        # All losses comparison (normalized)
+        max_pearson = max(pearson_losses) if max(pearson_losses) > 0 else 1
+        max_mse = max(mse_losses) if max(mse_losses) > 0 else 1
+        max_cos = max(cos_losses) if max(cos_losses) > 0 else 1
+        max_align = max(align_losses) if max(align_losses) > 0 else 1
+        
+        axes[1, 2].plot(epochs, [p/max_pearson for p in pearson_losses], 'orange', label='Pearson (norm)', linewidth=2)
+        axes[1, 2].plot(epochs, [m/max_mse for m in mse_losses], 'green', label='MSE (norm)', linewidth=2)
+        axes[1, 2].plot(epochs, [c/max_cos for c in cos_losses], 'red', label='Cosine (norm)', linewidth=2)
+        axes[1, 2].plot(epochs, [a/max_align for a in align_losses], 'cyan', label='Align (norm)', linewidth=2)
+        axes[1, 2].set_title('Normalized Loss Components')
+        axes[1, 2].set_xlabel('Epochs')
+        axes[1, 2].set_ylabel('Normalized Loss')
+        axes[1, 2].legend()
+        axes[1, 2].grid(True)
         
         plt.suptitle(f'GAT Deconvolution Training - {sample_name}')
         plt.tight_layout()
@@ -751,6 +793,8 @@ def main():
                        help='Batch size')
     
     # Loss function arguments
+    parser.add_argument('--loss_lambda_pearson', type=float, default=1.0,
+                       help='Pearson correlation loss weight')
     parser.add_argument('--loss_lambda_mse', type=float, default=1.0,
                        help='MSE reconstruction loss weight')
     parser.add_argument('--loss_lambda_cosine', type=float, default=1.0,
@@ -839,7 +883,7 @@ def main():
     print(f"ST matching genes: {len(trainer.genes)}/{len(trainer.genes)}")
     
     # Extract ST data
-
+    sc.pp.normalize_total(st_subset, target_sum=1e4)
     # sc.pp.log1p(st_subset)
     st_X = st_subset.X.toarray() if hasattr(st_subset.X, 'toarray') else st_subset.X
     
@@ -858,6 +902,7 @@ def main():
         gat_layers=args.gat_layers,
         gat_heads=args.gat_heads,
         dropout=args.dropout,
+        loss_lambda_pearson=args.loss_lambda_pearson,
         loss_lambda_mse=args.loss_lambda_mse,
         loss_lambda_cosine=args.loss_lambda_cosine,
         loss_lambda_align=args.loss_lambda_align,

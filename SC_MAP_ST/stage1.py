@@ -9,7 +9,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import LabelEncoder
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+from sklearn.linear_model import LogisticRegressionCV
 import matplotlib.pyplot as plt
 import seaborn as sns
 from typing import List, Tuple, Dict, Optional
@@ -23,7 +24,27 @@ warnings.filterwarnings('ignore')
 # Import unified model definitions
 from model import VAE, vae_loss_function, zinb_loss_function, compute_mmd
 
-def compute_clusters_and_marker_genes(adata, top_n=100, min_fold_change=1.5, resolution=0.5, save_path=None):
+def load_marker_genes_from_file(file_path):
+    """
+    Load marker genes from a text file
+    
+    Args:
+        file_path: Path to the text file containing marker genes (one gene per line)
+    
+    Returns:
+        marker_genes: List of marker genes
+    """
+    print("="*60)
+    print(f"Loading marker genes from file: {file_path}")
+    
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"Marker genes file not found: {file_path}")
+    
+    with open(file_path, 'r') as f:
+        marker_genes = [line.strip() for line in f if line.strip()]
+    
+    print(f"   Loaded {len(marker_genes)} marker genes")
+    return marker_genes
     """
     Compute clusters and extract top marker genes for each cluster
     """
@@ -74,6 +95,7 @@ def compute_clusters_and_marker_genes(adata, top_n=100, min_fold_change=1.5, res
     result = adata_full.uns['rank_genes_groups']
     
     print(f"Marker genes per cluster:")
+    lasso_selected = {}
     for cluster in sorted(adata_full.obs['leiden'].unique()):
         if cluster in result['names'].dtype.names:
             genes = result['names'][cluster]
@@ -91,7 +113,39 @@ def compute_clusters_and_marker_genes(adata, top_n=100, min_fold_change=1.5, res
                 if len(selected_genes) >= top_n:
                     break
             
-            marker_genes.update(selected_genes)
+            # Apply Lasso regression for further selection
+            if len(selected_genes) > 0:
+                sub_adata = adata_full[:, selected_genes].copy()
+                y = (adata_full.obs['leiden'] == cluster).astype(int)
+                X = sub_adata.X
+                if hasattr(X, 'toarray'):
+                    X = X.toarray()
+                
+                scaler = StandardScaler(with_mean=False)
+                X_scaled = scaler.fit_transform(X)
+                
+                clf = LogisticRegressionCV(
+                    Cs=10,
+                    penalty='l1',
+                    solver='saga',
+                    class_weight='balanced',
+                    cv=5,
+                    max_iter=3000,
+                    scoring='roc_auc',
+                    n_jobs=-1
+                )
+                clf.fit(X_scaled, y)
+                coef = clf.coef_.ravel()
+                
+                lasso_selected_genes = [g for g, c in zip(selected_genes, coef) if abs(c) > 1e-5]
+                lasso_selected_genes = sorted(lasso_selected_genes, key=lambda g: abs(coef[selected_genes.index(g)]), reverse=True)
+                
+                lasso_selected[cluster] = lasso_selected_genes
+                marker_genes.update(lasso_selected_genes)
+                print(f"   {cluster}: {len(selected_genes)} -> {len(lasso_selected_genes)} (after Lasso)")
+            else:
+                lasso_selected[cluster] = []
+                print(f"   {cluster}: 0 genes")
     
     print(f"Total: {len(marker_genes)} marker genes")
     
@@ -139,6 +193,7 @@ def extract_marker_genes_from_celltype(adata, celltype_col='cell_type', top_n=10
     result = adata_work.uns['rank_genes_groups']
     
     print(f"Marker genes per celltype:")
+    lasso_selected = {}
     for celltype in sorted(adata_work.obs[celltype_col].unique()):
         if celltype in result['names'].dtype.names:
             genes = result['names'][celltype]
@@ -156,7 +211,39 @@ def extract_marker_genes_from_celltype(adata, celltype_col='cell_type', top_n=10
                 if len(selected_genes) >= top_n:
                     break
             
-            marker_genes.update(selected_genes)
+            # Apply Lasso regression for further selection
+            if len(selected_genes) > 0:
+                sub_adata = adata_work[:, selected_genes].copy()
+                y = (adata_work.obs[celltype_col] == celltype).astype(int)
+                X = sub_adata.X
+                if hasattr(X, 'toarray'):
+                    X = X.toarray()
+                
+                scaler = StandardScaler(with_mean=False)
+                X_scaled = scaler.fit_transform(X)
+                
+                clf = LogisticRegressionCV(
+                    Cs=10,
+                    penalty='l1',
+                    solver='saga',
+                    class_weight='balanced',
+                    cv=5,
+                    max_iter=3000,
+                    scoring='roc_auc',
+                    n_jobs=-1
+                )
+                clf.fit(X_scaled, y)
+                coef = clf.coef_.ravel()
+                
+                lasso_selected_genes = [g for g, c in zip(selected_genes, coef) if abs(c) > 1e-5]
+                lasso_selected_genes = sorted(lasso_selected_genes, key=lambda g: abs(coef[selected_genes.index(g)]), reverse=True)
+                
+                lasso_selected[celltype] = lasso_selected_genes
+                marker_genes.update(lasso_selected_genes)
+                print(f"   {celltype}: {len(selected_genes)} -> {len(lasso_selected_genes)} (after Lasso)")
+            else:
+                lasso_selected[celltype] = []
+                print(f"   {celltype}: 0 genes")
     
     print(f"Total: {len(marker_genes)} marker genes")
     
@@ -246,7 +333,7 @@ class coEncoder:
 
     def prepare_marker_gene_data(self, sc_adata: ad.AnnData, st_adata: ad.AnnData, 
                                top_n_per_type: int = 100, resolution: float = 0.5,
-                               celltype_key: str = None) -> Tuple:
+                               celltype_key: str = None, precomputed_marker_file: str = None) -> Tuple:
         """Prepare training data based on marker genes
         
         Args:
@@ -257,11 +344,32 @@ class coEncoder:
             celltype_key: Column name in sc_adata.obs for celltype annotation.
                          If None, will auto-cluster using Leiden. If provided,
                          will use existing celltype annotation from adata.obs[celltype_key]
+            precomputed_marker_file: Path to precomputed marker genes file.
+                                   If provided, will load marker genes directly from this file
+                                   instead of computing them from scratch.
         """
 
         # 1. Compute clusters and marker genes  
         print("="*60)
-        if celltype_key is not None:
+        if precomputed_marker_file is not None:
+            # Load precomputed marker genes
+            print(f"Using precomputed marker genes from: {precomputed_marker_file}")
+            self.marker_genes = load_marker_genes_from_file(precomputed_marker_file)
+            # For compatibility, create dummy clustering results
+            # We'll use a simple clustering approach for the rest of the pipeline
+            sc_adata_clustered = sc_adata.copy()
+            sc.pp.normalize_total(sc_adata_clustered, target_sum=1e4)
+            sc.pp.log1p(sc_adata_clustered)
+            sc.pp.highly_variable_genes(sc_adata_clustered, min_mean=0.0125, max_mean=3, min_disp=0.5)
+            sc_adata_clustered.raw = sc_adata_clustered
+            sc_adata_clustered = sc_adata_clustered[:, sc_adata_clustered.var.highly_variable]
+            sc.pp.scale(sc_adata_clustered, max_value=10)
+            sc.tl.pca(sc_adata_clustered, svd_solver='arpack')
+            sc.pp.neighbors(sc_adata_clustered, n_neighbors=10, n_pcs=40)
+            sc.tl.leiden(sc_adata_clustered, resolution=resolution)
+            sc_clusters = sc_adata_clustered.obs['leiden'].copy()
+            self.celltype_key = None  # Not using celltype annotation
+        elif celltype_key is not None:
             # Use existing celltype annotation
             print(f"Using existing celltype annotation from '{celltype_key}'...")
             cluster_save_path = f"{self.output_dir}/marker_genes_celltype.txt"
@@ -865,7 +973,7 @@ class coEncoder:
     
     def run_stage1_training(self, top_n_per_type=100, resolution=0.5, batch_size=256, n_epochs=100, 
                            lr=1e-3, beta=1.0, hidden_dims=[512, 256], latent_dim=128, loss_type='mse', 
-                           lambda_mmd=0.0, pretrained_path=None, celltype_key=None):
+                           lambda_mmd=0.0, pretrained_path=None, celltype_key=None, precomputed_marker_file=None):
         """Run stage 1 training: VAE on SC + ST with marker genes
         
         Args:
@@ -883,6 +991,9 @@ class coEncoder:
             celltype_key: Column name in sc_adata.obs for celltype annotation.
                          If None, will auto-cluster using Leiden.
                          If provided, will use existing celltype annotation.
+            precomputed_marker_file: Path to precomputed marker genes file.
+                                   If provided, will load marker genes directly from this file
+                                   instead of computing them from scratch.
         """
         print("="*60)
         print("Stage 1 Training: VAE (SC + ST, Marker Genes)")
@@ -894,6 +1005,8 @@ class coEncoder:
             print(f"   Celltype column: {celltype_key}")
         else:
             print(f"   Leiden resolution: {resolution}")
+        if precomputed_marker_file:
+            print(f"   Precomputed marker genes: {precomputed_marker_file}")
         print(f"   Batch size: {batch_size}")
         print(f"   Epochs: {n_epochs}")
         print(f"   Learning rate: {lr}")
@@ -911,7 +1024,8 @@ class coEncoder:
         
         # 2. Prepare data based on marker genes
         train_X, test_X, train_modality, test_modality, y_train, y_test, sc_X_full_train_count = self.prepare_marker_gene_data(
-            sc_adata, st_adata, top_n_per_type=top_n_per_type, resolution=resolution, celltype_key=celltype_key
+            sc_adata, st_adata, top_n_per_type=top_n_per_type, resolution=resolution, 
+            celltype_key=celltype_key, precomputed_marker_file=precomputed_marker_file
         )
         
         # 3. Build or load VAE
@@ -1065,6 +1179,9 @@ def main():
                        help='MMD loss weight for modality alignment (0=disabled, 1.0=recommended)')
     parser.add_argument('--pretrained_path', type=str, default=None,
                        help='Path to pretrained VAE model to continue training')
+    parser.add_argument('--precomputed_marker_file', type=str, default=None,
+                       help='Path to precomputed marker genes file. If provided, '
+                            'marker genes will be loaded directly from this file instead of computing them.')
     
     # Device argument
     parser.add_argument('--device', type=str, default=None,
@@ -1094,7 +1211,8 @@ def main():
         loss_type=args.loss_type,
         lambda_mmd=args.lambda_mmd,
         pretrained_path=args.pretrained_path,
-        celltype_key=args.celltype_key
+        celltype_key=args.celltype_key,
+        precomputed_marker_file=args.precomputed_marker_file
     )
     
 if __name__ == "__main__":

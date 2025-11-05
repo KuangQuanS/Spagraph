@@ -82,7 +82,7 @@ class GATDeconvolution:
         print("="*60)
         print("Loading pretrained VAE Encoder...")
         
-        checkpoint = torch.load(self.stage1_model_path, map_location=self.device)
+        checkpoint = torch.load(self.stage1_model_path, map_location=self.device, weights_only=False)
         
         # Rebuild VAE
         input_dim = checkpoint['input_dim']
@@ -108,6 +108,25 @@ class GATDeconvolution:
         self.marker_genes = checkpoint['marker_genes']
         self.genes = checkpoint['genes']
         self.sc_clusters = checkpoint.get('sc_clusters', None)
+        
+        # 尝试从 sc_adata_clustered.h5ad 加载聚类信息（作为备选）
+        if self.sc_clusters is None:
+            sc_adata_path = os.path.join(os.path.dirname(self.stage1_model_path), 'sc_adata_clustered.h5ad')
+            if os.path.exists(sc_adata_path):
+                print(f"\n   sc_clusters not in checkpoint, loading from {sc_adata_path}")
+                import scanpy as sc
+                sc_adata = sc.read_h5ad(sc_adata_path)
+                if 'leiden' in sc_adata.obs:
+                    self.sc_clusters = sc_adata.obs['leiden'].copy()
+                    if hasattr(self.sc_clusters, 'cat'):
+                        self.sc_clusters = self.sc_clusters.cat.remove_unused_categories()
+                    print(f"   ✓ Loaded {len(self.sc_clusters)} cell cluster labels from h5ad")
+                else:
+                    print(f"   ⚠️ 'leiden' column not found in {sc_adata_path}")
+            else:
+                print(f"   ⚠️ sc_adata_clustered.h5ad not found at {sc_adata_path}")
+        else:
+            print(f"   ✓ Loaded {len(self.sc_clusters)} cell cluster labels from checkpoint")
         self.resolution = checkpoint.get('resolution', 0.5)
         self.celltype_key = checkpoint.get('celltype_key', None)  # Get celltype mode info
         
@@ -203,8 +222,9 @@ class GATDeconvolution:
        
     def build_gat_model(self, n_cell_types: int, gat_hidden_dim=64, gat_layers=3, 
                        gat_heads=4, dropout=0.1, loss_lambda_pearson=1.0, loss_lambda_mse=1.0,
-                       loss_lambda_cosine=1.0, loss_lambda_align=1.0, 
-                       loss_lambda_reg=0.5, loss_lambda_sparse=0.01):
+                       loss_lambda_cosine=1.0, 
+                       loss_lambda_reg=0.5, loss_lambda_sparse=0.01, loss_lambda_diversity=0.1,
+                       loss_lambda_hetero=0.05, loss_lambda_proportion=1.0):
         """Build GAT deconvolution model"""
         print("="*60)
         print("Building GAT model...")
@@ -218,8 +238,9 @@ class GATDeconvolution:
         print(f"Attention heads: {gat_heads}")
         print(f"Dropout: {dropout}")
         print(f"Loss weights: λ_pearson={loss_lambda_pearson}, λ_mse={loss_lambda_mse}, "
-              f"λ_cosine={loss_lambda_cosine}, λ_align={loss_lambda_align}, "
-              f"λ_reg={loss_lambda_reg}, λ_sparse={loss_lambda_sparse}")
+              f"λ_cosine={loss_lambda_cosine}, "
+              f"λ_reg={loss_lambda_reg}, λ_sparse={loss_lambda_sparse}, λ_diversity={loss_lambda_diversity}, "
+              f"λ_hetero={loss_lambda_hetero}, λ_proportion={loss_lambda_proportion}")
         
         self.gat_model = HeterogeneousGATDeconvolution(
             embedding_dim=embedding_dim,  # Use actual VAE latent dimension
@@ -229,16 +250,48 @@ class GATDeconvolution:
             gat_heads=gat_heads,
             dropout=dropout,
             k_spatial=self.k_spatial,
-            k_celltype=self.k_celltype
+            k_celltype=self.k_celltype,
+            celltype_prototypes=self.celltype_prototypes  # 使用第一阶段的celltype prototypes初始化
         ).to(self.device)
+        
+        # 计算单细胞数据中各cluster的比例
+        sc_celltype_proportions = None
+        if hasattr(self, 'sc_clusters') and self.sc_clusters is not None:
+            # sc_clusters 是从 stage1 加载的单细胞cluster标签
+            print(f"\n   Computing cell type proportions from {len(self.sc_clusters)} cells...")
+            cluster_counts = {}
+            for cluster_id in self.sc_clusters:
+                cluster_counts[cluster_id] = cluster_counts.get(cluster_id, 0) + 1
+            
+            total_cells = len(self.sc_clusters)
+            # 按cluster ID顺序构建比例数组
+            proportions = []
+            for i in range(n_cell_types):
+                count = cluster_counts.get(str(i), 0)  # cluster ID可能是字符串
+                if count == 0:
+                    count = cluster_counts.get(i, 0)  # 尝试整数
+                proportion = count / total_cells if total_cells > 0 else 1.0 / n_cell_types
+                proportions.append(proportion)
+            
+            sc_celltype_proportions = proportions
+            print(f"   Single-cell cluster proportions (total {total_cells} cells):")
+            for i, prop in enumerate(proportions):
+                count = cluster_counts.get(str(i), cluster_counts.get(i, 0))
+                print(f"      Cluster {i}: {count:6d} cells ({prop*100:6.2f}%)")
+        else:
+            print("\n   ⚠️ Warning: sc_clusters not available, proportion loss will not be effective")
+            print("      Tip: Make sure stage1 saves sc_clusters or sc_adata_clustered.h5ad exists")
         
         self.loss_fn = SpatialDeconvolutionLoss(
             lambda_pearson=loss_lambda_pearson,
             lambda_mse=loss_lambda_mse,
             lambda_cosine=loss_lambda_cosine,
-            lambda_align=loss_lambda_align,
             lambda_reg=loss_lambda_reg,
-            lambda_sparse=loss_lambda_sparse
+            lambda_sparse=loss_lambda_sparse,
+            lambda_diversity=loss_lambda_diversity,
+            lambda_hetero=loss_lambda_hetero,
+            lambda_proportion=loss_lambda_proportion,
+            sc_celltype_proportions=sc_celltype_proportions
         )
         
         gat_params = sum(p.numel() for p in self.gat_model.parameters())
@@ -255,10 +308,11 @@ class GATDeconvolution:
             'pearson_loss': 0.0,
             'mse_loss': 0.0,
             'cosine_loss': 0.0,
-            'alignment_loss': 0.0,
             'weight_reg': 0.0,
             'sparsity_loss': 0.0,
-            'cos_sim_rec': 0.0
+            'diversity_loss': 0.0,
+            'hetero_loss': 0.0,
+            'proportion_loss': 0.0
         }
         
         num_batches = len(dataloader)
@@ -286,7 +340,8 @@ class GATDeconvolution:
                 celltype_expression=self.celltype_expressions,
                 true_spot_expression=batch_st_data,
                 spot_embedding=gat_outputs['spot_features'],
-                celltype_embedding=gat_outputs['celltype_features']
+                celltype_embedding=gat_outputs['celltype_features'],
+                edge_index=gat_outputs['edge_index']  # 传递edge_index用于计算空间异质性
             )
             
             # Backward pass
@@ -338,7 +393,7 @@ class GATDeconvolution:
         # Optimizer
         optimizer = torch.optim.Adam(self.gat_model.parameters(), lr=lr)
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode='min', patience=20, factor=0.5, verbose=True
+            optimizer, mode='min', patience=20, factor=0.5
         )
         
         # Training history
@@ -346,9 +401,11 @@ class GATDeconvolution:
         pearson_losses = []
         mse_losses = []
         cos_losses = []
-        align_losses = []
         weight_regs = []
         sparsity_regs = []
+        diversity_losses = []
+        hetero_losses = []
+        proportion_losses = []
         
         best_loss = float('inf')
         patience_counter = 0
@@ -368,9 +425,11 @@ class GATDeconvolution:
             pearson_losses.append(epoch_losses['pearson_loss'])
             mse_losses.append(epoch_losses['mse_loss'])
             cos_losses.append(epoch_losses['cosine_loss'])
-            align_losses.append(epoch_losses['alignment_loss'])
             weight_regs.append(epoch_losses['weight_reg'])
             sparsity_regs.append(epoch_losses.get('sparsity_loss', 0.0))
+            diversity_losses.append(epoch_losses.get('diversity_loss', 0.0))
+            hetero_losses.append(epoch_losses.get('hetero_loss', 0.0))
+            proportion_losses.append(epoch_losses.get('proportion_loss', 0.0))
             
             # Learning rate schedule
             scheduler.step(avg_total_loss)
@@ -381,7 +440,9 @@ class GATDeconvolution:
                 'Pearson': f'{epoch_losses["pearson_loss"]:.4f}',
                 'MSE': f'{epoch_losses["mse_loss"]:.4f}',
                 'Cosine': f'{epoch_losses["cosine_loss"]:.4f}',
-                'Align': f'{epoch_losses["alignment_loss"]:.4f}'
+                'Diversity': f'{epoch_losses["diversity_loss"]:.4f}',
+                'Hetero': f'{epoch_losses["hetero_loss"]:.4f}',
+                'Proportion': f'{epoch_losses["proportion_loss"]:.4f}'
             })
             
 
@@ -400,7 +461,8 @@ class GATDeconvolution:
         
         # Plot training curves
         self.plot_training_curves(train_losses, pearson_losses, mse_losses, cos_losses, 
-                                 align_losses, weight_regs, sparsity_regs, sample_name)
+                                 weight_regs, sparsity_regs, diversity_losses, hetero_losses, 
+                                 proportion_losses, sample_name)
         
         # Save final model
         self.save_model(f"{self.output_dir}/final_gat_model.pth")
@@ -535,7 +597,7 @@ class GATDeconvolution:
             
             # Get cluster-to-celltype mapping from checkpoint if available
             checkpoint_cluster_to_celltype = {}
-            checkpoint = torch.load(self.stage1_model_path, map_location=self.device)
+
             sc_clustered_path = f"{os.path.dirname(self.stage1_model_path)}/sc_adata_clustered.h5ad"
             
             if os.path.exists(sc_clustered_path):
@@ -652,7 +714,7 @@ class GATDeconvolution:
         else:
             # Auto-cluster mode: 从 checkpoint 加载映射
             checkpoint_cluster_to_celltype = {}
-            checkpoint = torch.load(self.stage1_model_path, map_location=self.device)
+
             sc_clustered_path = f"{os.path.dirname(self.stage1_model_path)}/sc_adata_clustered.h5ad"
             
             if os.path.exists(sc_clustered_path):
@@ -673,70 +735,90 @@ class GATDeconvolution:
             print(f"   ✅ Celltype-cluster mapping: {mapping_file}")
     
     def plot_training_curves(self, train_losses, pearson_losses, mse_losses, cos_losses, 
-                           align_losses, weight_regs, sparsity_regs, sample_name):
+                           weight_regs, sparsity_regs, diversity_losses, hetero_losses, 
+                           proportion_losses, sample_name):
         """Plot training curves"""
-        fig, axes = plt.subplots(2, 3, figsize=(20, 10))
+        fig, axes = plt.subplots(3, 3, figsize=(24, 18))
         
         epochs = range(1, len(train_losses) + 1)
         
         # Total loss
         axes[0, 0].plot(epochs, train_losses, 'b-', linewidth=2)
-        axes[0, 0].set_title('Total Loss')
+        axes[0, 0].set_title('Total Loss', fontsize=14, fontweight='bold')
         axes[0, 0].set_xlabel('Epochs')
         axes[0, 0].set_ylabel('Loss')
-        axes[0, 0].grid(True)
+        axes[0, 0].grid(True, alpha=0.3)
         
         # Reconstruction losses
         axes[0, 1].plot(epochs, pearson_losses, 'orange', label='Pearson', linewidth=2)
         axes[0, 1].plot(epochs, mse_losses, 'green', label='MSE', linewidth=2)
         axes[0, 1].plot(epochs, cos_losses, 'red', label='Cosine', linewidth=2)
-        axes[0, 1].set_title('Reconstruction Losses')
+        axes[0, 1].set_title('Reconstruction Losses', fontsize=14, fontweight='bold')
         axes[0, 1].set_xlabel('Epochs')
         axes[0, 1].set_ylabel('Loss')
         axes[0, 1].legend()
-        axes[0, 1].grid(True)
+        axes[0, 1].grid(True, alpha=0.3)
         
-        # Alignment loss
-        axes[0, 2].plot(epochs, align_losses, 'cyan', linewidth=2)
-        axes[0, 2].set_title('Alignment Loss')
+        # Pearson loss
+        axes[0, 2].plot(epochs, pearson_losses, 'orange', linewidth=2)
+        axes[0, 2].set_title('Pearson Loss', fontsize=14, fontweight='bold')
         axes[0, 2].set_xlabel('Epochs')
         axes[0, 2].set_ylabel('Loss')
-        axes[0, 2].grid(True)
+        axes[0, 2].grid(True, alpha=0.3)
         
-        # Weight regularization
-        axes[1, 0].plot(epochs, weight_regs, 'brown', linewidth=2)
-        axes[1, 0].set_title('Weight Regularization')
+        # MSE loss
+        axes[1, 0].plot(epochs, mse_losses, 'green', linewidth=2)
+        axes[1, 0].set_title('MSE Loss', fontsize=14, fontweight='bold')
         axes[1, 0].set_xlabel('Epochs')
         axes[1, 0].set_ylabel('Loss')
-        axes[1, 0].grid(True)
+        axes[1, 0].grid(True, alpha=0.3)
         
-        # Sparsity regularization
-        axes[1, 1].plot(epochs, sparsity_regs, 'purple', linewidth=2)
-        axes[1, 1].set_title('Sparsity Regularization')
+        # Diversity and Heterogeneity losses
+        axes[1, 1].plot(epochs, diversity_losses, 'cyan', label='Diversity', linewidth=2)
+        axes[1, 1].plot(epochs, hetero_losses, 'magenta', label='Heterogeneity', linewidth=2)
+        axes[1, 1].set_title('Diversity & Heterogeneity', fontsize=14, fontweight='bold')
         axes[1, 1].set_xlabel('Epochs')
         axes[1, 1].set_ylabel('Loss')
-        axes[1, 1].grid(True)
+        axes[1, 1].legend()
+        axes[1, 1].grid(True, alpha=0.3)
         
-        # All losses comparison (normalized)
-        max_pearson = max(pearson_losses) if max(pearson_losses) > 0 else 1
-        max_mse = max(mse_losses) if max(mse_losses) > 0 else 1
-        max_cos = max(cos_losses) if max(cos_losses) > 0 else 1
-        max_align = max(align_losses) if max(align_losses) > 0 else 1
-        
-        axes[1, 2].plot(epochs, [p/max_pearson for p in pearson_losses], 'orange', label='Pearson (norm)', linewidth=2)
-        axes[1, 2].plot(epochs, [m/max_mse for m in mse_losses], 'green', label='MSE (norm)', linewidth=2)
-        axes[1, 2].plot(epochs, [c/max_cos for c in cos_losses], 'red', label='Cosine (norm)', linewidth=2)
-        axes[1, 2].plot(epochs, [a/max_align for a in align_losses], 'cyan', label='Align (norm)', linewidth=2)
-        axes[1, 2].set_title('Normalized Loss Components')
+        # Heterogeneity loss (单独显示)
+        axes[1, 2].plot(epochs, hetero_losses, 'magenta', linewidth=2)
+        axes[1, 2].set_title('Spatial Heterogeneity Loss', fontsize=14, fontweight='bold')
         axes[1, 2].set_xlabel('Epochs')
-        axes[1, 2].set_ylabel('Normalized Loss')
-        axes[1, 2].legend()
-        axes[1, 2].grid(True)
+        axes[1, 2].set_ylabel('Loss')
+        axes[1, 2].grid(True, alpha=0.3)
         
-        plt.suptitle(f'GAT Deconvolution Training - {sample_name}')
+        # Weight regularization
+        axes[2, 0].plot(epochs, weight_regs, 'brown', linewidth=2)
+        axes[2, 0].set_title('Weight Regularization', fontsize=14, fontweight='bold')
+        axes[2, 0].set_xlabel('Epochs')
+        axes[2, 0].set_ylabel('Loss')
+        axes[2, 0].grid(True, alpha=0.3)
+        
+        # Sparsity regularization
+        axes[2, 1].plot(epochs, sparsity_regs, 'purple', linewidth=2)
+        axes[2, 1].set_title('Sparsity Regularization', fontsize=14, fontweight='bold')
+        axes[2, 1].set_xlabel('Epochs')
+        axes[2, 1].set_ylabel('Loss')
+        axes[2, 1].grid(True, alpha=0.3)
+        
+        # All regularizations comparison
+        axes[2, 2].plot(epochs, weight_regs, 'brown', label='Weight', linewidth=2)
+        axes[2, 2].plot(epochs, sparsity_regs, 'purple', label='Sparsity', linewidth=2)
+        axes[2, 2].plot(epochs, diversity_losses, 'cyan', label='Diversity', linewidth=2)
+        axes[2, 2].plot(epochs, hetero_losses, 'magenta', label='Heterogeneity', linewidth=2)
+        axes[2, 2].plot(epochs, proportion_losses, 'olive', label='Proportion', linewidth=2)
+        axes[2, 2].set_title('All Regularizations', fontsize=14, fontweight='bold')
+        axes[2, 2].set_xlabel('Epochs')
+        axes[2, 2].set_ylabel('Loss')
+        axes[2, 2].legend()
+        axes[2, 2].grid(True, alpha=0.3)
+        
+        plt.suptitle(f'GAT Deconvolution Training - {sample_name}', fontsize=16, fontweight='bold')
         plt.tight_layout()
         plt.savefig(f"{self.output_dir}/gat_training_curves_{sample_name}.png", dpi=300, bbox_inches='tight')
-        plt.show()
+        # plt.show()
     
     def save_model(self, filepath: str):
         """Save model"""
@@ -799,12 +881,16 @@ def main():
                        help='MSE reconstruction loss weight')
     parser.add_argument('--loss_lambda_cosine', type=float, default=1.0,
                        help='Cosine similarity loss weight')
-    parser.add_argument('--loss_lambda_align', type=float, default=1.0,
-                       help='Modality alignment loss weight')
     parser.add_argument('--loss_lambda_reg', type=float, default=0.5,
                        help='Weight regularization weight')
     parser.add_argument('--loss_lambda_sparse', type=float, default=0.01,
                        help='Sparsity regularization weight (Shannon entropy)')
+    parser.add_argument('--loss_lambda_diversity', type=float, default=0.1,
+                       help='Diversity loss weight (prevents all spots using same celltype)')
+    parser.add_argument('--loss_lambda_hetero', type=float, default=0.05,
+                       help='Spatial heterogeneity loss weight (preserves spatial variation)')
+    parser.add_argument('--loss_lambda_proportion', type=float, default=1.0,
+                       help='Global cell type proportion consistency loss weight (matches SC cluster distribution)')
     
     # Spot composition argument
     parser.add_argument('--cells_per_spot', type=float, default=10.0,
@@ -873,6 +959,7 @@ def main():
     # Load ST data
     print(f"Loading ST data: {args.st_file}")
     st_adata = sc.read_h5ad(args.st_file)
+    st_adata.var_names_make_unique()  # Handle duplicate gene names
 
     # Check spatial coordinates
     if 'spatial' not in st_adata.obsm:
@@ -905,9 +992,11 @@ def main():
         loss_lambda_pearson=args.loss_lambda_pearson,
         loss_lambda_mse=args.loss_lambda_mse,
         loss_lambda_cosine=args.loss_lambda_cosine,
-        loss_lambda_align=args.loss_lambda_align,
         loss_lambda_reg=args.loss_lambda_reg,
-        loss_lambda_sparse=args.loss_lambda_sparse
+        loss_lambda_sparse=args.loss_lambda_sparse,
+        loss_lambda_diversity=args.loss_lambda_diversity,
+        loss_lambda_hetero=args.loss_lambda_hetero,
+        loss_lambda_proportion=args.loss_lambda_proportion
     )
     
     # Start training

@@ -44,7 +44,10 @@ def load_marker_genes_from_file(file_path):
         marker_genes = [line.strip() for line in f if line.strip()]
     
     print(f"   Loaded {len(marker_genes)} marker genes")
+
     return marker_genes
+
+def compute_clusters_and_marker_genes(adata, top_n=100, min_fold_change=1.5, resolution=0.5, save_path=None):
     """
     Compute clusters and extract top marker genes for each cluster
     """
@@ -129,8 +132,8 @@ def load_marker_genes_from_file(file_path):
                     penalty='l1',
                     solver='saga',
                     class_weight='balanced',
-                    cv=5,
-                    max_iter=3000,
+                    cv=3,
+                    max_iter=2000,
                     scoring='roc_auc',
                     n_jobs=-1
                 )
@@ -149,8 +152,21 @@ def load_marker_genes_from_file(file_path):
     
     print(f"Total: {len(marker_genes)} marker genes")
     
+    clusters_to_drop = [cluster for cluster, genes in lasso_selected.items() if len(genes) == 0]
+    if clusters_to_drop:
+        print(f"Removing clusters with no marker genes: {clusters_to_drop}")
+        keep_mask = ~adata_full.obs['leiden'].isin(clusters_to_drop)
+        removed_cells = int((~keep_mask).sum())
+        print(f"   Removed {removed_cells} cells belonging to empty clusters")
+        adata_full = adata_full[keep_mask].copy()
+        if hasattr(adata_full.obs['leiden'], 'cat'):
+            adata_full.obs['leiden'] = adata_full.obs['leiden'].cat.remove_unused_categories()
+    
     # Return clustering info, marker genes, and full adata for annotation
-    return sorted(list(marker_genes)), adata_full.obs['leiden'].copy(), adata_full
+    sc_clusters = adata_full.obs['leiden'].copy()
+    if hasattr(sc_clusters, 'cat'):
+        sc_clusters = sc_clusters.cat.remove_unused_categories()
+    return sorted(list(marker_genes)), sc_clusters, adata_full
 
 def extract_marker_genes_from_celltype(adata, celltype_col='cell_type', top_n=100, min_fold_change=1.5, save_path=None):
     """
@@ -227,8 +243,8 @@ def extract_marker_genes_from_celltype(adata, celltype_col='cell_type', top_n=10
                     penalty='l1',
                     solver='saga',
                     class_weight='balanced',
-                    cv=5,
-                    max_iter=3000,
+                    cv=3,
+                    max_iter=2000,
                     scoring='roc_auc',
                     n_jobs=-1
                 )
@@ -308,12 +324,14 @@ class coEncoder:
         print(f"   Loading SC: {self.sc_file}")
         sc_adata = sc.read_h5ad(self.sc_file)
         sc_adata.obs['modality'] = 'SC'
+        sc_adata.var_names_make_unique()
         print(f"   SC shape: {sc_adata.shape}")
         
         # Load ST data
         print(f"   Loading ST: {self.st_file}")
         st_adata = sc.read_h5ad(self.st_file)
         st_adata.obs['modality'] = 'ST'
+        st_adata.var_names_make_unique()
         print(f"   ST shape: {st_adata.shape}")
         
         # Find common genes
@@ -553,7 +571,7 @@ class coEncoder:
         # Optimizer
         optimizer = torch.optim.Adam(self.vae.parameters(), lr=lr)
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode='min', patience=10, factor=0.5, verbose=True
+            optimizer, mode='min', patience=10, factor=0.5
         )
         
         # Training history
@@ -754,7 +772,7 @@ class coEncoder:
         
         plt.tight_layout()
         plt.savefig(f"{self.output_dir}/vae_training_curves.png", dpi=300, bbox_inches='tight')
-        plt.show()
+        # plt.show()
     
     def plot_modality_alignment_umap(self, train_X, train_modality, y_train=None):
         """
@@ -851,7 +869,7 @@ class coEncoder:
         
         plt.tight_layout()
         plt.savefig(f"{self.output_dir}/modality_alignment_umap.png", dpi=300, bbox_inches='tight')
-        plt.show()
+        # plt.show()
         
         print(f"   UMAP visualization saved to: {self.output_dir}/modality_alignment_umap.png")
     

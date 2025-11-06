@@ -139,6 +139,132 @@ class VAE(nn.Module):
         z = self.reparameterize(mu, log_var)
         return z, mu, log_var
 
+
+class DualDecoderVAE(nn.Module):
+    """
+    双解码器VAE - 用于SC和ST模态对齐
+    
+    架构:
+        - 共享Encoder: 将SC和ST数据编码到同一个latent space
+        - SC Decoder: 专门重建SC数据
+        - ST Decoder: 专门重建ST数据
+        - MMD Loss: 在latent space上对齐两个模态的分布
+    
+    前向传播:
+        SC: x_sc → Encoder → z_sc → Decoder_SC → recon_sc
+        ST: x_st → Encoder → z_st → Decoder_ST → recon_st
+        Alignment: MMD(z_sc, z_st) → 强制两个模态的latent分布对齐
+    """
+    def __init__(self, input_dim, hidden_dims=[512, 256], latent_dim=128, dropout=0.2, output_type='mse'):
+        super().__init__()
+        
+        self.latent_dim = latent_dim
+        self.output_type = output_type
+        
+        # 共享编码器 (Shared Encoder)
+        self.encoder = VAEEncoder(
+            input_dim=input_dim,
+            hidden_dims=hidden_dims,
+            latent_dim=latent_dim,
+            dropout=dropout
+        )
+        
+        # SC专用解码器 (SC-specific Decoder)
+        decoder_hidden = hidden_dims[::-1]
+        self.decoder_sc = VAEDecoder(
+            latent_dim=latent_dim,
+            hidden_dims=decoder_hidden,
+            output_dim=input_dim,
+            dropout=dropout,
+            output_type=output_type
+        )
+        
+        # ST专用解码器 (ST-specific Decoder)
+        self.decoder_st = VAEDecoder(
+            latent_dim=latent_dim,
+            hidden_dims=decoder_hidden,
+            output_dim=input_dim,
+            dropout=dropout,
+            output_type=output_type
+        )
+        
+    def reparameterize(self, mu, log_var):
+        """重参数化技巧"""
+        std = torch.exp(0.5 * log_var)
+        eps = torch.randn_like(std)
+        return mu + eps * std
+    
+    def forward(self, x, modality):
+        """
+        前向传播
+        
+        Args:
+            x: 输入数据 [batch_size, input_dim]
+            modality: 模态标签 [batch_size] (0=SC, 1=ST)
+        
+        Returns:
+            根据output_type返回不同格式:
+            - MSE模式: recon_x, mu, log_var, z
+            - ZINB模式: mean, disp, pi, mu, log_var, z
+        """
+        # 共享编码 (所有数据都通过同一个encoder)
+        mu, log_var = self.encoder(x)
+        z = self.reparameterize(mu, log_var)
+        
+        # 根据modality选择不同的decoder
+        # modality: 0=SC, 1=ST
+        sc_mask = (modality == 0)
+        st_mask = (modality == 1)
+        
+        if self.output_type == 'zinb':
+            # 初始化输出张量
+            batch_size = x.shape[0]
+            input_dim = x.shape[1]
+            device = x.device
+            
+            mean = torch.zeros(batch_size, input_dim, device=device)
+            disp = torch.zeros(batch_size, input_dim, device=device)
+            pi = torch.zeros(batch_size, input_dim, device=device)
+            
+            # SC数据通过decoder_sc
+            if sc_mask.sum() > 0:
+                mean_sc, disp_sc, pi_sc = self.decoder_sc(z[sc_mask])
+                mean[sc_mask] = mean_sc
+                disp[sc_mask] = disp_sc
+                pi[sc_mask] = pi_sc
+            
+            # ST数据通过decoder_st
+            if st_mask.sum() > 0:
+                mean_st, disp_st, pi_st = self.decoder_st(z[st_mask])
+                mean[st_mask] = mean_st
+                disp[st_mask] = disp_st
+                pi[st_mask] = pi_st
+            
+            return mean, disp, pi, mu, log_var, z
+        else:
+            # MSE模式
+            batch_size = x.shape[0]
+            input_dim = x.shape[1]
+            device = x.device
+            
+            recon_x = torch.zeros(batch_size, input_dim, device=device)
+            
+            # SC数据通过decoder_sc
+            if sc_mask.sum() > 0:
+                recon_x[sc_mask] = self.decoder_sc(z[sc_mask])
+            
+            # ST数据通过decoder_st
+            if st_mask.sum() > 0:
+                recon_x[st_mask] = self.decoder_st(z[st_mask])
+            
+            return recon_x, mu, log_var, z
+    
+    def encode(self, x):
+        """仅编码，返回潜在表示"""
+        mu, log_var = self.encoder(x)
+        z = self.reparameterize(mu, log_var)
+        return z, mu, log_var
+
 # Loss Functions
 def vae_loss_function(recon_x, x, mu, log_var, beta=1.0):
     """VAE损失函数：重建损失 (MSE) + KL散度"""
@@ -589,6 +715,7 @@ class SpatialDeconvolutionLoss(nn.Module):
         
         # ============ 1. Pearson Correlation Loss ============
         # 计算Pearson相关系数(基于基因表达的相关性)
+        # 使用 log-normalized 空间以减少高表达基因的主导作用
         def pearson_correlation(x, y):
             """计算Pearson相关系数"""
             x_centered = x - x.mean(dim=-1, keepdim=True)
@@ -600,15 +727,20 @@ class SpatialDeconvolutionLoss(nn.Module):
             corr = numerator / (denominator + 1e-8)
             return corr
         
-        pearson_corr = pearson_correlation(reconstructed_spot, true_spot_expression)
+        # Log-normalize 用于计算相似度（避免高表达基因主导）
+        reconstructed_log = torch.log1p(reconstructed_spot)
+        true_log = torch.log1p(true_spot_expression)
+        
+        pearson_corr = pearson_correlation(reconstructed_log, true_log)
         L_pearson = 1.0 - pearson_corr.mean()  # 1 - 相关系数,越小越好
         
         # ============ 2. MSE Loss (重建误差) ============
+        # MSE 在 count 空间计算（保持比例线性）
         L_mse = F.mse_loss(reconstructed_spot, true_spot_expression)
         
         # ============ 3. Cosine Similarity Loss ============
-        # Cosine相似度(越接近1越好)
-        cos_sim_rec = F.cosine_similarity(reconstructed_spot, true_spot_expression, dim=-1)
+        # Cosine相似度在 log-normalized 空间计算（避免高表达基因主导）
+        cos_sim_rec = F.cosine_similarity(reconstructed_log, true_log, dim=-1)
         L_cosine = 1.0 - cos_sim_rec.mean()
         
         # ============ 4. Weight Regularization Loss ============

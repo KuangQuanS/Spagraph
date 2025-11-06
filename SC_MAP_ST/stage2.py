@@ -92,11 +92,23 @@ class GATDeconvolution:
         print(f"   VAE architecture: {input_dim} -> {latent_dim}")
         print(f"   Output type: {output_type}")
         
-        # Use only encoder part
-        full_vae = VAE(input_dim=input_dim, latent_dim=latent_dim, output_type=output_type).to(self.device)
-        full_vae.load_state_dict(checkpoint['vae_state_dict'])
+        # 检测是否是双解码器架构
+        state_dict = checkpoint['vae_state_dict']
+        is_dual_decoder = any('decoder_sc' in key or 'decoder_st' in key for key in state_dict.keys())
         
-        # Extract encoder
+        if is_dual_decoder:
+            print(f"   Architecture: Dual Decoder (SC/ST-specific)")
+            # 使用双解码器VAE
+            from model import DualDecoderVAE
+            full_vae = DualDecoderVAE(input_dim=input_dim, latent_dim=latent_dim, output_type=output_type).to(self.device)
+        else:
+            print(f"   Architecture: Single Decoder")
+            # 使用标准VAE
+            full_vae = VAE(input_dim=input_dim, latent_dim=latent_dim, output_type=output_type).to(self.device)
+        
+        full_vae.load_state_dict(state_dict)
+        
+        # Extract encoder (encoder是共享的，不管单双解码器)
         self.vae_encoder = full_vae.encoder
         self.vae_encoder.eval()  # Freeze encoder
         
@@ -651,6 +663,68 @@ class GATDeconvolution:
             cluster_composition_df.to_csv(cluster_file)
             print(f"   Saved cluster composition: {cluster_file}")
         
+        # ============ Compute reconstruction quality (Cosine Similarity) ============
+        print("\nComputing reconstruction quality per spot...")
+        
+        # Reconstruct spot expression using deconv_weights
+        if self.celltype_expressions_full is not None and all(expr is not None for expr in self.celltype_expressions_full):
+            # Use full gene expression
+            # Check if expressions are tensors or numpy arrays
+            if isinstance(self.celltype_expressions_full[0], torch.Tensor):
+                celltype_expr_full = np.array([expr.cpu().numpy() for expr in self.celltype_expressions_full])
+            else:
+                celltype_expr_full = np.array(self.celltype_expressions_full)
+            
+            reconstructed_full_expr = np.dot(deconv_weights, celltype_expr_full)
+            
+            # IMPORTANT: 确保 true_expr 和 reconstructed_full_expr 使用相同的基因集
+            # celltype_expr_full 对应的是 self.all_genes（从 stage1 加载）
+            if hasattr(self, 'all_genes') and self.all_genes is not None:
+                # 只提取 all_genes 对应的基因表达
+                true_expr_full = st_adata[:, self.all_genes].X
+                true_expr = true_expr_full.toarray() if hasattr(true_expr_full, 'toarray') else true_expr_full
+                print(f"   Using {len(self.all_genes)} genes for reconstruction quality")
+            else:
+                # Fallback: 如果没有 all_genes，使用 st_adata 的所有基因（可能不匹配）
+                print("   Warning: all_genes not found, using all ST genes (may cause dimension mismatch)")
+                true_expr = st_adata.X.toarray() if hasattr(st_adata.X, 'toarray') else st_adata.X
+        else:
+            # Fall back to marker genes
+            celltype_expr_marker = self.celltype_expressions.cpu().numpy()
+            reconstructed_full_expr = np.dot(deconv_weights, celltype_expr_marker)
+            
+            # 使用 marker genes 对应的真实表达
+            st_marker_subset = st_adata[:, self.genes].X
+            true_expr = st_marker_subset.toarray() if hasattr(st_marker_subset, 'toarray') else st_marker_subset
+            print(f"   Using {len(self.genes)} marker genes for reconstruction quality")
+        
+        # Compute cosine similarity per spot (log-normalized space)
+        reconstructed_log = np.log1p(reconstructed_full_expr)
+        true_log = np.log1p(true_expr)
+        
+        cosine_similarities = []
+        for i in range(n_spots):
+            rec = reconstructed_log[i]
+            true = true_log[i]
+            
+            # Cosine similarity
+            cos_sim = np.dot(rec, true) / (np.linalg.norm(rec) * np.linalg.norm(true) + 1e-8)
+            cosine_similarities.append(cos_sim)
+        
+        cosine_similarities = np.array(cosine_similarities)
+        
+        # Save cosine similarities to CSV
+        cosine_df = pd.DataFrame({
+            'spot_id': spot_barcodes,
+            'cosine_similarity': cosine_similarities
+        })
+        cosine_csv = f"{self.output_dir}/{sample_name}_spot_cosine_similarity.csv"
+        cosine_df.to_csv(cosine_csv, index=False)
+        print(f"   Cosine similarities saved: {cosine_csv}")
+        
+        # Plot reconstruction quality curve (sorted by similarity)
+        self.plot_reconstruction_quality_curve(cosine_similarities, sample_name)
+        
         # Save results summary
         # results = {
         #     'deconv_weights': deconv_weights,
@@ -733,6 +807,77 @@ class GATDeconvolution:
                     celltype_name = checkpoint_cluster_to_celltype.get(str(cluster_id), f"Cluster_{cluster_id}")
                     f.write(f"{cluster_id}\t{celltype_name}\n")
             print(f"   ✅ Celltype-cluster mapping: {mapping_file}")
+    
+    def plot_reconstruction_quality_curve(self, cosine_similarities, sample_name):
+        """Plot reconstruction quality curve (sorted by cosine similarity)
+        
+        Args:
+            cosine_similarities: Array of cosine similarities per spot [n_spots]
+            sample_name: Sample name for saving
+        """
+        print("\nPlotting reconstruction quality curve...")
+        
+        # Sort cosine similarities in ascending order
+        sorted_similarities = np.sort(cosine_similarities)
+        n_spots = len(sorted_similarities)
+        spot_indices = np.arange(1, n_spots + 1)  # 1-based indexing
+        
+        # Compute statistics
+        mean_sim = np.mean(cosine_similarities)
+        median_sim = np.median(cosine_similarities)
+        q25_sim = np.percentile(cosine_similarities, 25)
+        q75_sim = np.percentile(cosine_similarities, 75)
+        min_sim = np.min(cosine_similarities)
+        max_sim = np.max(cosine_similarities)
+        
+        # Create plot
+        fig, ax = plt.subplots(1, 1, figsize=(10, 6))
+        
+        # Plot curve
+        ax.plot(spot_indices, sorted_similarities, linewidth=2.5, color='#1f77b4', label='Cosine Similarity')
+        
+        # Add reference lines
+        ax.axhline(mean_sim, color='red', linestyle='--', linewidth=1.5, alpha=0.7, label=f'Mean: {mean_sim:.3f}')
+        ax.axhline(median_sim, color='green', linestyle='--', linewidth=1.5, alpha=0.7, label=f'Median: {median_sim:.3f}')
+        ax.axhline(0.8, color='gray', linestyle=':', linewidth=1, alpha=0.5)  # Reference line at 0.8
+        
+        # Styling
+        ax.set_xlabel('Spot Index (sorted by similarity)', fontsize=12, fontweight='bold')
+        ax.set_ylabel('Cosine Similarity', fontsize=12, fontweight='bold')
+        ax.set_title(f'Reconstruction Quality Distribution - {sample_name}', fontsize=14, fontweight='bold', pad=15)
+        ax.legend(loc='lower right', fontsize=10)
+        ax.grid(True, alpha=0.3, linestyle='--')
+        ax.set_ylim([0, 1.0])
+        ax.set_xlim([0, n_spots])
+        
+        # Add text box with statistics
+        textstr = '\n'.join([
+            f'Total spots: {n_spots}',
+            f'Min: {min_sim:.3f}',
+            f'Q25: {q25_sim:.3f}',
+            f'Median: {median_sim:.3f}',
+            f'Q75: {q75_sim:.3f}',
+            f'Max: {max_sim:.3f}',
+            f'Mean: {mean_sim:.3f}'
+        ])
+        props = dict(boxstyle='round', facecolor='wheat', alpha=0.5)
+        ax.text(0.02, 0.98, textstr, transform=ax.transAxes, fontsize=9,
+                verticalalignment='top', bbox=props)
+        
+        plt.tight_layout()
+        
+        # Save figure
+        output_file = f"{self.output_dir}/{sample_name}_reconstruction_quality_curve.png"
+        plt.savefig(output_file, dpi=300, bbox_inches='tight')
+        print(f"   Reconstruction quality curve saved: {output_file}")
+        plt.close()
+        
+        # Print summary
+        print(f"\n   Reconstruction Quality Summary:")
+        print(f"      Mean cosine similarity: {mean_sim:.4f}")
+        print(f"      Median cosine similarity: {median_sim:.4f}")
+        print(f"      Range: [{min_sim:.4f}, {max_sim:.4f}]")
+        print(f"      Spots with similarity > 0.8: {np.sum(cosine_similarities > 0.8)} ({100*np.sum(cosine_similarities > 0.8)/n_spots:.1f}%)")
     
     def plot_training_curves(self, train_losses, pearson_losses, mse_losses, cos_losses, 
                            weight_regs, sparsity_regs, diversity_losses, hetero_losses, 
@@ -970,7 +1115,7 @@ def main():
     print(f"ST matching genes: {len(trainer.genes)}/{len(trainer.genes)}")
     
     # Extract ST data
-    sc.pp.normalize_total(st_subset, target_sum=1e4)
+    # sc.pp.normalize_total(st_subset, target_sum=1e4)
     # sc.pp.log1p(st_subset)
     st_X = st_subset.X.toarray() if hasattr(st_subset.X, 'toarray') else st_subset.X
     

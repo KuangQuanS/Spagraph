@@ -681,7 +681,7 @@ class SpatialDeconvolutionLoss(nn.Module):
     
     def __init__(self, lambda_pearson=1.0, lambda_mse=1.0, lambda_cosine=1.0, 
                  lambda_reg=0.5, lambda_sparse=0.01,
-                 lambda_proportion=1.0, sc_celltype_proportions=None):
+                 lambda_proportion=1.0, sc_celltype_proportions=None, cells_per_spot=1.0):
         super().__init__()
         self.lambda_pearson = lambda_pearson      # Pearson损失权重
         self.lambda_mse = lambda_mse              # MSE损失权重
@@ -689,6 +689,7 @@ class SpatialDeconvolutionLoss(nn.Module):
         self.lambda_reg = lambda_reg              # 权重正则化权重
         self.lambda_sparse = lambda_sparse        # 稀疏性正则化权重
         self.lambda_proportion = lambda_proportion  # 细胞类型比例一致性权重
+        self.cells_per_spot = cells_per_spot      # 每个spot的细胞数缩放因子
         
         # 单细胞数据中各cluster的比例 [n_cell_types]
         # 例如: [0.10, 0.15, 0.20, ...] 表示cluster0占10%, cluster1占15%等
@@ -722,7 +723,13 @@ class SpatialDeconvolutionLoss(nn.Module):
         n_spots = attention_weights.shape[0]
         
         # 计算重建的spot表达
-        reconstructed_spot = torch.matmul(attention_weights, celltype_expression)  # [n_spots, n_genes]
+        # 关键修改：加上 cells_per_spot 缩放因子
+        # attention_weights 是比例（和为1），乘以 cells_per_spot 得到细胞数量
+        # celltype_expression 是每个细胞的平均表达，所以最终是细胞数量加权求和
+        reconstructed_spot = torch.matmul(
+            attention_weights * self.cells_per_spot,  # [n_spots, n_cell_types] × scalar
+            celltype_expression                        # [n_cell_types, n_genes]
+        )  # [n_spots, n_genes]
         
         # ============ 1. Pearson Correlation Loss ============
         # 计算Pearson相关系数(基于基因表达的相关性)
@@ -814,12 +821,7 @@ class SpatialDeconvolutionLoss(nn.Module):
         #   - 这是对**整个组织切片**的全局约束，不是对单个spot的约束
         #   - 单个spot可以有不同的细胞组成（保持空间异质性）
         #   - 但所有spots加起来的总体分布应该与单细胞数据匹配
-        # 
-        # 例子：
-        #   - 单细胞数据: T细胞30%, B细胞20%, 上皮细胞50%
-        #   - Spot A (肿瘤核心): T细胞5%, B细胞5%, 上皮细胞90%  ✓ 允许
-        #   - Spot B (免疫区域): T细胞60%, B细胞30%, 上皮细胞10% ✓ 允许
-        #   - 全局平均: T细胞30%, B细胞20%, 上皮细胞50%         ✓ 匹配单细胞
+
         proportion_loss = torch.tensor(0.0, device=attention_weights.device)
         
         if self.sc_celltype_proportions is not None:

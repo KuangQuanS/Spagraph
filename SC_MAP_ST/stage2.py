@@ -244,7 +244,7 @@ class GATDeconvolution:
                        gat_heads=4, dropout=0.1, loss_lambda_pearson=1.0, loss_lambda_mse=1.0,
                        loss_lambda_cosine=1.0, 
                        loss_lambda_reg=0.5, loss_lambda_sparse=0.01,
-                       loss_lambda_proportion=1.0):
+                       loss_lambda_proportion=1.0, cells_per_spot=1.0):
         """Build GAT deconvolution model"""
         print("="*60)
         print("Building GAT model...")
@@ -257,6 +257,7 @@ class GATDeconvolution:
         print(f"GAT layers: {gat_layers}")
         print(f"Attention heads: {gat_heads}")
         print(f"Dropout: {dropout}")
+        print(f"Cells per spot (scale factor): {cells_per_spot:.3f}")
         print(f"Loss weights: λ_pearson={loss_lambda_pearson}, λ_mse={loss_lambda_mse}, "
               f"λ_cosine={loss_lambda_cosine}, "
               f"λ_reg={loss_lambda_reg}, λ_sparse={loss_lambda_sparse}, "
@@ -309,7 +310,8 @@ class GATDeconvolution:
             lambda_reg=loss_lambda_reg,
             lambda_sparse=loss_lambda_sparse,
             lambda_proportion=loss_lambda_proportion,
-            sc_celltype_proportions=sc_celltype_proportions
+            sc_celltype_proportions=sc_celltype_proportions,
+            cells_per_spot=cells_per_spot
         )
         
         gat_params = sum(p.numel() for p in self.gat_model.parameters())
@@ -1218,7 +1220,8 @@ def main():
         loss_lambda_cosine=args.loss_lambda_cosine,
         loss_lambda_reg=args.loss_lambda_reg,
         loss_lambda_sparse=args.loss_lambda_sparse,
-        loss_lambda_proportion=args.loss_lambda_proportion
+        loss_lambda_proportion=args.loss_lambda_proportion,
+        cells_per_spot=args.cells_per_spot
     )
     
     # Start training

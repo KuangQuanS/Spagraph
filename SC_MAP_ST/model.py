@@ -681,7 +681,7 @@ class SpatialDeconvolutionLoss(nn.Module):
     
     def __init__(self, lambda_pearson=1.0, lambda_mse=1.0, lambda_cosine=1.0, 
                  lambda_reg=0.5, lambda_sparse=0.01,
-                 lambda_proportion=1.0, sc_celltype_proportions=None, cells_per_spot=1.0):
+                 lambda_proportion=1.0, sc_celltype_proportions=None, spot_total_counts=None):
         super().__init__()
         self.lambda_pearson = lambda_pearson      # Pearson损失权重
         self.lambda_mse = lambda_mse              # MSE损失权重
@@ -689,7 +689,13 @@ class SpatialDeconvolutionLoss(nn.Module):
         self.lambda_reg = lambda_reg              # 权重正则化权重
         self.lambda_sparse = lambda_sparse        # 稀疏性正则化权重
         self.lambda_proportion = lambda_proportion  # 细胞类型比例一致性权重
-        self.cells_per_spot = cells_per_spot      # 每个spot的细胞数缩放因子
+        
+        # ✅ 使用 spot_total_counts 代替 cells_per_spot
+        # spot_total_counts: 每个 spot 的总 UMI 数 [n_spots]
+        if spot_total_counts is not None:
+            self.register_buffer('spot_total_counts', torch.FloatTensor(spot_total_counts))
+        else:
+            self.spot_total_counts = None
         
         # 单细胞数据中各cluster的比例 [n_cell_types]
         # 例如: [0.10, 0.15, 0.20, ...] 表示cluster0占10%, cluster1占15%等
@@ -705,7 +711,8 @@ class SpatialDeconvolutionLoss(nn.Module):
                true_spot_expression: torch.Tensor,
                spot_embedding: torch.Tensor = None,
                celltype_embedding: torch.Tensor = None,
-               edge_index: torch.Tensor = None) -> Dict[str, torch.Tensor]:
+               edge_index: torch.Tensor = None,
+               batch_spot_total_counts: torch.Tensor = None) -> Dict[str, torch.Tensor]:
         """
         计算总损失
         
@@ -716,24 +723,42 @@ class SpatialDeconvolutionLoss(nn.Module):
             spot_embedding: spot embedding [n_spots, embedding_dim]（可选）
             celltype_embedding: 细胞类型embedding [n_cell_types, embedding_dim]（可选）
             edge_index: 图的边索引 [2, num_edges]（可选，用于计算空间异质性）
+            batch_spot_total_counts: 当前batch的spot总counts [batch_size]（优先使用）
             
         Returns:
             损失字典
         """
         n_spots = attention_weights.shape[0]
         
-        # 计算重建的spot表达
-        # 关键修改：加上 cells_per_spot 缩放因子
-        # attention_weights 是比例（和为1），乘以 cells_per_spot 得到细胞数量
-        # celltype_expression 是每个细胞的平均表达，所以最终是细胞数量加权求和
-        reconstructed_spot = torch.matmul(
-            attention_weights * self.cells_per_spot,  # [n_spots, n_cell_types] × scalar
-            celltype_expression                        # [n_cell_types, n_genes]
-        )  # [n_spots, n_genes]
+        # ✅ 计算重建的spot表达: X̂_i = s_i × Σ(w_ic × R_c)
+        # attention_weights: [n_spots, n_cell_types] - 细胞类型比例 (和为1)
+        # celltype_expression: [n_cell_types, n_genes] - 来自Stage 1 (normalize 1e4)
+        # spot_total_counts: [n_spots] - 每个spot的总UMI数 (raw counts)
+        
+        # 将 celltype_expression 从 1e4 scale 转换为 sum=1
+        # 原因: Stage 1 用 normalize_total(1e4), 求 mean 后可能不完全是 1e4
+        celltype_expr_normalized = celltype_expression / 1e4  # 转换为 sum≈1 的比例
+        
+        # 先计算混合比例: Σ(w_ic × R_c)
+        mixed_proportions = torch.matmul(
+            attention_weights,           # [n_spots, n_cell_types]
+            celltype_expr_normalized     # [n_cell_types, n_genes], sum≈1
+        )  # [n_spots, n_genes] - 混合后的表达比例
+        
+        # 然后乘以每个spot的总counts: s_i × Σ(w_ic × R_c)
+        # ✅ 优先使用 batch_spot_total_counts (当前batch的)
+        if batch_spot_total_counts is not None:
+            reconstructed_spot = mixed_proportions * batch_spot_total_counts.unsqueeze(-1)
+        elif self.spot_total_counts is not None:
+            reconstructed_spot = mixed_proportions * self.spot_total_counts[:n_spots].unsqueeze(-1)
+        else:
+            # Fallback: 如果没有spot_total_counts,使用原始比例
+            reconstructed_spot = mixed_proportions
+            print("⚠️  Warning: spot_total_counts not available, using proportions directly!")
         
         # ============ 1. Pearson Correlation Loss ============
         # 计算Pearson相关系数(基于基因表达的相关性)
-        # 使用 log-normalized 空间以减少高表达基因的主导作用
+        # ✅ 先 normalize 到比例空间，再 log，消除文库大小差异
         def pearson_correlation(x, y):
             """计算Pearson相关系数"""
             x_centered = x - x.mean(dim=-1, keepdim=True)
@@ -745,9 +770,13 @@ class SpatialDeconvolutionLoss(nn.Module):
             corr = numerator / (denominator + 1e-8)
             return corr
         
-        # Log-normalize 用于计算相似度（避免高表达基因主导）
-        reconstructed_log = torch.log1p(reconstructed_spot)
-        true_log = torch.log1p(true_spot_expression)
+        # Normalize 到比例空间 (消除文库大小差异)
+        reconstructed_norm = reconstructed_spot / (reconstructed_spot.sum(dim=-1, keepdim=True) + 1e-8)
+        true_norm = true_spot_expression / (true_spot_expression.sum(dim=-1, keepdim=True) + 1e-8)
+        
+        # Log-transform (避免高表达基因主导)
+        reconstructed_log = torch.log1p(reconstructed_norm * 1e4)  # 乘 1e4 使 log 值更稳定
+        true_log = torch.log1p(true_norm * 1e4)
         
         pearson_corr = pearson_correlation(reconstructed_log, true_log)
         L_pearson = 1.0 - pearson_corr.mean()  # 1 - 相关系数,越小越好

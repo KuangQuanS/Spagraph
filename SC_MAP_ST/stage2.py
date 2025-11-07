@@ -23,20 +23,26 @@ warnings.filterwarnings('ignore')
 from model import VAE, HeterogeneousGATDeconvolution, SpatialDeconvolutionLoss
 
 class SpatialDataset(Dataset):
-    """Spatial transcriptomics dataset"""
-    def __init__(self, st_data, spatial_coords, spot_ids):
-        self.st_data = torch.FloatTensor(st_data)
+    """Spatial transcriptomics dataset
+    
+    Stores both normalized (for embedding) and raw (for loss) data
+    """
+    def __init__(self, st_data_normalized, st_data_raw, spatial_coords, spot_ids):
+        self.st_data_normalized = torch.FloatTensor(st_data_normalized)
+        self.st_data_raw = torch.FloatTensor(st_data_raw)
         self.spatial_coords = torch.FloatTensor(spatial_coords)
         self.spot_ids = spot_ids
         
     def __len__(self):
-        return len(self.st_data)
+        return len(self.st_data_normalized)
     
     def __getitem__(self, idx):
         return {
-            'expression': self.st_data[idx],
+            'expression_normalized': self.st_data_normalized[idx],  # For VAE embedding
+            'expression_raw': self.st_data_raw[idx],                # For loss
             'coords': self.spatial_coords[idx],
-            'spot_id': self.spot_ids[idx]
+            'spot_id': self.spot_ids[idx],
+            'index': idx  # ✅ Add index for spot_total_counts lookup
         }
 
 class GATDeconvolution:
@@ -244,8 +250,13 @@ class GATDeconvolution:
                        gat_heads=4, dropout=0.1, loss_lambda_pearson=1.0, loss_lambda_mse=1.0,
                        loss_lambda_cosine=1.0, 
                        loss_lambda_reg=0.5, loss_lambda_sparse=0.01,
-                       loss_lambda_proportion=1.0, cells_per_spot=1.0):
-        """Build GAT deconvolution model"""
+                       loss_lambda_proportion=1.0, spot_total_counts=None):
+        """Build GAT deconvolution model
+        
+        Args:
+            spot_total_counts: Array of total counts for each spot (shape: [n_spots])
+                              Used for scaling: reconstructed = s_i × Σ(w_ic × R_c)
+        """
         print("="*60)
         print("Building GAT model...")
         
@@ -257,7 +268,14 @@ class GATDeconvolution:
         print(f"GAT layers: {gat_layers}")
         print(f"Attention heads: {gat_heads}")
         print(f"Dropout: {dropout}")
-        print(f"Cells per spot (scale factor): {cells_per_spot:.3f}")
+        
+        if spot_total_counts is not None:
+            print(f"Spot total counts: min={spot_total_counts.min():.1f}, max={spot_total_counts.max():.1f}, mean={spot_total_counts.mean():.1f}")
+            self.spot_total_counts = spot_total_counts
+        else:
+            print("⚠️  Warning: spot_total_counts not provided!")
+            self.spot_total_counts = None
+            
         print(f"Loss weights: λ_pearson={loss_lambda_pearson}, λ_mse={loss_lambda_mse}, "
               f"λ_cosine={loss_lambda_cosine}, "
               f"λ_reg={loss_lambda_reg}, λ_sparse={loss_lambda_sparse}, "
@@ -311,7 +329,7 @@ class GATDeconvolution:
             lambda_sparse=loss_lambda_sparse,
             lambda_proportion=loss_lambda_proportion,
             sc_celltype_proportions=sc_celltype_proportions,
-            cells_per_spot=cells_per_spot
+            spot_total_counts=self.spot_total_counts  # ✅ Pass spot_total_counts to loss function
         )
         
         gat_params = sum(p.numel() for p in self.gat_model.parameters())
@@ -337,12 +355,22 @@ class GATDeconvolution:
         
         for batch_idx, batch in enumerate(dataloader):
             # Extract batch data
-            batch_st_data = batch['expression'].to(self.device)
+            batch_st_normalized = batch['expression_normalized'].to(self.device)  # For embedding
+            batch_st_raw = batch['expression_raw'].to(self.device)                # For loss
             batch_spatial_coords = batch['coords'].to(self.device)
+            batch_indices = batch['index']  # ✅ Get batch indices
             
-            # Compute spot embeddings
+            # ✅ Get spot_total_counts for this batch (convert to tensor)
+            if self.spot_total_counts is not None:
+                batch_spot_total_counts = torch.FloatTensor(
+                    self.spot_total_counts[batch_indices]
+                ).to(self.device)
+            else:
+                batch_spot_total_counts = None
+            
+            # Compute spot embeddings (using normalized data, consistent with VAE training)
             with torch.no_grad():
-                mu, log_var = self.vae_encoder(batch_st_data)
+                mu, log_var = self.vae_encoder(batch_st_normalized)
                 spot_embeddings = mu
             
             # GAT forward pass
@@ -352,14 +380,15 @@ class GATDeconvolution:
                 celltype_prototypes=self.celltype_prototypes
             )
             
-            # Compute loss
+            # Compute loss (using raw count data)
             loss_outputs = self.loss_fn(
                 attention_weights=gat_outputs['deconv_weights'],
                 celltype_expression=self.celltype_expressions,
-                true_spot_expression=batch_st_data,
+                true_spot_expression=batch_st_raw,  # ✅ Use raw counts for loss
                 spot_embedding=gat_outputs['spot_features'],
                 celltype_embedding=gat_outputs['celltype_features'],
-                edge_index=gat_outputs['edge_index']  # 传递edge_index用于计算空间异质性
+                edge_index=gat_outputs['edge_index'],
+                batch_spot_total_counts=batch_spot_total_counts  # ✅ Pass batch-specific counts
             )
             
             # Backward pass
@@ -379,33 +408,36 @@ class GATDeconvolution:
         return epoch_losses
     
     def train_gat_deconvolution(self, 
-                               st_data: np.ndarray,
+                               st_data_normalized: np.ndarray,  # For VAE embedding (sum=1)
+                               st_data_raw: np.ndarray,         # For loss calculation (raw counts)
                                spatial_coords: np.ndarray,
                                sample_name: str,
                                st_adata=None,
                                n_epochs: int = 50,
                                lr: float = 1e-3,
-                               batch_size: int = 512,
-                               cells_per_spot: float = 10.0):
+                               batch_size: int = 512):
         """Train GAT deconvolution model
         
         Args:
-            cells_per_spot: Average number of cells per spot (default 10 for Visium)
+            st_data_normalized: Normalized ST data (sum=1) for VAE embedding
+            st_data_raw: Raw count ST data for loss calculation
         """
         print("="*60)
         print("Starting GAT deconvolution training...")
-        print(f"Cells per spot: {cells_per_spot}")
+        print(f"   ST normalized data for embedding: {st_data_normalized.shape}")
+        print(f"   ST raw count data for loss: {st_data_raw.shape}")
         
         # Save st_adata for later use
         self.st_adata = st_adata
  
         # Convert to tensor
-        st_tensor = torch.FloatTensor(st_data).to(self.device)
+        st_tensor_normalized = torch.FloatTensor(st_data_normalized).to(self.device)
+        st_tensor_raw = torch.FloatTensor(st_data_raw).to(self.device)
         spatial_tensor = torch.FloatTensor(spatial_coords).to(self.device)
         
-        # Create dataset and dataloader
-        spot_ids = list(range(len(st_data)))
-        dataset = SpatialDataset(st_data, spatial_coords, spot_ids)
+        # Create dataset and dataloader (use normalized data for embedding)
+        spot_ids = list(range(len(st_data_normalized)))
+        dataset = SpatialDataset(st_data_normalized, st_data_raw, spatial_coords, spot_ids)
         dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=False)
         
         # Optimizer
@@ -483,8 +515,8 @@ class GATDeconvolution:
         # Save final model
         self.save_model(f"{self.output_dir}/final_gat_model.pth")
         
-        # Evaluate and visualize results
-        self.evaluate_and_visualize(st_data, self.st_adata, spatial_tensor, sample_name, cells_per_spot)
+        # Evaluate and visualize results (use normalized data for embedding)
+        self.evaluate_and_visualize(st_data_normalized, self.st_adata, spatial_tensor, sample_name)
         
         return {
             'best_loss': best_loss,
@@ -496,16 +528,14 @@ class GATDeconvolution:
                              st_data: np.ndarray,
                              st_adata,
                              spatial_coords: torch.Tensor,
-                             sample_name: str,
-                             cells_per_spot: float = 10.0):
+                             sample_name: str):
         """Evaluate model and visualize results, generate deconvolution matrices
         
-        Args:
-            cells_per_spot: Average number of cells per spot (default 10 for Visium)
+        Note: No longer needs cells_per_spot parameter.
+        Uses spot_total_counts stored during build_gat_model.
         """
         print("="*60)
         print("Evaluating model results...")
-        print(f"Cells per spot: {cells_per_spot}")
         
         self.gat_model.eval()
         
@@ -558,7 +588,23 @@ class GATDeconvolution:
         # 1. Marker gene expression matrix (spot × marker genes)
         print("   Marker gene expression...")
         celltype_expr_marker = self.celltype_expressions.cpu().numpy()
-        reconstructed_marker_expr = np.dot(deconv_weights, celltype_expr_marker)
+        
+        # ✅ 使用新公式: X̂_i = s_i × Σ(w_ic × R_c)
+        # celltype_expr_marker 来自 Stage 1 (normalize 1e4)
+        # 需要除以 1e4 转换为 sum≈1 的比例向量
+        celltype_expr_marker_normalized = celltype_expr_marker / 1e4
+        
+        # deconv_weights 是细胞类型比例 (sum=1)
+        # 混合比例
+        mixed_proportions_marker = np.dot(deconv_weights, celltype_expr_marker_normalized)  # [n_spots, n_genes]
+        
+        if self.spot_total_counts is not None:
+            # 乘以每个 spot 的总 counts
+            spot_total_marker = self.spot_total_counts[:len(spot_barcodes)]
+            reconstructed_marker_expr = mixed_proportions_marker * spot_total_marker[:, np.newaxis]
+        else:
+            reconstructed_marker_expr = mixed_proportions_marker
+            print("   ⚠️  Warning: spot_total_counts not available, using proportions")
         
         marker_expr_df = pd.DataFrame(
             reconstructed_marker_expr,
@@ -568,15 +614,24 @@ class GATDeconvolution:
         marker_expr_file = f"{self.output_dir}/{sample_name}_reconstructed_marker_genes.csv"
         marker_expr_df.to_csv(marker_expr_file)
         
-        # 2. Full gene expression matrix (use count version with cells_per_spot)
+        # 2. Full gene expression matrix (use count version with spot_total_counts)
         if self.celltype_expressions_full is not None and all(expr is not None for expr in self.celltype_expressions_full):
             print("   Full gene expression...")
             celltype_expr_full = np.array(self.celltype_expressions_full)
             
-            # Key change: weight represents cell fraction, so multiply by cells_per_spot
-            # Example: if weight=0.1 and cells_per_spot=10, means 1 cell of this type
-            # Cluster expression is mean count per cell, so 1 cell contributes 1 × cluster_expr
-            reconstructed_full_expr = np.dot(deconv_weights * cells_per_spot, celltype_expr_full)
+            # ✅ 使用新公式: X̂_i = s_i × Σ(w_ic × R_c)
+            # celltype_expr_full 来自 Stage 1 (normalize 1e4)
+            # 需要除以 1e4 转换为 sum≈1
+            celltype_expr_full_normalized = celltype_expr_full / 1e4
+            
+            mixed_proportions_full = np.dot(deconv_weights, celltype_expr_full_normalized)  # [n_spots, n_all_genes]
+            
+            if self.spot_total_counts is not None:
+                spot_total_full = self.spot_total_counts[:len(spot_barcodes)]
+                reconstructed_full_expr = mixed_proportions_full * spot_total_full[:, np.newaxis]
+            else:
+                reconstructed_full_expr = mixed_proportions_full
+                print("   ⚠️  Warning: spot_total_counts not available, using proportions")
             
             # Get full gene names
             if self.all_genes is not None:
@@ -1112,99 +1167,31 @@ def main():
     st_subset = st_adata[:, trainer.genes].copy()
     print(f"ST matching genes: {len(trainer.genes)}/{len(trainer.genes)}")
     
-    # Extract ST data
+    # ✅ 保存原始 raw counts (用于计算 loss)
+    st_X_raw = st_subset.X.toarray() if hasattr(st_subset.X, 'toarray') else st_subset.X
+    
+    # Calculate total counts per spot (for scaling in reconstruction)
+    spot_total_counts = st_X_raw.sum(axis=1)  # Shape: [n_spots]
+    print(f"ST spot total counts: min={spot_total_counts.min():.1f}, max={spot_total_counts.max():.1f}, mean={spot_total_counts.mean():.1f}")
+    
+    # ✅ Normalize ST data for VAE embedding (consistent with Stage 1 training: 1e4)
     sc.pp.normalize_total(st_subset, target_sum=1e4)
-    # sc.pp.log1p(st_subset)
-    st_X = st_subset.X.toarray() if hasattr(st_subset.X, 'toarray') else st_subset.X
+    st_X_normalized = st_subset.X.toarray() if hasattr(st_subset.X, 'toarray') else st_subset.X
     
     # Extract spatial coordinates
     spatial_coords = st_adata.obsm['spatial']
     
-    print(f"ST data: {st_X.shape}")
+    print(f"ST data: normalized (1e4)={st_X_normalized.shape} (for embedding), raw={st_X_raw.shape} (for loss)")
     
-    # Auto-calculate cells_per_spot if not manually specified
-    if args.cells_per_spot is None or args.cells_per_spot <= 0:
-        print("\n" + "="*60)
-        print("Auto-calculating cells_per_spot...")
-        
-        # Get average total counts per spot (MUST use raw counts, not normalized!)
-        if 'n_counts' in st_adata.obs.columns:
-            # Prefer pre-calculated raw counts
-            avg_spot_counts = st_adata.obs['n_counts'].mean()
-            print(f"   Using pre-calculated ST n_counts")
-        elif hasattr(st_adata, 'raw') and st_adata.raw is not None:
-            # Use raw layer if available
-            if hasattr(st_adata.raw.X, 'toarray'):
-                avg_spot_counts = st_adata.raw.X.toarray().sum(axis=1).mean()
-            else:
-                avg_spot_counts = st_adata.raw.X.sum(axis=1).mean()
-            print(f"   Using ST raw layer")
-        else:
-            # Fallback to current X (may be normalized - NOT ideal!)
-            if hasattr(st_adata.X, 'toarray'):
-                avg_spot_counts = st_adata.X.toarray().sum(axis=1).mean()
-            else:
-                avg_spot_counts = st_adata.X.sum(axis=1).mean()
-            print(f"   WARNING: Using potentially normalized ST data (may be inaccurate)")
-        
-        # Try to get avg_cell_counts from Stage 1 checkpoint first
-        if hasattr(trainer, 'avg_cell_counts') and trainer.avg_cell_counts is not None:
-            avg_cell_counts = trainer.avg_cell_counts
-            print(f"   Using avg_cell_counts from Stage 1: {avg_cell_counts:.1f}")
-        else:
-            # Fallback: load SC data to calculate average single cell counts
-            print(f"   avg_cell_counts not in Stage 1 checkpoint, calculating from SC data...")
-            stage1_dir = os.path.dirname(args.stage1_model_path)
-            sc_clustered_file = os.path.join(stage1_dir, 'sc_adata_clustered.h5ad')
-            
-            if os.path.exists(sc_clustered_file):
-                print(f"   Loading SC data: {sc_clustered_file}")
-                sc_adata = sc.read_h5ad(sc_clustered_file)
-                
-                # Get average total counts per cell (MUST use raw counts!)
-                if 'n_counts' in sc_adata.obs.columns:
-                    avg_cell_counts = sc_adata.obs['n_counts'].mean()
-                    print(f"   Using pre-calculated SC n_counts")
-                elif hasattr(sc_adata, 'raw') and sc_adata.raw is not None:
-                    if hasattr(sc_adata.raw.X, 'toarray'):
-                        avg_cell_counts = sc_adata.raw.X.toarray().sum(axis=1).mean()
-                    else:
-                        avg_cell_counts = sc_adata.raw.X.sum(axis=1).mean()
-                    print(f"   Using SC raw layer")
-                else:
-                    if hasattr(sc_adata.X, 'toarray'):
-                        avg_cell_counts = sc_adata.X.toarray().sum(axis=1).mean()
-                    else:
-                        avg_cell_counts = sc_adata.X.sum(axis=1).mean()
-                    print(f"   WARNING: Using potentially normalized SC data (may be inaccurate)")
-            else:
-                print(f"   Error: SC clustered file not found: {sc_clustered_file}")
-                print(f"   Using default cells_per_spot = 10.0")
-                args.cells_per_spot = 10.0
-                avg_cell_counts = None
-        
-        if avg_cell_counts is not None:
-            # Calculate cells per spot as a scale factor
-            calculated_cells_per_spot = avg_spot_counts / avg_cell_counts
-            
-            print(f"   Average spot total counts: {avg_spot_counts:.1f}")
-            print(f"   Average cell total counts: {avg_cell_counts:.1f}")
-            print(f"   Calculated ratio (cells_per_spot): {calculated_cells_per_spot:.3f}")
-            
-            # Only clip if unreasonably large (>30), but allow < 1 for sequencing depth differences
-            if calculated_cells_per_spot > 30.0:
-                print(f"   WARNING: Calculated ratio > 30, clipping to 30.0")
-                calculated_cells_per_spot = 30.0
-            elif calculated_cells_per_spot < 0.1:
-                print(f"   WARNING: Calculated ratio < 0.1, seems too small, using 1.0")
-                calculated_cells_per_spot = 1.0
-            
-            args.cells_per_spot = calculated_cells_per_spot
-        
-        print("="*60 + "\n")
-    else:
-        print(f"\nUsing manual cells_per_spot: {args.cells_per_spot}")
-  
+    # ✅ No need for cells_per_spot with this approach!
+    # We use spot_total_counts as scaling factor directly
+    print("\n" + "="*60)
+    print("Using NEW scaling approach:")
+    print("  - SC clusters: normalized to sum=1 (proportion vectors)")
+    print("  - ST spots: raw counts")
+    print("  - Scaling: spot_total_counts × (weighted_cluster_proportions)")
+    print("  - Formula: X̂_i = s_i × Σ(w_ic × R_c)")
+    print("="*60 + "\n")
     
     # Build GAT model and loss function
     print("="*60)
@@ -1221,7 +1208,7 @@ def main():
         loss_lambda_reg=args.loss_lambda_reg,
         loss_lambda_sparse=args.loss_lambda_sparse,
         loss_lambda_proportion=args.loss_lambda_proportion,
-        cells_per_spot=args.cells_per_spot
+        spot_total_counts=spot_total_counts  # ✅ Pass spot total counts instead of cells_per_spot
     )
     
     # Start training
@@ -1229,14 +1216,14 @@ def main():
     print("Starting GAT deconvolution training...")
     
     trainer.train_gat_deconvolution(
-        st_data=st_X,
+        st_data_normalized=st_X_normalized,  # For VAE embedding
+        st_data_raw=st_X_raw,                # For loss calculation
         spatial_coords=spatial_coords,
         sample_name=sample_name,
         st_adata=st_adata,
         n_epochs=args.n_epochs,
         lr=args.lr,
-        batch_size=args.batch_size,
-        cells_per_spot=args.cells_per_spot
+        batch_size=args.batch_size
     )
     
     print("="*60)

@@ -221,6 +221,26 @@ class coEncoder:
         sc_adata.var_names_make_unique()
         print(f"   SC shape: {sc_adata.shape}")
         
+        # Calculate average cell counts (for cells_per_spot scale factor in Stage 2)
+        if 'n_counts' in sc_adata.obs.columns:
+            avg_cell_counts = sc_adata.obs['n_counts'].mean()
+            print(f"   SC avg counts/cell: {avg_cell_counts:.1f} (from n_counts)")
+        elif hasattr(sc_adata, 'raw') and sc_adata.raw is not None:
+            if hasattr(sc_adata.raw.X, 'toarray'):
+                avg_cell_counts = sc_adata.raw.X.toarray().sum(axis=1).mean()
+            else:
+                avg_cell_counts = sc_adata.raw.X.sum(axis=1).mean()
+            print(f"   SC avg counts/cell: {avg_cell_counts:.1f} (from raw layer)")
+        else:
+            if hasattr(sc_adata.X, 'toarray'):
+                avg_cell_counts = sc_adata.X.toarray().sum(axis=1).mean()
+            else:
+                avg_cell_counts = sc_adata.X.sum(axis=1).mean()
+            print(f"   SC avg counts/cell: {avg_cell_counts:.1f} (from X)")
+        
+        # Store for later saving
+        self.avg_cell_counts = avg_cell_counts
+        
         # Load ST data
         print(f"   Loading ST: {self.st_file}")
         st_adata = sc.read_h5ad(self.st_file)
@@ -459,7 +479,8 @@ class coEncoder:
             cluster_expressions=getattr(self, 'cluster_expressions', None),
             cluster_expressions_full=getattr(self, 'cluster_expressions_full', None),
             cluster_expressions_full_count=getattr(self, 'cluster_expressions_full_count', None),
-            all_genes=getattr(self, 'all_genes', None)
+            all_genes=getattr(self, 'all_genes', None),
+            avg_cell_counts=getattr(self, 'avg_cell_counts', None)
         )
     
     def load_vae(self, filepath):

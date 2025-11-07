@@ -343,7 +343,7 @@ from model import VAE
 def save_vae_checkpoint(vae, label_encoder, marker_genes, genes, all_genes, 
                        sc_clusters, resolution, cluster_prototypes, 
                        cluster_expressions, cluster_expressions_full, 
-                       cluster_expressions_full_count, filepath):
+                       cluster_expressions_full_count, filepath, avg_cell_counts=None):
     """Save VAE model checkpoint
     
     Args:
@@ -359,6 +359,7 @@ def save_vae_checkpoint(vae, label_encoder, marker_genes, genes, all_genes,
         cluster_expressions_full: Dict of cluster expressions (all genes)
         cluster_expressions_full_count: Dict of cluster expressions (all genes, count backup)
         filepath: Path to save checkpoint
+        avg_cell_counts: Average total counts per cell (for Stage 2 cells_per_spot calculation)
     """
     print("="*60)
     print(f"Saving model to: {filepath}")
@@ -383,6 +384,9 @@ def save_vae_checkpoint(vae, label_encoder, marker_genes, genes, all_genes,
     else:
         print(f"   Warning: full gene expressions (count backup) missing")
     
+    if avg_cell_counts is not None:
+        print(f"   Average cell counts: {avg_cell_counts:.1f} (for Stage 2 scale factor)")
+    
     torch.save({
         'vae_state_dict': vae.state_dict(),
         'label_encoder': label_encoder,
@@ -397,7 +401,8 @@ def save_vae_checkpoint(vae, label_encoder, marker_genes, genes, all_genes,
         'cluster_expressions': cluster_expressions,
         'cluster_expressions_full': cluster_expressions_full,
         'cluster_expressions_full_count': cluster_expressions_full_count,
-        'all_genes': all_genes
+        'all_genes': all_genes,
+        'avg_cell_counts': avg_cell_counts
     }, filepath)
     
     print(f"   Saved successfully!")

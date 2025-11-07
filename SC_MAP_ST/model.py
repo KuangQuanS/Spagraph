@@ -423,7 +423,7 @@ class HeterogeneousGATDeconvolution(nn.Module):
         self.k_spatial = k_spatial
         self.k_celltype = k_celltype  # 每个spot连接最近的k个celltype
         
-        # 1. 节点嵌入层
+        # 1. 节点特征投影层
         # Spot节点：从VAE embedding到GAT输入
         self.spot_projection = nn.Sequential(
             nn.Linear(embedding_dim, gat_hidden_dim),
@@ -434,14 +434,14 @@ class HeterogeneousGATDeconvolution(nn.Module):
         # CellType节点：使用第一阶段VAE的celltype prototypes初始化
         if celltype_prototypes is not None:
             # 从VAE embedding投影到GAT hidden dim
-            # 确保投影层和prototypes在同一设备上
             device = celltype_prototypes.device
             celltype_proj = nn.Linear(embedding_dim, gat_hidden_dim, bias=False).to(device)
             with torch.no_grad():
                 projected_prototypes = celltype_proj(celltype_prototypes)
+            # 初始化为prototypes，但允许训练（通过残差连接保持联系）
             self.celltype_embeddings = nn.Parameter(projected_prototypes)
         else:
-            # 如果没有提供prototypes，则随机初始化（用于向后兼容）
+            # 如果没有提供prototypes，则随机初始化
             self.celltype_embeddings = nn.Parameter(
                 torch.randn(n_cell_types, gat_hidden_dim)
             )
@@ -546,6 +546,11 @@ class HeterogeneousGATDeconvolution(nn.Module):
         # 对于每个spot，找到最相似的k个celltype
         k_neighbors = min(self.k_celltype, n_cell_types)  # 防止k超过celltype数量
         
+        # Warning if k_celltype exceeds actual number of celltypes
+        if self.k_celltype > n_cell_types:
+            print(f"[WARNING] k_celltype ({self.k_celltype}) > n_cell_types ({n_cell_types}), "
+                  f"using k_neighbors={k_neighbors} (all celltypes will be connected)")
+        
         for spot_idx in range(n_spots):
             # 获取该spot与所有celltype的相似度
             similarities = similarity_matrix[spot_idx]
@@ -601,12 +606,20 @@ class HeterogeneousGATDeconvolution(nn.Module):
                 celltype_idx = dst - n_spots
                 sparse_mask[src, celltype_idx] = True
         
-        # 3. GAT processing
+        # 3. GAT processing with residual connections
+        # 保存原始节点特征用于残差连接
+        original_features = node_features.clone()
+        
         x = node_features
         for i, gat_layer in enumerate(self.gat_layers_list):
             x = gat_layer(x, edge_index)
             if i < len(self.gat_layers_list) - 1:
                 x = F.relu(x)
+        
+        # 添加残差连接：保持与原始VAE embeddings的联系
+        # 这样既能利用GAT的空间聚合，又不会完全偏离原始语义
+        alpha = 0.5  # 残差权重，可以调整
+        x = alpha * x + (1 - alpha) * original_features
         
         # 4. Extract spot and celltype node features
         spot_features = x[:n_spots]  # [n_spots, gat_hidden_dim]
@@ -653,7 +666,7 @@ class HeterogeneousGATDeconvolution(nn.Module):
 class SpatialDeconvolutionLoss(nn.Module):
     """空间解卷积损失函数
     
-    L_total = λ_pearson·L_pearson + λ_mse·L_mse + λ_cosine·L_cosine + λ_reg·L_reg + λ_sparse·L_sparse + λ_diversity·L_diversity + λ_hetero·L_hetero + λ_proportion·L_proportion
+    L_total = λ_pearson·L_pearson + λ_mse·L_mse + λ_cosine·L_cosine + λ_reg·L_reg + λ_sparse·L_sparse + λ_proportion·L_proportion
     
     其中：
     - L_pearson: Pearson相关系数损失(基因表达相关性)
@@ -661,13 +674,13 @@ class SpatialDeconvolutionLoss(nn.Module):
     - L_cosine: Cosine相似度损失(基因表达相似性)
     - L_reg: 权重正则化
     - L_sparse: 稀疏性正则化
-    - L_diversity: 多样性损失(防止所有spot都使用相同的细胞类型)
-    - L_hetero: 空间异质性损失(鼓励相邻spot的细胞组成有差异)
     - L_proportion: 全局细胞类型比例一致性损失(与单细胞数据的cluster比例一致)
+    
+    注：已移除 L_diversity 和 L_hetero
     """
     
     def __init__(self, lambda_pearson=1.0, lambda_mse=1.0, lambda_cosine=1.0, 
-                 lambda_reg=0.5, lambda_sparse=0.01, lambda_diversity=0.1, lambda_hetero=0.05,
+                 lambda_reg=0.5, lambda_sparse=0.01,
                  lambda_proportion=1.0, sc_celltype_proportions=None):
         super().__init__()
         self.lambda_pearson = lambda_pearson      # Pearson损失权重
@@ -675,8 +688,6 @@ class SpatialDeconvolutionLoss(nn.Module):
         self.lambda_cosine = lambda_cosine        # Cosine损失权重
         self.lambda_reg = lambda_reg              # 权重正则化权重
         self.lambda_sparse = lambda_sparse        # 稀疏性正则化权重
-        self.lambda_diversity = lambda_diversity  # 多样性损失权重
-        self.lambda_hetero = lambda_hetero        # 空间异质性损失权重
         self.lambda_proportion = lambda_proportion  # 细胞类型比例一致性权重
         
         # 单细胞数据中各cluster的比例 [n_cell_types]
@@ -752,49 +763,49 @@ class SpatialDeconvolutionLoss(nn.Module):
         # 鼓励稀疏的注意力分布（每个spot只使用少数细胞类型）
         sparsity_loss = -torch.mean(attention_weights * torch.log(attention_weights + 1e-8))
         
-        # ============ 6. Diversity Loss ============
+        # ============ 6. Diversity Loss ============ [已禁用]
         # 防止所有spot都使用相同的细胞类型组合
-        # 计算全局细胞类型使用频率（所有spot的平均权重）
-        global_celltype_usage = attention_weights.mean(dim=0)  # [n_cell_types]
+        # 注释掉：这个损失会降低模型对真实细胞组成的拟合精度
+        diversity_loss = torch.tensor(0.0, device=attention_weights.device)
+        # # 计算全局细胞类型使用频率（所有spot的平均权重）
+        # global_celltype_usage = attention_weights.mean(dim=0)  # [n_cell_types]
+        # # 目标：每个细胞类型的全局使用率应该尽可能均匀
+        # # 使用KL散度，鼓励全局使用分布接近均匀分布
+        # n_cell_types = attention_weights.shape[1]
+        # uniform_dist = torch.ones_like(global_celltype_usage) / n_cell_types
+        # # KL(global_usage || uniform) = sum(p * log(p/q))
+        # diversity_loss = torch.sum(
+        #     global_celltype_usage * torch.log(
+        #         (global_celltype_usage + 1e-8) / (uniform_dist + 1e-8)
+        #     )
+        # )
         
-        # 目标：每个细胞类型的全局使用率应该尽可能均匀
-        # 使用KL散度，鼓励全局使用分布接近均匀分布
-        n_cell_types = attention_weights.shape[1]
-        uniform_dist = torch.ones_like(global_celltype_usage) / n_cell_types
-        
-        # KL(global_usage || uniform) = sum(p * log(p/q))
-        diversity_loss = torch.sum(
-            global_celltype_usage * torch.log(
-                (global_celltype_usage + 1e-8) / (uniform_dist + 1e-8)
-            )
-        )
-        
-        # ============ 7. Spatial Heterogeneity Loss ============
+        # ============ 7. Spatial Heterogeneity Loss ============ [已禁用]
         # 鼓励相邻spot的细胞组成有差异，保持空间异质性
+        # 注释掉：这个损失可能导致过度的空间差异，影响重建精度
         hetero_loss = torch.tensor(0.0, device=attention_weights.device)
-        
-        if edge_index is not None and edge_index.shape[1] > 0:
-            # 只考虑spot-spot边（节点索引 < n_spots）
-            spot_spot_mask = (edge_index[0] < n_spots) & (edge_index[1] < n_spots)
-            spot_edges = edge_index[:, spot_spot_mask]
-            
-            if spot_edges.shape[1] > 0:
-                # 获取边的源节点和目标节点
-                src_nodes = spot_edges[0]  # [num_edges]
-                dst_nodes = spot_edges[1]  # [num_edges]
-                
-                # 获取相邻spot的权重
-                src_weights = attention_weights[src_nodes]  # [num_edges, n_cell_types]
-                dst_weights = attention_weights[dst_nodes]  # [num_edges, n_cell_types]
-                
-                # 计算相邻spot权重的相似度（使用cosine相似度）
-                # 我们希望这个相似度不要太高（保持差异）
-                similarity = F.cosine_similarity(src_weights, dst_weights, dim=-1)  # [num_edges]
-                
-                # 异质性损失：惩罚过高的相似度
-                # 使用 ReLU 确保只惩罚相似度 > threshold 的情况
-                similarity_threshold = 0.7  # 相邻spot的相似度不应超过0.7
-                hetero_loss = F.relu(similarity - similarity_threshold).mean()
+        # if edge_index is not None and edge_index.shape[1] > 0:
+        #     # 只考虑spot-spot边（节点索引 < n_spots）
+        #     spot_spot_mask = (edge_index[0] < n_spots) & (edge_index[1] < n_spots)
+        #     spot_edges = edge_index[:, spot_spot_mask]
+        #     
+        #     if spot_edges.shape[1] > 0:
+        #         # 获取边的源节点和目标节点
+        #         src_nodes = spot_edges[0]  # [num_edges]
+        #         dst_nodes = spot_edges[1]  # [num_edges]
+        #         
+        #         # 获取相邻spot的权重
+        #         src_weights = attention_weights[src_nodes]  # [num_edges, n_cell_types]
+        #         dst_weights = attention_weights[dst_nodes]  # [num_edges, n_cell_types]
+        #         
+        #         # 计算相邻spot权重的相似度（使用cosine相似度）
+        #         # 我们希望这个相似度不要太高（保持差异）
+        #         similarity = F.cosine_similarity(src_weights, dst_weights, dim=-1)  # [num_edges]
+        #         
+        #         # 异质性损失：惩罚过高的相似度
+        #         # 使用 ReLU 确保只惩罚相似度 > threshold 的情况
+        #         similarity_threshold = 0.7  # 相邻spot的相似度不应超过0.7
+        #         hetero_loss = F.relu(similarity - similarity_threshold).mean()
         
         # ============ 8. Global Cell Type Proportion Consistency Loss ============
         # 确保解卷积结果的**全局**细胞类型比例与单细胞数据一致
@@ -839,13 +850,12 @@ class SpatialDeconvolutionLoss(nn.Module):
             # 或者使用组合: proportion_loss = 0.5 * kl_loss + 0.5 * l2_loss
         
         # ============ 总损失 ============
+        # 注意：已移除 diversity_loss 和 hetero_loss
         total_loss = (self.lambda_pearson * L_pearson +
                      self.lambda_mse * L_mse +
                      self.lambda_cosine * L_cosine +
                      self.lambda_reg * weight_sum_loss +
                      self.lambda_sparse * sparsity_loss +
-                     self.lambda_diversity * diversity_loss +
-                     self.lambda_hetero * hetero_loss +
                      self.lambda_proportion * proportion_loss)
         
         return {
@@ -855,7 +865,5 @@ class SpatialDeconvolutionLoss(nn.Module):
             'cosine_loss': L_cosine,
             'weight_reg': weight_sum_loss,
             'sparsity_loss': sparsity_loss,
-            'diversity_loss': diversity_loss,
-            'hetero_loss': hetero_loss,
             'proportion_loss': proportion_loss
         }

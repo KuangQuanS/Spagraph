@@ -192,6 +192,14 @@ class GATDeconvolution:
         
         # Load full gene cluster expressions (count version for reconstruction)
         cluster_expressions_full_count = checkpoint.get('cluster_expressions_full_count', None)
+        
+        # Load average cell counts (for cells_per_spot scale factor)
+        self.avg_cell_counts = checkpoint.get('avg_cell_counts', None)
+        if self.avg_cell_counts is not None:
+            print(f"Loaded avg_cell_counts: {self.avg_cell_counts:.1f} (for scale factor calculation)")
+        else:
+            print("Warning: avg_cell_counts not found in checkpoint (old model)")
+        
         if cluster_expressions_full_count is None:
             # Fall back to log version if count not available
             cluster_expressions_full_count = checkpoint.get('cluster_expressions_full', None)
@@ -235,8 +243,8 @@ class GATDeconvolution:
     def build_gat_model(self, n_cell_types: int, gat_hidden_dim=64, gat_layers=3, 
                        gat_heads=4, dropout=0.1, loss_lambda_pearson=1.0, loss_lambda_mse=1.0,
                        loss_lambda_cosine=1.0, 
-                       loss_lambda_reg=0.5, loss_lambda_sparse=0.01, loss_lambda_diversity=0.1,
-                       loss_lambda_hetero=0.05, loss_lambda_proportion=1.0):
+                       loss_lambda_reg=0.5, loss_lambda_sparse=0.01,
+                       loss_lambda_proportion=1.0):
         """Build GAT deconvolution model"""
         print("="*60)
         print("Building GAT model...")
@@ -251,8 +259,8 @@ class GATDeconvolution:
         print(f"Dropout: {dropout}")
         print(f"Loss weights: λ_pearson={loss_lambda_pearson}, λ_mse={loss_lambda_mse}, "
               f"λ_cosine={loss_lambda_cosine}, "
-              f"λ_reg={loss_lambda_reg}, λ_sparse={loss_lambda_sparse}, λ_diversity={loss_lambda_diversity}, "
-              f"λ_hetero={loss_lambda_hetero}, λ_proportion={loss_lambda_proportion}")
+              f"λ_reg={loss_lambda_reg}, λ_sparse={loss_lambda_sparse}, "
+              f"λ_proportion={loss_lambda_proportion}")
         
         self.gat_model = HeterogeneousGATDeconvolution(
             embedding_dim=embedding_dim,  # Use actual VAE latent dimension
@@ -300,8 +308,6 @@ class GATDeconvolution:
             lambda_cosine=loss_lambda_cosine,
             lambda_reg=loss_lambda_reg,
             lambda_sparse=loss_lambda_sparse,
-            lambda_diversity=loss_lambda_diversity,
-            lambda_hetero=loss_lambda_hetero,
             lambda_proportion=loss_lambda_proportion,
             sc_celltype_proportions=sc_celltype_proportions
         )
@@ -322,8 +328,6 @@ class GATDeconvolution:
             'cosine_loss': 0.0,
             'weight_reg': 0.0,
             'sparsity_loss': 0.0,
-            'diversity_loss': 0.0,
-            'hetero_loss': 0.0,
             'proportion_loss': 0.0
         }
         
@@ -439,21 +443,19 @@ class GATDeconvolution:
             cos_losses.append(epoch_losses['cosine_loss'])
             weight_regs.append(epoch_losses['weight_reg'])
             sparsity_regs.append(epoch_losses.get('sparsity_loss', 0.0))
-            diversity_losses.append(epoch_losses.get('diversity_loss', 0.0))
-            hetero_losses.append(epoch_losses.get('hetero_loss', 0.0))
+            diversity_losses.append(0.0)  # 已禁用
+            hetero_losses.append(0.0)  # 已禁用
             proportion_losses.append(epoch_losses.get('proportion_loss', 0.0))
             
             # Learning rate schedule
             scheduler.step(avg_total_loss)
             
-            # Update progress bar with loss info
+            # Update progress bar with loss info (不显示已禁用的损失)
             pbar.set_postfix({
                 'Total': f'{avg_total_loss:.4f}',
                 'Pearson': f'{epoch_losses["pearson_loss"]:.4f}',
                 'MSE': f'{epoch_losses["mse_loss"]:.4f}',
                 'Cosine': f'{epoch_losses["cosine_loss"]:.4f}',
-                'Diversity': f'{epoch_losses["diversity_loss"]:.4f}',
-                'Hetero': f'{epoch_losses["hetero_loss"]:.4f}',
                 'Proportion': f'{epoch_losses["proportion_loss"]:.4f}'
             })
             
@@ -882,7 +884,7 @@ class GATDeconvolution:
     def plot_training_curves(self, train_losses, pearson_losses, mse_losses, cos_losses, 
                            weight_regs, sparsity_regs, diversity_losses, hetero_losses, 
                            proportion_losses, sample_name):
-        """Plot training curves"""
+        """Plot training curves (diversity and hetero losses are now disabled, plotted as zeros)"""
         fig, axes = plt.subplots(3, 3, figsize=(24, 18))
         
         epochs = range(1, len(train_losses) + 1)
@@ -918,18 +920,16 @@ class GATDeconvolution:
         axes[1, 0].set_ylabel('Loss')
         axes[1, 0].grid(True, alpha=0.3)
         
-        # Diversity and Heterogeneity losses
-        axes[1, 1].plot(epochs, diversity_losses, 'cyan', label='Diversity', linewidth=2)
-        axes[1, 1].plot(epochs, hetero_losses, 'magenta', label='Heterogeneity', linewidth=2)
-        axes[1, 1].set_title('Diversity & Heterogeneity', fontsize=14, fontweight='bold')
+        # Proportion loss (移到这个位置，替换原来的diversity和hetero)
+        axes[1, 1].plot(epochs, proportion_losses, 'olive', linewidth=2)
+        axes[1, 1].set_title('Proportion Loss', fontsize=14, fontweight='bold')
         axes[1, 1].set_xlabel('Epochs')
         axes[1, 1].set_ylabel('Loss')
-        axes[1, 1].legend()
         axes[1, 1].grid(True, alpha=0.3)
         
-        # Heterogeneity loss (单独显示)
-        axes[1, 2].plot(epochs, hetero_losses, 'magenta', linewidth=2)
-        axes[1, 2].set_title('Spatial Heterogeneity Loss', fontsize=14, fontweight='bold')
+        # Cosine loss
+        axes[1, 2].plot(epochs, cos_losses, 'red', linewidth=2)
+        axes[1, 2].set_title('Cosine Loss', fontsize=14, fontweight='bold')
         axes[1, 2].set_xlabel('Epochs')
         axes[1, 2].set_ylabel('Loss')
         axes[1, 2].grid(True, alpha=0.3)
@@ -948,11 +948,9 @@ class GATDeconvolution:
         axes[2, 1].set_ylabel('Loss')
         axes[2, 1].grid(True, alpha=0.3)
         
-        # All regularizations comparison
+        # All regularizations comparison (移除diversity和hetero)
         axes[2, 2].plot(epochs, weight_regs, 'brown', label='Weight', linewidth=2)
         axes[2, 2].plot(epochs, sparsity_regs, 'purple', label='Sparsity', linewidth=2)
-        axes[2, 2].plot(epochs, diversity_losses, 'cyan', label='Diversity', linewidth=2)
-        axes[2, 2].plot(epochs, hetero_losses, 'magenta', label='Heterogeneity', linewidth=2)
         axes[2, 2].plot(epochs, proportion_losses, 'olive', label='Proportion', linewidth=2)
         axes[2, 2].set_title('All Regularizations', fontsize=14, fontweight='bold')
         axes[2, 2].set_xlabel('Epochs')
@@ -1030,16 +1028,14 @@ def main():
                        help='Weight regularization weight')
     parser.add_argument('--loss_lambda_sparse', type=float, default=0.01,
                        help='Sparsity regularization weight (Shannon entropy)')
-    parser.add_argument('--loss_lambda_diversity', type=float, default=0.1,
-                       help='Diversity loss weight (prevents all spots using same celltype)')
-    parser.add_argument('--loss_lambda_hetero', type=float, default=0.05,
-                       help='Spatial heterogeneity loss weight (preserves spatial variation)')
+    # 已移除: --loss_lambda_diversity (已禁用)
+    # 已移除: --loss_lambda_hetero (已禁用)
     parser.add_argument('--loss_lambda_proportion', type=float, default=1.0,
                        help='Global cell type proportion consistency loss weight (matches SC cluster distribution)')
     
     # Spot composition argument
-    parser.add_argument('--cells_per_spot', type=float, default=10.0,
-                       help='Average number of cells per spot (default 10 for Visium)')
+    parser.add_argument('--cells_per_spot', type=float, default=None,
+                       help='Average number of cells per spot (default: auto-calculate from data, or 10.0 for Visium if auto-calc fails)')
     
     # Weight thresholding argument
     parser.add_argument('--weight_threshold', type=float, default=0.01,
@@ -1115,7 +1111,7 @@ def main():
     print(f"ST matching genes: {len(trainer.genes)}/{len(trainer.genes)}")
     
     # Extract ST data
-    # sc.pp.normalize_total(st_subset, target_sum=1e4)
+    sc.pp.normalize_total(st_subset, target_sum=1e4)
     # sc.pp.log1p(st_subset)
     st_X = st_subset.X.toarray() if hasattr(st_subset.X, 'toarray') else st_subset.X
     
@@ -1123,6 +1119,89 @@ def main():
     spatial_coords = st_adata.obsm['spatial']
     
     print(f"ST data: {st_X.shape}")
+    
+    # Auto-calculate cells_per_spot if not manually specified
+    if args.cells_per_spot is None or args.cells_per_spot <= 0:
+        print("\n" + "="*60)
+        print("Auto-calculating cells_per_spot...")
+        
+        # Get average total counts per spot (MUST use raw counts, not normalized!)
+        if 'n_counts' in st_adata.obs.columns:
+            # Prefer pre-calculated raw counts
+            avg_spot_counts = st_adata.obs['n_counts'].mean()
+            print(f"   Using pre-calculated ST n_counts")
+        elif hasattr(st_adata, 'raw') and st_adata.raw is not None:
+            # Use raw layer if available
+            if hasattr(st_adata.raw.X, 'toarray'):
+                avg_spot_counts = st_adata.raw.X.toarray().sum(axis=1).mean()
+            else:
+                avg_spot_counts = st_adata.raw.X.sum(axis=1).mean()
+            print(f"   Using ST raw layer")
+        else:
+            # Fallback to current X (may be normalized - NOT ideal!)
+            if hasattr(st_adata.X, 'toarray'):
+                avg_spot_counts = st_adata.X.toarray().sum(axis=1).mean()
+            else:
+                avg_spot_counts = st_adata.X.sum(axis=1).mean()
+            print(f"   WARNING: Using potentially normalized ST data (may be inaccurate)")
+        
+        # Try to get avg_cell_counts from Stage 1 checkpoint first
+        if hasattr(trainer, 'avg_cell_counts') and trainer.avg_cell_counts is not None:
+            avg_cell_counts = trainer.avg_cell_counts
+            print(f"   Using avg_cell_counts from Stage 1: {avg_cell_counts:.1f}")
+        else:
+            # Fallback: load SC data to calculate average single cell counts
+            print(f"   avg_cell_counts not in Stage 1 checkpoint, calculating from SC data...")
+            stage1_dir = os.path.dirname(args.stage1_model_path)
+            sc_clustered_file = os.path.join(stage1_dir, 'sc_adata_clustered.h5ad')
+            
+            if os.path.exists(sc_clustered_file):
+                print(f"   Loading SC data: {sc_clustered_file}")
+                sc_adata = sc.read_h5ad(sc_clustered_file)
+                
+                # Get average total counts per cell (MUST use raw counts!)
+                if 'n_counts' in sc_adata.obs.columns:
+                    avg_cell_counts = sc_adata.obs['n_counts'].mean()
+                    print(f"   Using pre-calculated SC n_counts")
+                elif hasattr(sc_adata, 'raw') and sc_adata.raw is not None:
+                    if hasattr(sc_adata.raw.X, 'toarray'):
+                        avg_cell_counts = sc_adata.raw.X.toarray().sum(axis=1).mean()
+                    else:
+                        avg_cell_counts = sc_adata.raw.X.sum(axis=1).mean()
+                    print(f"   Using SC raw layer")
+                else:
+                    if hasattr(sc_adata.X, 'toarray'):
+                        avg_cell_counts = sc_adata.X.toarray().sum(axis=1).mean()
+                    else:
+                        avg_cell_counts = sc_adata.X.sum(axis=1).mean()
+                    print(f"   WARNING: Using potentially normalized SC data (may be inaccurate)")
+            else:
+                print(f"   Error: SC clustered file not found: {sc_clustered_file}")
+                print(f"   Using default cells_per_spot = 10.0")
+                args.cells_per_spot = 10.0
+                avg_cell_counts = None
+        
+        if avg_cell_counts is not None:
+            # Calculate cells per spot as a scale factor
+            calculated_cells_per_spot = avg_spot_counts / avg_cell_counts
+            
+            print(f"   Average spot total counts: {avg_spot_counts:.1f}")
+            print(f"   Average cell total counts: {avg_cell_counts:.1f}")
+            print(f"   Calculated ratio (cells_per_spot): {calculated_cells_per_spot:.3f}")
+            
+            # Only clip if unreasonably large (>30), but allow < 1 for sequencing depth differences
+            if calculated_cells_per_spot > 30.0:
+                print(f"   WARNING: Calculated ratio > 30, clipping to 30.0")
+                calculated_cells_per_spot = 30.0
+            elif calculated_cells_per_spot < 0.1:
+                print(f"   WARNING: Calculated ratio < 0.1, seems too small, using 1.0")
+                calculated_cells_per_spot = 1.0
+            
+            args.cells_per_spot = calculated_cells_per_spot
+        
+        print("="*60 + "\n")
+    else:
+        print(f"\nUsing manual cells_per_spot: {args.cells_per_spot}")
   
     
     # Build GAT model and loss function
@@ -1139,8 +1218,6 @@ def main():
         loss_lambda_cosine=args.loss_lambda_cosine,
         loss_lambda_reg=args.loss_lambda_reg,
         loss_lambda_sparse=args.loss_lambda_sparse,
-        loss_lambda_diversity=args.loss_lambda_diversity,
-        loss_lambda_hetero=args.loss_lambda_hetero,
         loss_lambda_proportion=args.loss_lambda_proportion
     )
     

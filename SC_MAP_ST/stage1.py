@@ -21,149 +21,27 @@ from tqdm import tqdm
 import umap
 warnings.filterwarnings('ignore')
 
-# Import model and utilities
-from model import VAE, DualDecoderVAE
-from vae_utils import train_vae, evaluate_vae, save_vae_checkpoint, load_vae_pretrained, load_vae_for_inference, plot_modality_alignment_umap
+# Import model and utilities from deconv_model (which now includes vae_utils)
+from deconv_model import (
+    VAE, DualDecoderVAE,
+    train_vae, evaluate_vae, save_vae_checkpoint, 
+    load_vae_pretrained, load_vae_for_inference, 
+    plot_modality_alignment_umap
+)
 
-def load_marker_genes_from_file(file_path):
-    """
-    Load marker genes from a text file
-    
-    Args:
-        file_path: Path to the text file containing marker genes (one gene per line)
-    
-    Returns:
-        marker_genes: List of marker genes
-    """
-    print("="*60)
-    print(f"Loading marker genes from file: {file_path}")
-    
-    if not os.path.exists(file_path):
-        raise FileNotFoundError(f"Marker genes file not found: {file_path}")
-    
-    with open(file_path, 'r') as f:
-        marker_genes = [line.strip() for line in f if line.strip()]
-    
-    print(f"   Loaded {len(marker_genes)} marker genes")
+# Import stage1 utility functions
+from stage1_utils import (
+    load_marker_genes_from_file,
+    compute_clusters_and_marker_genes,
+    compute_cluster_centers_and_expressions,
+    print_weight_statistics
+)
 
-    return marker_genes
-
-def compute_clusters_and_marker_genes(adata, top_n=100, min_fold_change=1.5, resolution=0.5, save_path=None):
+def compute_clusters_and_marker_genes_deprecated(adata, top_n=100, min_fold_change=1.5, resolution=0.5, save_path=None):
     """
-    Compute clusters and extract top marker genes for each cluster
+    DEPRECATED: Use stage1_utils.compute_clusters_and_marker_genes instead
     """
-    print("="*60)
-    print("Starting clustering analysis...")
-    
-    # Backup original data
-    adata_backup = adata.copy()
-    
-    # Preprocessing: normalization and PCA
-    sc.pp.normalize_total(adata, target_sum=1e4)
-    sc.pp.log1p(adata)
-    sc.pp.highly_variable_genes(adata, min_mean=0.0125, max_mean=3, min_disp=0.5)
-    adata.raw = adata
-    adata = adata[:, adata.var.highly_variable]
-    
-    # PCA
-    sc.pp.scale(adata, max_value=10)
-    sc.tl.pca(adata, svd_solver='arpack')
-    
-    # Build neighbor graph
-    sc.pp.neighbors(adata, n_neighbors=10, n_pcs=40)
-    
-    # Leiden clustering
-    sc.tl.leiden(adata, resolution=resolution)
-    
-    print(f"Clustering results: {len(adata.obs['leiden'].unique())} clusters")
-    
-    # Restore to original gene set for marker analysis
-    adata_full = adata_backup.copy()
-    sc.pp.normalize_total(adata_full, target_sum=1e4)
-    sc.pp.log1p(adata_full)
-    
-    # Transfer clustering results to full dataset
-    adata_full.obs['leiden'] = adata.obs['leiden'].copy()
-    
-    # Compute marker genes for each cluster
-    sc.tl.rank_genes_groups(
-        adata_full, 
-        'leiden', 
-        method='wilcoxon',
-        key_added='rank_genes_groups',
-        n_genes=top_n * 2
-    )
-    
-    # Extract marker genes
-    marker_genes = set()
-    result = adata_full.uns['rank_genes_groups']
-    
-    print(f"Marker genes per cluster:")
-    lasso_selected = {}
-    for cluster in sorted(adata_full.obs['leiden'].unique()):
-        if cluster in result['names'].dtype.names:
-            genes = result['names'][cluster]
-            scores = result['scores'][cluster]
-            pvals = result['pvals_adj'][cluster]
-            logfoldchanges = result['logfoldchanges'][cluster]
-            
-            selected_genes = []
-            for i in range(len(genes)):
-                if (pvals[i] < 0.05 and 
-                    scores[i] > 0 and 
-                    logfoldchanges[i] >= np.log2(min_fold_change)):
-                    selected_genes.append(genes[i])
-                    
-                if len(selected_genes) >= top_n:
-                    break
-            
-            # Apply Lasso regression for further selection
-            if len(selected_genes) > 0:
-                sub_adata = adata_full[:, selected_genes].copy()
-                y = (adata_full.obs['leiden'] == cluster).astype(int)
-                X = sub_adata.X
-                if hasattr(X, 'toarray'):
-                    X = X.toarray()
-                
-                X_scaled = X
-                
-                clf = LogisticRegression(
-                    C=1.0,
-                    penalty='l1',
-                    solver='saga',
-                    class_weight='balanced',
-                    max_iter=500
-                )
-                clf.fit(X_scaled, y)
-                coef = clf.coef_.ravel()
-                
-                lasso_selected_genes = [g for g, c in zip(selected_genes, coef) if abs(c) > 1e-5]
-                lasso_selected_genes = sorted(lasso_selected_genes, key=lambda g: abs(coef[selected_genes.index(g)]), reverse=True)
-                
-                lasso_selected[cluster] = lasso_selected_genes
-                marker_genes.update(lasso_selected_genes)
-                print(f"   {cluster}: {len(selected_genes)} -> {len(lasso_selected_genes)} (after Lasso)")
-            else:
-                lasso_selected[cluster] = []
-                print(f"   {cluster}: 0 genes")
-    
-    print(f"Total: {len(marker_genes)} marker genes")
-    
-    clusters_to_drop = [cluster for cluster, genes in lasso_selected.items() if len(genes) == 0]
-    if clusters_to_drop:
-        print(f"Removing clusters with no marker genes: {clusters_to_drop}")
-        keep_mask = ~adata_full.obs['leiden'].isin(clusters_to_drop)
-        removed_cells = int((~keep_mask).sum())
-        print(f"   Removed {removed_cells} cells belonging to empty clusters")
-        adata_full = adata_full[keep_mask].copy()
-        if hasattr(adata_full.obs['leiden'], 'cat'):
-            adata_full.obs['leiden'] = adata_full.obs['leiden'].cat.remove_unused_categories()
-    
-    # Return clustering info, marker genes, and full adata for annotation
-    sc_clusters = adata_full.obs['leiden'].copy()
-    if hasattr(sc_clusters, 'cat'):
-        sc_clusters = sc_clusters.cat.remove_unused_categories()
-    return sorted(list(marker_genes)), sc_clusters, adata_full
+    raise DeprecationWarning("This function has been moved to stage1_utils.py")
 
 #============================================================
 # Main Module
@@ -374,17 +252,17 @@ class coEncoder:
         
         print(f"   Final gene count: {len(final_genes)}")
         
-        # 5. Split data
+        # 5. Split data for training (with test set for early stopping)
         sc_train, sc_test, y_train, y_test = train_test_split(
             sc_X_final, sc_y, test_size=0.1, stratify=sc_y, random_state=42
         )
         
         # Split full gene SC data with same indices
         sc_train_indices = np.arange(len(sc_X_final))
+
         sc_train_idx, sc_test_idx = train_test_split(
             sc_train_indices, test_size=0.1, stratify=sc_y, random_state=42
         )
-        sc_X_full_train_count = sc_X_full_count[sc_train_idx]
         
         st_train, st_test = train_test_split(
             st_X_final, test_size=0.1, random_state=42
@@ -407,6 +285,11 @@ class coEncoder:
         print(f"   Train set: {train_X.shape} (SC: {len(sc_train)}, ST: {len(st_train)})")
         print(f"   Test set: {test_X.shape} (SC: {len(sc_test)}, ST: {len(st_test)})")
         
+        # ✅ Keep ALL SC data (train + test) for cluster embedding computation
+        sc_X_full_all_count = sc_X_full_count  # All cells
+        sc_all_indices = np.arange(len(sc_X_final))  # All indices
+        sc_all_labels = sc_y  # All labels
+        
         # Save gene list
         self.genes = final_genes
         self.all_genes = sc_all_genes  # Save all gene list
@@ -415,7 +298,7 @@ class coEncoder:
             for gene in self.genes:
                 f.write(f"{gene}\n")
 
-        return train_X, test_X, train_modality, test_modality, y_train, y_test, sc_X_full_train_count
+        return train_X, test_X, train_modality, test_modality, y_train, y_test, sc_X_final, sc_X_full_all_count, sc_all_labels
     
     def build_vae(self, input_dim: int, hidden_dims=[512, 256], latent_dim=128, dropout=0.2, loss_type='mse', use_dual_decoder=False):
         """Build VAE model
@@ -466,7 +349,7 @@ class coEncoder:
             print(f"   - Decoder ST: {decoder_st_params:,}")
     
     def save_vae(self, filepath):
-        """Save VAE model using vae_io module"""
+        """Save VAE model (only model weights and basic info, no cluster data)"""
         save_vae_checkpoint(
             vae=self.vae,
             filepath=filepath,
@@ -475,13 +358,79 @@ class coEncoder:
             genes=self.genes,
             sc_clusters=getattr(self, 'sc_clusters', None),
             resolution=getattr(self, 'resolution', 0.5),
-            cluster_prototypes=getattr(self, 'cluster_prototypes', None),
-            cluster_expressions=getattr(self, 'cluster_expressions', None),
-            cluster_expressions_full=getattr(self, 'cluster_expressions_full', None),
-            cluster_expressions_full_count=getattr(self, 'cluster_expressions_full_count', None),
             all_genes=getattr(self, 'all_genes', None),
-            avg_cell_counts=getattr(self, 'avg_cell_counts', None)
+            avg_cell_counts=getattr(self, 'avg_cell_counts', None),
+            # ✅ Don't save cluster data in PTH - will be saved separately in NPZ
+            cluster_prototypes=None,
+            cluster_expressions=None,
+            cluster_expressions_full=None,
+            cluster_expressions_full_count=None,
+            cluster_cell_weights=None,
+            cluster_to_celltype=None
         )
+        print(f"✅ Saved VAE model (weights only): {filepath}")
+    
+    def save_cluster_data(self, filepath):
+        """Save cluster data to separate NPZ file"""
+        print("="*60)
+        print(f"Saving cluster data to: {filepath}")
+        
+        # Prepare cluster data - convert dicts to arrays
+        cluster_ids = np.arange(len(self.label_encoder.classes_))
+        
+        # Convert cluster_prototypes dict to array
+        if isinstance(self.cluster_prototypes, dict):
+            cluster_ids_sorted = sorted(self.cluster_prototypes.keys())
+            prototypes_array = np.stack([self.cluster_prototypes[cid] for cid in cluster_ids_sorted], axis=0)
+        else:
+            prototypes_array = self.cluster_prototypes
+        
+        # Convert cluster_expressions dict to array
+        if isinstance(self.cluster_expressions, dict):
+            cluster_ids_sorted = sorted(self.cluster_expressions.keys())
+            expressions_array = np.stack([self.cluster_expressions[cid] for cid in cluster_ids_sorted], axis=0)
+        else:
+            expressions_array = self.cluster_expressions
+        
+        # Convert cluster_expressions_full_count dict to list of arrays
+        if isinstance(self.cluster_expressions_full_count, dict):
+            cluster_ids_sorted = sorted(self.cluster_expressions_full_count.keys())
+            expressions_full_list = [self.cluster_expressions_full_count[cid] for cid in cluster_ids_sorted]
+        else:
+            expressions_full_list = self.cluster_expressions_full_count
+        
+        # Prepare celltype mapping as structured array if available
+        if self.cluster_to_celltype is not None:
+            celltype_mapping = np.array(
+                [(int(k), str(v)) for k, v in self.cluster_to_celltype.items()],
+                dtype=[('cluster_id', 'i4'), ('celltype', 'U100')]
+            )
+        else:
+            celltype_mapping = None
+        
+        # Save to NPZ
+        save_dict = {
+            'cluster_ids': cluster_ids,
+            'cluster_prototypes': prototypes_array,
+            'cluster_expressions': expressions_array,
+            'cluster_expressions_full': np.array(expressions_full_list, dtype=object),
+        }
+        
+        if celltype_mapping is not None:
+            save_dict['cluster_to_celltype'] = celltype_mapping
+        
+        if hasattr(self, 'cluster_cell_weights') and self.cluster_cell_weights is not None:
+            save_dict['cluster_cell_weights'] = self.cluster_cell_weights
+        
+        np.savez(filepath, **save_dict)
+        
+        print(f"   ✓ Cluster IDs: {len(cluster_ids)}")
+        print(f"   ✓ Prototypes: {prototypes_array.shape}")
+        print(f"   ✓ Expressions (marker): {expressions_array.shape}")
+        print(f"   ✓ Expressions (full): {len(expressions_full_list)} clusters × {expressions_full_list[0].shape[0]} genes")
+        if celltype_mapping is not None:
+            print(f"   ✓ Celltype mapping: {len(celltype_mapping)} clusters")
+        print(f"✅ Saved cluster data: {filepath}")
     
     def load_vae(self, filepath):
         """Load VAE model (basic loading for inference) using vae_io module"""
@@ -495,26 +444,27 @@ class coEncoder:
     
     def load_pretrained(self, filepath):
         """Load pretrained VAE weights for continued training using vae_io module"""
-        loaded_components = load_vae_pretrained(filepath, self.device)
+        self.vae, components, output_type, latent_dim = load_vae_pretrained(filepath, self.device)
         
         # Unpack loaded components
-        self.vae = loaded_components['vae']
-        self.label_encoder = loaded_components['label_encoder']
-        self.marker_genes = loaded_components['marker_genes']
-        self.genes = loaded_components['genes']
-        self.all_genes = loaded_components['all_genes']
-        self.sc_clusters = loaded_components['sc_clusters']
-        self.resolution = loaded_components['resolution']
-        self.cluster_prototypes = loaded_components['cluster_prototypes']
-        self.cluster_expressions = loaded_components['cluster_expressions']
-        self.cluster_expressions_full = loaded_components['cluster_expressions_full']
-        self.cluster_expressions_full_count = loaded_components['cluster_expressions_full_count']
+        self.label_encoder = components['label_encoder']
+        self.marker_genes = components['marker_genes']
+        self.genes = components['genes']
+        self.all_genes = components['all_genes']
+        self.sc_clusters = components['sc_clusters']
+        self.resolution = components['resolution']
+        self.cluster_prototypes = components['cluster_prototypes']
+        self.cluster_expressions = components['cluster_expressions']
+        self.cluster_expressions_full = components['cluster_expressions_full']
+        self.cluster_expressions_full_count = components['cluster_expressions_full_count']
+        self.cluster_cell_weights = components.get('cluster_cell_weights', None)
         
-        return loaded_components['output_type'], loaded_components['latent_dim']
+        return output_type, latent_dim
     
     def run_stage1_training(self, top_n_per_type=100, resolution=0.5, batch_size=256, n_epochs=100, 
                            lr=1e-3, beta=1.0, hidden_dims=[512, 256], latent_dim=128, loss_type='mse', 
-                           lambda_mmd=0.0, pretrained_path=None, precomputed_marker_file=None, use_dual_decoder=False):
+                           lambda_mmd=0.0, pretrained_path=None, precomputed_marker_file=None, use_dual_decoder=False,
+                           aggregation_method='weighted'):
         """Run stage 1 training: VAE on SC + ST with marker genes
         
         Args:
@@ -533,6 +483,10 @@ class coEncoder:
                                    If provided, will load marker genes directly from this file
                                    instead of computing them from scratch.
             use_dual_decoder: If True, use DualDecoderVAE with separate SC/ST decoders + MMD alignment
+            aggregation_method: Cluster aggregation method: 'mean', 'median', or 'weighted'
+                - 'mean': Simple average (fast, basic)
+                - 'median': Median aggregation (robust to outliers)
+                - 'weighted': Weighted average with UMI, representativeness, and marker activity (recommended)
         """
         print("="*60)
         print("Stage 1 Training: VAE (SC + ST, Marker Genes)")
@@ -551,6 +505,7 @@ class coEncoder:
         print(f"   Loss type: {loss_type.upper()}")
         print(f"   Lambda MMD: {lambda_mmd}")
         print(f"   Dual Decoder: {use_dual_decoder}")
+        print(f"   Aggregation method: {aggregation_method}")
         if pretrained_path:
             print(f"   Pretrained: {pretrained_path}")
         print("="*60)
@@ -558,8 +513,8 @@ class coEncoder:
         # 1. Load data
         sc_adata, st_adata = self.load_data()
         
-        # 2. Prepare data based on marker genes
-        train_X, test_X, train_modality, test_modality, y_train, y_test, sc_X_full_train_count = self.prepare_marker_gene_data(
+        # 2. Prepare data based on marker genes (with test split for early stopping)
+        train_X, test_X, train_modality, test_modality, y_train, y_test, sc_X_final, sc_X_full_all_count, sc_all_labels = self.prepare_marker_gene_data(
             sc_adata, st_adata, top_n_per_type=top_n_per_type, resolution=resolution, 
             precomputed_marker_file=precomputed_marker_file
         )
@@ -585,11 +540,11 @@ class coEncoder:
             # Build from scratch
             self.build_vae(input_dim, hidden_dims=hidden_dims, latent_dim=latent_dim, loss_type=loss_type, use_dual_decoder=use_dual_decoder)
         
-        # 4. Train VAE using vae_utils module
+        # 4. Train VAE with test set for early stopping
         best_loss = train_vae(
             vae=self.vae,
             train_X=train_X,
-            test_X=test_X,
+            test_X=test_X,  # ✅ Use test set for validation and early stopping
             train_modality=train_modality,
             test_modality=test_modality,
             batch_size=batch_size,
@@ -606,29 +561,27 @@ class coEncoder:
         self.train_X = train_X
         self.train_modality = train_modality  
         self.y_train = y_train
-        self.sc_X_full_train_count = sc_X_full_train_count  # Full gene SC training data (count, for reconstruction)
+        # ✅ Save ALL SC data (train + test) for cluster embedding computation
+        self.sc_X_final = sc_X_final  # ALL SC marker gene data
+        self.sc_X_full_all_count = sc_X_full_all_count  # ALL SC full gene data (count)
+        self.sc_all_labels = sc_all_labels  # ALL SC cluster labels
         
-        # 5. Compute and save cluster centers
+        # 5. Compute and save cluster centers using ALL data (not just training set)
         print("="*60)
-        print("Computing cluster centers...")
+        print("📊 Computing cluster centers using ALL SC data (train + test)...")
         
-        # Use training data to compute cluster centers (already preprocessed with marker genes)
-        sc_train_mask = train_modality == 0
-        sc_train_data = train_X[sc_train_mask]
-        sc_train_labels = y_train
+        print(f"   ALL SC data: {sc_X_final.shape}")
+        print(f"   Number of clusters: {len(np.unique(sc_all_labels))}")
         
-        print(f"   SC training data: {sc_train_data.shape}")
-        print(f"   Number of clusters: {len(np.unique(sc_train_labels))}")
-        
-        # Use trained VAE to compute embeddings
+        # ✅ Use trained VAE to compute embeddings for ALL SC cells
         self.vae.eval()
         with torch.no_grad():
             # Process in batches to avoid memory issues
-            batch_size = 1000
+            batch_size_embed = 1000
             all_embeddings = []
             
-            for i in range(0, len(sc_train_data), batch_size):
-                batch_data = sc_train_data[i:i+batch_size]
+            for i in range(0, len(sc_X_final), batch_size_embed):
+                batch_data = sc_X_final[i:i+batch_size_embed]
                 batch_tensor = torch.FloatTensor(batch_data).to(self.device)
                 
                 # Get latent representation
@@ -637,40 +590,56 @@ class coEncoder:
             
             embeddings = np.vstack(all_embeddings)
         
-        # Compute cluster centers and expressions
-        cluster_prototypes = {}
-        cluster_expressions = {}  # Count version for training
-        cluster_expressions_full_count = {}  # Count version (all genes)
+        print(f"   Computed embeddings shape: {embeddings.shape}")
         
-        for cluster_id in np.unique(sc_train_labels):
-            cluster_mask = sc_train_labels == cluster_id
- 
-            # Compute cluster center (latent space)
-            cluster_center = np.mean(embeddings[cluster_mask], axis=0)
-            cluster_prototypes[cluster_id] = cluster_center
-            
-            # Compute cluster expression (marker genes, count)
-            cluster_expression = np.mean(sc_train_data[cluster_mask], axis=0)
-            cluster_expressions[cluster_id] = cluster_expression
+        # Print weight statistics if using weighted aggregation
+        if aggregation_method == 'weighted':
+            print_weight_statistics(sc_X_full_all_count)
         
-        # Compute full gene expressions (count version)
-        print("   Computing full gene cluster expressions...")
-        print(f"      Total genes: {len(self.all_genes)}")
-        
-        for cluster_id in np.unique(sc_train_labels):
-            cluster_mask = sc_train_labels == cluster_id
-            # Count version (for reconstruction)
-            cluster_expr_full_count = np.mean(sc_X_full_train_count[cluster_mask], axis=0)
-            cluster_expressions_full_count[cluster_id] = cluster_expr_full_count
+        # ✅ Compute cluster centers and expressions using ALL SC data
+        cluster_prototypes, cluster_expressions, cluster_expressions_full_count, cluster_cell_weights = \
+            compute_cluster_centers_and_expressions(
+                embeddings=embeddings,
+                sc_train_data=sc_X_final,  # Use ALL marker gene data
+                sc_train_labels=sc_all_labels,  # Use ALL labels
+                sc_X_full_train_count=sc_X_full_all_count,  # Use ALL full gene data
+                aggregation_method=aggregation_method
+            )
         
         # Save cluster centers and expressions
         self.cluster_prototypes = cluster_prototypes
         self.cluster_expressions = cluster_expressions
-        self.cluster_expressions_full = cluster_expressions_full_count  # Use count version
-        self.cluster_expressions_full_count = cluster_expressions_full_count  # Also keep this for backward compatibility
-        print(f"   Completed: {len(cluster_prototypes)} clusters with center and expressions (all genes)")
+        self.cluster_expressions_full = cluster_expressions_full_count
+        self.cluster_expressions_full_count = cluster_expressions_full_count
+        self.cluster_cell_weights = cluster_cell_weights
         
-        # 6. Plot UMAP for modality alignment visualization using vae_viz module
+        # 6. Extract celltype-cluster mapping (if celltype available in sc_adata)
+        cluster_to_celltype = {}
+        
+        # Check for celltype column (prioritize 'cell_type', then 'celltype')
+        celltype_col = None
+        if 'cell_type' in self.sc_adata_clustered.obs.columns:
+            celltype_col = 'cell_type'
+        elif 'celltype' in self.sc_adata_clustered.obs.columns:
+            celltype_col = 'celltype'
+        
+        if celltype_col is not None:
+            print("="*60)
+            print(f"Extracting celltype-cluster mapping (using '{celltype_col}' column)...")
+            for cluster_id in sorted(self.sc_adata_clustered.obs['leiden'].unique()):
+                cluster_mask = self.sc_adata_clustered.obs['leiden'] == cluster_id
+                celltype_counts = self.sc_adata_clustered.obs[cluster_mask][celltype_col].value_counts()
+                major_celltype = celltype_counts.index[0]
+                total_cells = celltype_counts.sum()
+                cluster_to_celltype[str(cluster_id)] = major_celltype
+                print(f"   Cluster {cluster_id} -> {major_celltype} ({celltype_counts.iloc[0]}/{total_cells} cells)")
+            self.cluster_to_celltype = cluster_to_celltype
+        else:
+            print("="*60)
+            print("   Note: Neither 'cell_type' nor 'celltype' column found in sc_adata, skipping celltype mapping")
+            self.cluster_to_celltype = None
+        
+        # 7. Plot UMAP for modality alignment visualization using vae_viz module
         print("="*60)
         print("Visualizing modality alignment...")
         plot_modality_alignment_umap(
@@ -682,13 +651,20 @@ class coEncoder:
             output_dir=self.output_dir
         )
         
-        self.save_vae(f"{self.output_dir}/final_vae.pth")
+        # 8. Save model and cluster data separately
+        model_path = f"{self.output_dir}/final_vae.pth"
+        self.save_vae(model_path)
+        
+        # Save cluster data to separate NPZ file
+        npz_path = model_path.replace('.pth', '_cluster_data.npz')
+        self.save_cluster_data(npz_path)
         
         return {
             'best_loss': best_loss,
             'n_genes': len(self.genes),
             'n_clusters': len(self.label_encoder.classes_),
-            'model_path': f"{self.output_dir}/final_vae.pth",
+            'model_path': model_path,
+            'cluster_data_path': npz_path,
             'clusters': list(self.label_encoder.classes_)
         }
 
@@ -736,6 +712,10 @@ def main():
     parser.add_argument('--precomputed_marker_file', type=str, default=None,
                        help='Path to precomputed marker genes file. If provided, '
                             'marker genes will be loaded directly from this file instead of computing them.')
+    parser.add_argument('--aggregation_method', type=str, default='weighted', 
+                       choices=['mean', 'median', 'weighted'],
+                       help='Cluster aggregation method: mean (simple average), median (robust to outliers), '
+                            'weighted (UMI+representativeness+marker activity, recommended)')
     
     # Device argument
     parser.add_argument('--device', type=str, default=None,
@@ -766,7 +746,8 @@ def main():
         lambda_mmd=args.lambda_mmd,
         pretrained_path=args.pretrained_path,
         precomputed_marker_file=args.precomputed_marker_file,
-        use_dual_decoder=args.use_dual_decoder
+        use_dual_decoder=args.use_dual_decoder,
+        aggregation_method=args.aggregation_method
     )
     
 if __name__ == "__main__":

@@ -19,6 +19,7 @@ class STHeteroSubgraphDataset:
                  expr_threshold: float = 1.0,
                  spot_cell_expr_npz_path: Optional[str] = None,
                  load_lr_scores_csv: Optional[str] = None,
+                 min_comm_edges: int = 1,
                  device: str = 'cpu'):
         """
         初始化数据集
@@ -34,8 +35,10 @@ class STHeteroSubgraphDataset:
             spot_cell_expr_npz_path: 预构建的spot-cell-gene表达矩阵路径
             load_lr_scores_csv: 加载预先计算的LR通讯得分CSV路径
                                CSV格式: spot_i, spot_j, cell_i, cell_j, ligand, receptor, comm_score
+            min_comm_edges: 最小通讯边数阈值，少于此值的spot将被过滤 (default: 1)
             device: 设备
         """
+        self.min_comm_edges = min_comm_edges
         self.cluster_expr = cluster_expr
         self.cell_expr = cell_expr
         self.cell_full_expr = cell_full_expr
@@ -259,9 +262,75 @@ class STHeteroSubgraphDataset:
             self.lr_keys_by_spot_pair[pair_key].append(key)
         
         print(f"[Optimized] LR keys grouped by {len(self.lr_keys_by_spot_pair)} spot-cell pairs")
+        
+        # ========== 预过滤：只保留有足够通讯边的spot ==========
+        self._filter_valid_spots(self.min_comm_edges)
+    
+    def _filter_valid_spots(self, min_comm_edges: int):
+        """
+        预先过滤掉没有通讯边（或通讯边太少）的spot
+        
+        Args:
+            min_comm_edges: 最小通讯边数阈值（默认1，即至少有1条通讯边）
+        """
+        print(f"\n[Filtering] 检查每个spot的通讯边数量...")
+        valid_spots = []
+        spot_comm_counts = []
+        
+        for spot_idx in range(self.n_spots):
+            # 统计该spot作为中心点的通讯边数
+            comm_edge_count = 0
+            
+            # 获取邻居
+            neighbor_indices = self.knn_indices[spot_idx]
+            
+            # 获取中心spot的cell composition
+            composition_center = self.composition.iloc[spot_idx].values
+            cells_in_center = np.where(composition_center > 1e-6)[0]
+            
+            if len(cells_in_center) == 0:
+                spot_comm_counts.append(0)
+                continue
+            
+            # 检查与每个邻居的通讯
+            for neighbor_idx in neighbor_indices:
+                if self.knn_mask is not None and not self.knn_mask[spot_idx, neighbor_idx]:
+                    continue
+                
+                composition_neighbor = self.composition.iloc[neighbor_idx].values
+                cells_in_neighbor = np.where(composition_neighbor > 1e-6)[0]
+                
+                if len(cells_in_neighbor) == 0:
+                    continue
+                
+                # 检查cell-cell通讯
+                for cell_i in cells_in_center:
+                    for cell_j in cells_in_neighbor:
+                        pair_key = (spot_idx, neighbor_idx, cell_i, cell_j)
+                        if pair_key in self.lr_keys_by_spot_pair:
+                            comm_edge_count += len(self.lr_keys_by_spot_pair[pair_key])
+            
+            spot_comm_counts.append(comm_edge_count)
+            if comm_edge_count >= min_comm_edges:
+                valid_spots.append(spot_idx)
+        
+        self.valid_spot_indices = np.array(valid_spots)
+        self.spot_comm_counts = np.array(spot_comm_counts)
+        
+        print(f"[Filtering] 统计结果:")
+        print(f"   - 总spot数: {self.n_spots}")
+        print(f"   - 有通讯边的spot: {len(valid_spots)} ({len(valid_spots)/self.n_spots*100:.1f}%)")
+        print(f"   - 无通讯边的spot: {self.n_spots - len(valid_spots)} ({(self.n_spots-len(valid_spots))/self.n_spots*100:.1f}%)")
+        print(f"   - 平均通讯边数: {np.mean(spot_comm_counts):.1f}")
+        print(f"   - 中位数通讯边数: {np.median(spot_comm_counts):.1f}")
+        print(f"   - 最大通讯边数: {np.max(spot_comm_counts)}")
+        
+        if len(valid_spots) < self.n_spots * 0.5:
+            print(f"[Warning] 超过50%的spot没有通讯边，请检查LR通讯得分阈值设置")
     
     def __len__(self):
-        return self.n_spots
+        # 返回有效spot数量，而不是全部spot数量
+        return len(self.valid_spot_indices)
     
     def __getitem__(self, idx):
         """获取单个子图样本 - 固定celltype数量的异构子图
@@ -282,8 +351,9 @@ class STHeteroSubgraphDataset:
             - coords_subgraph: [k+1, 2] 子图中spot的坐标
             - composition_subgraph: [k+1, n_cells] 子图中spot的composition（完整9个）
         """
-        # ========== Step 1: 获取邻域spot ==========
-        center_idx = idx
+        # ========== Step 1: 获取邻域spot（从有效spot列表中映射）==========
+        # idx是有效spot列表中的索引，需要映射到原始spot索引
+        center_idx = self.valid_spot_indices[idx]
         neighbor_indices = self.knn_indices[center_idx]
         subgraph_spot_indices = np.concatenate([[center_idx], neighbor_indices])
         n_spots_sub = len(subgraph_spot_indices)

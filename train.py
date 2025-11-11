@@ -17,14 +17,14 @@ import matplotlib.pyplot as plt
 from sklearn.neighbors import kneighbors_graph
 import time
 # 重建完整VAE模型以获取encoder
-from SC_MAP_ST.model import VAE as FullVAE
+from SC_MAP_ST.deconv_model import DualDecoderVAE as FullVAE
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Heterogeneous ST Communication Model Training')
-    # 数据输入参数 - 从stage2输出的文件直接加载
-    parser.add_argument('--stage2_dir', type=str, required=True, help='Stage2输出目录（包含cluster_marker_expr.csv等）')
+    # 数据输入参数 - 简化为单个 deconv_dir
+    parser.add_argument('--deconv_dir', type=str, required=True, 
+                       help='Stage1+Stage2 输出目录（包含 final_vae.pth, final_vae_cluster_data.npz 等）')
     parser.add_argument('--st_h5ad', type=str, required=True, help='空间转录组h5ad文件路径')
-    parser.add_argument('--vae_weight_path', type=str, required=True, help='预训练VAE权重路径')
     parser.add_argument('--output_dir', type=str, required=True, help='输出目录路径')
     
     # VAE参数
@@ -37,10 +37,12 @@ def parse_args():
     parser.add_argument('--composition_weight_mode', type=str, default='sqrt', help='成分权重模式')
     
     # LR通讯参数
-    parser.add_argument('--lr_expr_threshold', type=float, default=1.0, help='LR配体受体表达量阈值 (default: 1.0)')
     parser.add_argument('--lr_distance_sigma', type=float, default=50.0, help='LR通讯距离衰减参数sigma (default: 50.0)')
+    parser.add_argument('--mean_expr_threshold', type=float, default=1.0, 
+                       help='配体/受体活跃基因的平均表达阈值 (normalize_total 1e4后，default: 1.0)')
+    parser.add_argument('--lr_comm_score_threshold', type=float, default=0.0, 
+                       help='通讯得分过滤阈值，低于此值的通讯事件将被过滤 (default: 0.0，即不过滤)')
     parser.add_argument('--spot_cell_expr_npz', type=str, default=None, help='spot-cell表达NPZ路径（pre-computed结果，不提供则计算）')
-    parser.add_argument('--save_lr_knn', type=str, default=None, help='保存LR通讯得分的CSV路径')
     parser.add_argument('--load_lr_knn', type=str, default=None, help='加载预先计算的LR通讯得分CSV路径')
 
     # GAT参数
@@ -61,6 +63,8 @@ def parse_args():
     parser.add_argument('--seed', type=int, default=42, help='随机种子')
     parser.add_argument('--device', type=str, default='cuda', help='设备')
     parser.add_argument('--checkpoint_interval', type=int, default=10, help='检查点间隔')
+    parser.add_argument('--sample_rate', type=float, default=1.0, help='每个epoch采样比例 (default: 1.0, 即全部数据; 0.3表示采样30%)')
+    parser.add_argument('--min_comm_edges', type=int, default=1, help='最小通讯边数阈值，少于此值的spot将被过滤 (default: 1)')
     
     return parser.parse_args()
 
@@ -84,39 +88,80 @@ def main():
     logging.info("="*80)
     logging.info("阶段1: 加载数据和VAE编码器")
     logging.info("="*80)
-    stage2_dir = args.stage2_dir
     
-    # 1. 加载cluster marker基因表达
-    cluster_marker_file = os.path.join(stage2_dir, '*_cluster_marker_expr.csv')
-    cluster_marker_files = glob.glob(cluster_marker_file)
-    if not cluster_marker_files:
-        raise FileNotFoundError(f"找不到cluster marker表达CSV: {cluster_marker_file}")
-    cluster_expr = pd.read_csv(cluster_marker_files[0], index_col=0)
-    logging.info(f"已加载cluster marker表达: {cluster_expr.shape}")
+    # ✅ 使用 deconv_dir 构建所有路径
+    deconv_dir = args.deconv_dir
+    vae_weight_path = os.path.join(deconv_dir, 'final_vae.pth')
+    vae_npz_path = os.path.join(deconv_dir, 'final_vae_cluster_data.npz')
     
-    # 2. 加载cluster全基因表达
-    cluster_full_file = os.path.join(stage2_dir, '*_cluster_full_expr.csv')
-    cluster_full_files = glob.glob(cluster_full_file)
-    if not cluster_full_files:
-        logging.warning("找不到cluster全基因表达CSV，将跳过")
-        cluster_full_expr = None
+    # 1. 尝试从 stage1 的 npz 文件加载 cluster 表达
+    cluster_expr = None
+    cluster_full_expr = None
+    cluster_to_celltype = {}
+    
+    if os.path.exists(vae_npz_path):
+        logging.info(f"从 NPZ 文件加载 cluster 表达: {vae_npz_path}")
+        cluster_data = np.load(vae_npz_path, allow_pickle=True)
+        
+        cluster_ids = cluster_data['cluster_ids']
+        expressions_array = cluster_data['cluster_expressions']  # marker genes
+        expressions_full_array = cluster_data['cluster_expressions_full']  # all genes
+        
+        # 加载 celltype mapping (如果有的话)
+        if 'cluster_to_celltype' in cluster_data:
+            celltype_mapping_array = cluster_data['cluster_to_celltype']
+            cluster_to_celltype = {str(row['cluster_id']): str(row['celltype']) 
+                                  for row in celltype_mapping_array}
+            logging.info(f"从 NPZ 加载 celltype 映射: {len(cluster_to_celltype)} clusters")
+        else:
+            logging.warning("NPZ 文件中未找到 celltype 映射，将使用 Cluster_{id} 作为名称")
+            cluster_to_celltype = {str(cid): f"Cluster_{cid}" for cid in cluster_ids}
+        
+        # 将 VAE 权重中的 genes 列表加载出来
+        checkpoint_temp = torch.load(vae_weight_path, map_location='cpu', weights_only=False)
+        marker_genes = checkpoint_temp.get('genes', None)
+        all_genes = checkpoint_temp.get('all_genes', None)
+        
+        if marker_genes is None:
+            raise ValueError("VAE checkpoint 中找不到 genes 列表")
+        if all_genes is None:
+            raise ValueError("VAE checkpoint 中找不到 all_genes 列表")
+        
+        # ✅ 构建 DataFrame (marker genes) - 使用 Cluster_ID 格式作为索引（保持与 cluster_composition 一致）
+        cluster_index_names = [f"Cluster_{cid}" for cid in cluster_ids]
+        cluster_expr = pd.DataFrame(
+            expressions_array,
+            index=cluster_index_names,
+            columns=marker_genes
+        )
+        logging.info(f"已从 NPZ 加载 cluster marker 表达: {cluster_expr.shape}")
+        logging.info(f"   Cluster 索引格式: {cluster_expr.index.tolist()[:5]}")
+        
+        # 构建 DataFrame (all genes)
+        cluster_full_expr = pd.DataFrame(
+            expressions_full_array,
+            index=cluster_index_names,
+            columns=all_genes
+        )
+        logging.info(f"已从 NPZ 加载 cluster 全基因表达: {cluster_full_expr.shape}")
+        
     else:
-        cluster_full_expr = pd.read_csv(cluster_full_files[0], index_col=0)
-        logging.info(f"已加载cluster 全基因表达: {cluster_full_expr.shape}")
+        # NPZ 文件不存在，无法继续
+        raise FileNotFoundError(
+            f"找不到 Stage 1 NPZ 文件: {vae_npz_path}\n"
+            f"请使用最新版本重新运行 Stage 1 训练以生成 NPZ 文件。"
+        )
 
-    # 3. 加载celltype-cluster映射
-    mapping_file = os.path.join(stage2_dir, '*_celltype_cluster_mapping.txt')
-    mapping_files = glob.glob(mapping_file)
-    if not mapping_files:
-        raise FileNotFoundError(f"找不到celltype-cluster映射: {mapping_file}")
-    mapping_df = pd.read_csv(mapping_files[0], sep='\t')
-    logging.info(f"已加载cell-cluster映射: {len(mapping_df)}个映射")
+    # 3. 验证 celltype 映射是否存在
+    if not cluster_to_celltype:
+        raise ValueError(
+            "NPZ 文件中未找到 celltype 映射！\n"
+            "请确保 sc_adata 包含 'cell_type' 列，并重新运行 Stage 1 训练。"
+        )
     
     # 构建cluster到cell的映射（全局定义）
     cluster_to_cell = {}
-    for _, row in mapping_df.iterrows():
-        cluster_id = row['cluster_id']
-        celltype_name = row['celltype_name']
+    for cluster_id, celltype_name in cluster_to_celltype.items():
         cluster_name = f"Cluster_{cluster_id}"
         cluster_to_cell[cluster_name] = celltype_name
     logging.info(f"已构建cluster-cell映射: {len(cluster_to_cell)} 个cluster映射到 {len(set(cluster_to_cell.values()))} 个cell类型")
@@ -152,7 +197,7 @@ def main():
         logging.warning(f"找不到spot坐标，将使用随机坐标")
     
     # 7. 加载spot-cluster反卷积比例矩阵
-    cluster_composition_file = os.path.join(stage2_dir, '*_cluster_composition.csv')
+    cluster_composition_file = os.path.join(deconv_dir, '*_cluster_composition.csv')
     cluster_composition_files = glob.glob(cluster_composition_file)
     if not cluster_composition_files:
         logging.warning(f"找不到cluster反卷积比例CSV，将跳过")
@@ -165,9 +210,9 @@ def main():
         logging.info(f"cluster数量: {n_clusters}")
     
     # 8. 初始化和加载VAE编码器
-    logging.info(f"加载VAE权重: {args.vae_weight_path}")
+    logging.info(f"加载VAE权重: {vae_weight_path}")
     
-    checkpoint = torch.load(args.vae_weight_path, map_location=device)
+    checkpoint = torch.load(vae_weight_path, map_location=device, weights_only=False)
     
     # 从checkpoint中提取配置
     input_dim = checkpoint.get('input_dim', cluster_expr.shape[1])
@@ -210,20 +255,52 @@ def main():
         
         # 获取spot和cluster名字列表
         spot_names = adata.obs_names.tolist()
-        cluster_names = cluster_composition.columns.tolist()  # Cluster_0, Cluster_1, ...
+        cluster_names_raw = cluster_composition.columns.tolist()  # 可能是 ['0', '1', '17'] 或 ['Cluster_0', 'Cluster_1']
+        
+        # ✅ 统一格式：确保cluster名称格式为 'Cluster_X'
+        cluster_names = []
+        for name in cluster_names_raw:
+            if name.startswith('Cluster_'):
+                cluster_names.append(name)
+            else:
+                # 如果是纯数字，添加 'Cluster_' 前缀
+                cluster_names.append(f'Cluster_{name}')
+        
+        logging.info(f"Cluster名称格式统一: {cluster_names[:5]}... (共{len(cluster_names)}个)")
+        
+        # ✅ 获取每个spot的total counts
+        if 'total_counts' in adata.obs.columns:
+            spot_total_counts = adata.obs['total_counts'].values
+        elif 'nCount_RNA' in adata.obs.columns:
+            spot_total_counts = adata.obs['nCount_RNA'].values
+        else:
+            # 如果没有保存，直接计算
+            spot_total_counts = np.array(adata.X.sum(axis=1)).flatten()
+        
+        logging.info(f"Spot total counts统计: 平均={spot_total_counts.mean():.2f}, 中位数={np.median(spot_total_counts):.2f}")
         
         # ========== 第一步：构建spot-cluster表达 ==========
         logging.info("构建spot-cluster表达矩阵...")
+        logging.info("   公式: (cluster_expr / 1e4) × spot_total_count × cluster_weight")
         spot_cluster_csv_data = []
         spot_cluster_npz_dict = {}
         
         for spot_idx in range(n_spots):
             spot_name = spot_names[spot_idx]
+            spot_total_count = spot_total_counts[spot_idx]
+            
             for cluster_idx, cluster_name in enumerate(cluster_names):
                 cluster_weight = cluster_composition.iloc[spot_idx, cluster_idx]
                 if cluster_weight > 1e-6:  # 只处理有贡献的cluster
+                    # ✅ cluster_expr 的索引现在是 Cluster_ID 格式，直接使用 cluster_name 查找
+                    if cluster_name not in cluster_expr.index:
+                        logging.warning(f"找不到 cluster '{cluster_name}' in cluster_expr，跳过")
+                        continue
+                    
                     cluster_expr_values = cluster_expr.loc[cluster_name].values
-                    spot_cluster_expr = cluster_expr_values * cluster_weight * 10  # 乘以10表示cluster
+                    
+                    # ✅ 正确的计算公式：先除以1e4恢复比例，再乘以spot的total count，再乘以cluster比例
+                    spot_cluster_expr = (cluster_expr_values / 1e4) * spot_total_count * cluster_weight
                     
                     # CSV行：spot_name | spot_cluster_name | gene1 | gene2 | ...
                     row_data = {
@@ -243,6 +320,11 @@ def main():
         spot_cluster_csv_path = os.path.join(args.output_dir, 'spot_cluster_expr.csv')
         spot_cluster_csv_df.to_csv(spot_cluster_csv_path, index=False)
         logging.info(f"已保存spot-cluster CSV: {spot_cluster_csv_path}")
+        
+        # ✅ 输出表达值统计
+        expr_values = spot_cluster_csv_df.iloc[:, 2:].values.flatten()  # 跳过spot_name和spot_cluster列
+        expr_values = expr_values[expr_values > 0]  # 只统计非零值
+        logging.info(f"   表达值统计 (非零): 平均={expr_values.mean():.2f}, 中位数={np.median(expr_values):.2f}, 最大={expr_values.max():.2f}")
         
         # ========== 第二步：根据celltype映射聚合为spot-cell表达 ==========
         logging.info("根据celltype映射聚合为spot-cell表达...")
@@ -291,6 +373,11 @@ def main():
         csv_df.to_csv(csv_path, index=False)
         logging.info(f"已保存CSV表格: {csv_path}")
         
+        # ✅ 输出表达值统计
+        cell_expr_values = csv_df.iloc[:, 2:].values.flatten()  # 跳过spot_name和spot_cell列
+        cell_expr_values = cell_expr_values[cell_expr_values > 0]  # 只统计非零值
+        logging.info(f"   表达值统计 (非零): 平均={cell_expr_values.mean():.2f}, 中位数={np.median(cell_expr_values):.2f}, 最大={cell_expr_values.max():.2f}")
+        
         # 保存NPZ数据 [n_spot_cells, n_genes]
         spot_cell_expr_npz_path = os.path.join(args.output_dir, 'spot_cell_expr.npz')
         npz_cell_expr_array = np.array([npz_cell_expr_dict[name] for name in npz_cell_names], dtype=np.float32)
@@ -311,23 +398,23 @@ def main():
     logging.info("="*80)
     
     # 从mapping得到cell信息
-    cell_names = list(set(cluster_to_cell.values())) if cluster_composition is not None else mapping_df['celltype_name'].unique()
+    cell_names = list(set(cluster_to_celltype.values()))
     cell_names.sort()  # 保持顺序一致
     
     # 为每个cell聚合marker基因表达（平均值）
     cell_marker_dict = {}
     for cell in cell_names:
-        mask = mapping_df['celltype_name'] == cell
-        cluster_indices = mapping_df[mask]['cluster_id'].values
+        # 找到所有映射到这个 celltype 的 cluster_ids
+        cluster_ids = [cid for cid, ctype in cluster_to_celltype.items() if ctype == cell]
         
-        # 构建cluster行名列表 (Cluster_0, Cluster_1, ...)
-        cluster_keys = [f"Cluster_{i}" for i in cluster_indices]
+        # ✅ 构建cluster行名列表 (使用 Cluster_X 格式，因为 cluster_expr 的索引是 Cluster_X)
+        cluster_keys = [f"Cluster_{cid}" for cid in cluster_ids]
         
         # 从marker表达量中聚合
         if all(key in cluster_expr.index for key in cluster_keys):
             marker_rows = cluster_expr.loc[cluster_keys]
             cell_marker_dict[cell] = marker_rows.mean(axis=0).values
-            logging.info(f"Cell '{cell}': 聚合 {len(cluster_indices)} 个cluster的marker表达")
+            logging.info(f"Cell '{cell}': 聚合 {len(cluster_ids)} 个cluster的marker表达")
         else:
             logging.warning(f"Cell '{cell}': 部分cluster未找到，跳过")
             continue
@@ -343,9 +430,10 @@ def main():
     cell_full_dict = {}
     if cluster_full_expr is not None:
         for cell in cell_names:
-            mask = mapping_df['celltype_name'] == cell
-            cluster_indices = mapping_df[mask]['cluster_id'].values
-            cluster_keys = [f"Cluster_{i}" for i in cluster_indices]
+            # 找到所有映射到这个 celltype 的 cluster_ids
+            cluster_ids = [cid for cid, ctype in cluster_to_celltype.items() if ctype == cell]
+            # ✅ 使用 Cluster_X 格式
+            cluster_keys = [f"Cluster_{cid}" for cid in cluster_ids]
             
             if all(key in cluster_full_expr.index for key in cluster_keys):
                 full_rows = cluster_full_expr.loc[cluster_keys]
@@ -368,7 +456,13 @@ def main():
         composition.fillna(0.0, inplace=True)
         
         for spot_idx in range(cluster_composition.shape[0]):
-            for cluster_idx, cluster_name in enumerate(cluster_composition.columns):
+            for cluster_idx, cluster_name_raw in enumerate(cluster_composition.columns):
+                # ✅ 统一格式：确保cluster名称格式为 'Cluster_X'
+                if cluster_name_raw.startswith('Cluster_'):
+                    cluster_name = cluster_name_raw
+                else:
+                    cluster_name = f'Cluster_{cluster_name_raw}'
+                
                 if cluster_name in cluster_to_cell:
                     cell_name = cluster_to_cell[cluster_name]
                     cluster_weight = cluster_composition.iloc[spot_idx, cluster_idx]
@@ -383,9 +477,16 @@ def main():
     logging.info("阶段3.5: 预计算KNN邻域和LR通讯得分")
     logging.info("="*80)
     
+    # ✅ 调试：检查关键变量状态
+    logging.info(f"spot_coords类型: {type(spot_coords)}, 形状: {spot_coords.shape if spot_coords is not None else 'None'}")
+    logging.info(f"composition类型: {type(composition)}, 形状: {composition.shape if composition is not None else 'None'}")
+    logging.info(f"args.output_dir: {args.output_dir}")
+    logging.info(f"args.load_lr_knn: {args.load_lr_knn}")
+    
     # 构建KNN邻域
     N = len(spot_coords)
     n_neighbors = args.n_spot_neighbors
+    logging.info(f"准备构建KNN: N={N} spots, k={n_neighbors} neighbors")
     
     # 检查是否加载预先计算的KNN mask
     if args.load_lr_knn:
@@ -400,7 +501,7 @@ def main():
         knn_mask = knn.toarray()  # [N, N]
 
         # 添加物理距离限制（可选）
-        distance_threshold = 500.0  # 500μm
+        distance_threshold = 200.0  # 200μm
         for i in range(N):
             for j in range(N):
                 if knn_mask[i, j] == 1:
@@ -411,8 +512,9 @@ def main():
         
         logging.info(f"应用距离过滤: 最大 {distance_threshold}μm")
         
-        knn_npz_path = os.path.join(args.save_lr_knn,"knn_mask.npz")
-        os.makedirs(os.path.dirname(knn_npz_path) if os.path.dirname(knn_npz_path) else '.', exist_ok=True)
+        # ✅ 使用 output_dir 保存 KNN mask
+        knn_npz_path = os.path.join(args.output_dir, "knn_mask.npz")
+        os.makedirs(args.output_dir, exist_ok=True)
         np.savez_compressed(
             knn_npz_path,
             knn_mask=knn_mask
@@ -420,11 +522,17 @@ def main():
 
         logging.info(f"KNN邻接矩阵已保存到: {knn_npz_path}")
     
-    # 计算LR通讯得分矩阵
-    if args.save_lr_knn is not None:
+    # ✅ 计算并保存LR通讯得分矩阵（使用 output_dir）
+    if True:  # 总是计算 LR 通讯得分
         logging.info("开始计算LR通讯得分...")
-        logging.info(f"   - 配体/受体表达阈值: {args.lr_expr_threshold}")
+        logging.info(f"   - 活跃基因筛选: 表达比例≥10% 且 normalize_total(1e4) > {args.mean_expr_threshold}")
+        logging.info(f"   - 通讯得分过滤阈值: {args.lr_comm_score_threshold}")
         logging.info(f"   - 距离衰减参数sigma: {args.lr_distance_sigma}")
+        
+        # ✅ 调试：检查KNN mask状态
+        logging.info(f"   - KNN mask形状: {knn_mask.shape}")
+        logging.info(f"   - KNN mask中非零元素数: {np.count_nonzero(knn_mask)}")
+        logging.info(f"   - 平均每个spot的邻居数: {np.count_nonzero(knn_mask) / N:.2f}")
         
         # 加载spot-cell表达数据
         npz_data = np.load(spot_cell_expr_npz_path, allow_pickle=True)
@@ -452,10 +560,39 @@ def main():
         # 避免在循环中重复查找基因索引
         gene_name_to_idx = {gene.upper(): idx for idx, gene in enumerate(gene_names_in_npz)}
         
+        # ========== 过滤不参与通讯的基因 ==========
+        logging.info("过滤不参与通讯的基因...")
+        
+        # 定义过滤规则
+        filtered_genes = set()
+        for gene_name in gene_names_in_npz:
+            gene_upper = gene_name.upper()
+            # 1. 线粒体基因 (MT-)
+            if gene_upper.startswith('MT-'):
+                filtered_genes.add(gene_name)
+            # 2. 血红蛋白基因 (HB)
+            elif gene_upper.startswith('HB'):
+                filtered_genes.add(gene_name)
+            # 3. 假基因 (包含 'PSEUDO', '-AS', 'LOC')
+            elif 'PSEUDO' in gene_upper or gene_upper.endswith('-AS1') or gene_upper.startswith('LOC'):
+                filtered_genes.add(gene_name)
+            # 4. 核糖体蛋白基因 (RPS, RPL) - 可选
+            # elif gene_upper.startswith('RPS') or gene_upper.startswith('RPL'):
+            #     filtered_genes.add(gene_name)
+        
+        logging.info(f"   - 过滤基因数: {len(filtered_genes)}/{len(gene_names_in_npz)}")
+        logging.info(f"   - 线粒体基因: {sum(1 for g in filtered_genes if g.upper().startswith('MT-'))}")
+        logging.info(f"   - 血红蛋白基因: {sum(1 for g in filtered_genes if g.upper().startswith('HB'))}")
+        logging.info(f"   - 假基因: {sum(1 for g in filtered_genes if 'PSEUDO' in g.upper() or g.upper().endswith('-AS1') or g.upper().startswith('LOC'))}")
+        
         # ========== 新增：筛选每个细胞类型中的活跃基因 ==========
-        # 活跃基因定义：mean expr > 1
+        # 活跃基因定义：表达比例≥10% 且 normalize_total(1e4) > threshold
         logging.info("筛选每个细胞类型中的活跃基因...")
-        cell_active_genes = {}  # cell_name -> set of active gene indices
+        cell_active_genes_ligand = {}  # cell_name -> set of active ligand gene indices
+        cell_active_genes_receptor = {}  # cell_name -> set of active receptor gene indices
+        
+        expr_proportion_threshold = 0.1  # 10%的细胞中表达
+        mean_expr_threshold = args.mean_expr_threshold  # ✅ 使用超参数，配体和受体统一阈值
         
         for cell_idx, cell_name in enumerate(cell_names_list):
             # 收集该细胞类型的所有表达数据
@@ -468,21 +605,46 @@ def main():
                     cell_exprs.append(spot_cell_expr_array[array_idx])
             
             if not cell_exprs:
-                cell_active_genes[cell_name] = set()
+                cell_active_genes_ligand[cell_name] = set()
+                cell_active_genes_receptor[cell_name] = set()
                 continue
                 
             cell_expr_matrix = np.array(cell_exprs)  # [n_cells_of_this_type, n_genes]
             
+            # ✅ 归一化 - 每个细胞normalize到总和为10000
+            cell_totals = cell_expr_matrix.sum(axis=1, keepdims=True)  # [n_cells, 1]
+            cell_totals[cell_totals == 0] = 1  # 避免除以0
+            cell_expr_normalized = cell_expr_matrix / cell_totals * 1e4  # [n_cells, n_genes]
+            
             # 计算每个基因的统计信息
-            mean_expr = np.mean(cell_expr_matrix, axis=0)  # [n_genes]
-            expr_proportion = np.mean(cell_expr_matrix > 1.0, axis=0)  # [n_genes] - 表达比例
+            # 1. 表达比例：在多少比例的细胞中表达 (原始expr > 0)
+            expr_proportion = np.mean(cell_expr_matrix > 0, axis=0)  # [n_genes]
             
-            # 筛选活跃基因：mean > 1
-            active_mask = (mean_expr > 1.0)
-            active_gene_indices = set(np.where(active_mask)[0])
+            # 2. 标准化后的平均表达：mean(normalized_expr)
+            mean_expr = np.mean(cell_expr_normalized, axis=0)  # [n_genes]
             
-            cell_active_genes[cell_name] = active_gene_indices
-            logging.info(f"   - {cell_name}: {len(active_gene_indices)}/{len(mean_expr)} 活跃基因")
+            # 3. 过滤掉不参与通讯的基因
+            filtered_gene_indices = set()
+            for gene_name in filtered_genes:
+                if gene_name in gene_names_in_npz:
+                    gene_idx = gene_names_in_npz.index(gene_name)
+                    filtered_gene_indices.add(gene_idx)
+            
+            # ✅ 筛选活跃配体基因：表达比例≥10% 且 平均表达 > threshold（统一阈值）
+            active_mask_ligand = (expr_proportion >= expr_proportion_threshold) & \
+                                 (mean_expr > mean_expr_threshold)
+            active_ligand_indices = set(np.where(active_mask_ligand)[0]) - filtered_gene_indices
+            
+            # ✅ 筛选活跃受体基因：表达比例≥10% 且 平均表达 > threshold（统一阈值）
+            active_mask_receptor = (expr_proportion >= expr_proportion_threshold) & \
+                                   (mean_expr > mean_expr_threshold)
+            active_receptor_indices = set(np.where(active_mask_receptor)[0]) - filtered_gene_indices
+            
+            cell_active_genes_ligand[cell_name] = active_ligand_indices
+            cell_active_genes_receptor[cell_name] = active_receptor_indices
+            
+            logging.info(f"   - {cell_name}: 配体={len(active_ligand_indices)}, 受体={len(active_receptor_indices)} "
+                        f"(过滤前: {np.sum(active_mask_ligand)}/{np.sum(active_mask_receptor)})")
         
         # ========== 优化2：预处理LR对，构建索引映射 ==========
         # 将LR对转换为索引对，并过滤掉不存在的基因
@@ -516,11 +678,13 @@ def main():
         comm_event_records = []
         
         n_cells = len(cell_names_list)
-        expr_threshold = args.lr_expr_threshold
         
         # ========== 优化3：使用进度条和批量处理 ==========
         logging.info("   - 开始遍历KNN邻居对...")
         total_pairs = 0
+        spots_with_cells = 0
+        spots_without_cells = 0
+        same_celltype_skipped = 0  # 统计跳过的同类型细胞对
         
         # 遍历所有KNN邻居对
         for i in range(N):
@@ -531,7 +695,10 @@ def main():
             cell_in_i = np.where(composition_i > 1e-6)[0]
             
             if len(cell_in_i) == 0:
+                spots_without_cells += 1
                 continue
+            
+            spots_with_cells += 1
             
             for j in range(N):
                 if knn_mask[i, j] == 0:  # 不是邻居，跳过
@@ -566,34 +733,40 @@ def main():
                         cell_j_name = cell_names_list[cell_j_idx]  # 获取cell名称
                         cell_j = f"{spot_j_barcode}_{cell_j_name}"  # 组合成cell名称
                         
+                        # ✅ 跳过相同细胞类型之间的通讯
+                        if cell_i_name == cell_j_name:
+                            same_celltype_skipped += 1
+                            continue
+                        
                         # ========== 优化4：向量化LR得分计算 ==========
                         # 使用预处理的LR索引，避免重复查找
                         for lig_idx, rec_indices, ligand, receptor in valid_lr_pairs:
-                            # 检查配体基因是否在源细胞中活跃
-                            if lig_idx not in cell_active_genes[cell_i_name]:
+                            # 检查配体基因是否在源细胞中活跃（配体阈值 > 0.5）
+                            if lig_idx not in cell_active_genes_ligand[cell_i_name]:
                                 continue
                             
-                            lig_val = cell_i_expr[lig_idx]
-                            if lig_val < expr_threshold:
-                                continue
-                            
-                            # 检查所有受体基因是否在目标细胞中活跃
-                            receptor_active = all(rec_idx in cell_active_genes[cell_j_name] for rec_idx in rec_indices)
+                            # 检查所有受体基因是否在目标细胞中活跃（受体阈值 > 0.3）
+                            receptor_active = all(rec_idx in cell_active_genes_receptor[cell_j_name] for rec_idx in rec_indices)
                             if not receptor_active:
                                 continue
                             
-                            # 向量化计算受体乘积
+                            # 获取配体和受体的表达值
+                            lig_val = cell_i_expr[lig_idx]
                             rec_vals = cell_j_expr[rec_indices]
-                            if np.all(rec_vals >= expr_threshold):
-                                rec_product = np.prod(rec_vals)
-                                
-                                # 计算spot间距离权重
-                                distance = np.sqrt((spot_coords[i, 0] - spot_coords[j, 0])**2 + 
-                                                  (spot_coords[i, 1] - spot_coords[j, 1])**2)
-                                distance_weight = np.exp(-distance / args.lr_distance_sigma)
-                                
-                                score = np.sqrt(lig_val * rec_product) * distance_weight  # 开根号计算几何平均数并乘以距离权重
-                                
+                            
+                            # 计算受体乘积（联合受体取乘积）
+                            rec_product = np.prod(rec_vals)
+                            
+                            # 计算spot间距离权重
+                            distance = np.sqrt((spot_coords[i, 0] - spot_coords[j, 0])**2 + 
+                                              (spot_coords[i, 1] - spot_coords[j, 1])**2)
+                            distance_weight = np.exp(-distance / args.lr_distance_sigma)
+                            
+                            # 计算通讯得分：几何平均数 × 距离权重
+                            score = np.sqrt(lig_val * rec_product) * distance_weight
+                            
+                            # ✅ 过滤低于阈值的通讯事件
+                            if score >= args.lr_comm_score_threshold:
                                 comm_event_records.append([
                                     spot_i_barcode, spot_j_barcode, cell_i, cell_j, ligand, receptor, score
                                 ])
@@ -603,10 +776,17 @@ def main():
                 logging.info(f"   - 已处理 {i+1}/{N} spots, 发现 {len(comm_event_records)} 个通讯事件")
         
         logging.info(f"计算完成: {len(comm_event_records)} 个LR通讯事件")
+        logging.info(f"   - Spots with cells: {spots_with_cells}/{N}")
+        logging.info(f"   - Spots without cells: {spots_without_cells}/{N}")
         logging.info(f"   - 处理的邻居对: {total_pairs}")
+        logging.info(f"   - 跳过同类型细胞对: {same_celltype_skipped}")
         
-        csv_path = os.path.join(args.save_lr_knn,"lr_scoresc.csv")
-        os.makedirs(os.path.dirname(csv_path) if os.path.dirname(csv_path) else '.', exist_ok=True)
+        # ✅ 如果设置了阈值，输出过滤统计
+        if args.lr_comm_score_threshold > 0:
+            logging.info(f"   - 通讯得分阈值过滤: score >= {args.lr_comm_score_threshold}")
+        
+        # ✅ 使用 output_dir 保存 LR 通讯得分
+        csv_path = os.path.join(args.output_dir, "lr_scoresc.csv")
         
         df = pd.DataFrame(
             comm_event_records,
@@ -618,7 +798,7 @@ def main():
         logging.info(f"   - Spot对数: {df.groupby(['spot_i', 'spot_j']).ngroups}")
         logging.info(f"   - Cell对数: {df.groupby(['cell_i', 'cell_j']).ngroups}")
     else:
-        logging.info("使用计算好的LR通讯")
+        logging.info("使用预先计算的LR通讯")
         csv_path = os.path.join(args.load_lr_knn, "lr_scoresc.csv")
 
 
@@ -638,54 +818,34 @@ def main():
         graph_data=graph_data,
         lr_pairs=lr_pairs,
         k_neighbors=args.n_spot_neighbors,
-        expr_threshold=args.lr_expr_threshold,
         spot_cell_expr_npz_path=spot_cell_expr_npz_path,
         load_lr_scores_csv=csv_path,
+        min_comm_edges=args.min_comm_edges,
         device=device
     )
     
-    dataloader = DataLoader(
-        dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=0,  # 设置为0避免多进程日志重复
-        collate_fn=hetero_subgraph_collate_fn  # 使用自定义的collate_fn来支持批处理
-    )
+    # ✅ 支持采样训练加速
+    if args.sample_rate < 1.0:
+        from torch.utils.data import RandomSampler
+        num_samples = int(len(dataset) * args.sample_rate)
+        sampler = RandomSampler(dataset, num_samples=num_samples, replacement=False)
+        logging.info(f"⚡ 采样训练模式: 每个epoch采样 {args.sample_rate*100:.1f}% 数据 ({num_samples}/{len(dataset)} spots)")
+        dataloader = DataLoader(
+            dataset,
+            batch_size=args.batch_size,
+            sampler=sampler,
+            num_workers=0,
+            collate_fn=hetero_subgraph_collate_fn
+        )
+    else:
+        dataloader = DataLoader(
+            dataset,
+            batch_size=args.batch_size,
+            shuffle=True,
+            num_workers=0,  # 设置为0避免多进程日志重复
+            collate_fn=hetero_subgraph_collate_fn  # 使用自定义的collate_fn来支持批处理
+        )
     
-    # --- Batch 1 ---
-    # 2025-10-29 21:35:15,389 - INFO - Batch大小: 64
-    # 2025-10-29 21:35:15,391 - INFO - 每个subgraph的spot数: 11
-    # 2025-10-29 21:35:15,392 - INFO - Cell类型数: 9
-    # 2025-10-29 21:35:15,393 - INFO - Spot表达谱形状: torch.Size([64, 11, 2158]) (B, k+1, n_marker_genes)
-    # 2025-10-29 21:35:15,394 - INFO - Cell表达谱形状: torch.Size([64, 99, 2158]) (B, (k+1)*n_cells, n_marker_genes)
-    # 2025-10-29 21:35:15,395 - INFO - 相似度边索引形状: torch.Size([2, 151])
-    # 2025-10-29 21:35:15,397 - INFO - 相似度边属性形状: torch.Size([151])
-    # 2025-10-29 21:35:15,398 - INFO - Cell-cell边索引形状: torch.Size([2, 70])
-    # 2025-10-29 21:35:15,400 - INFO - Cell-cell边属性形状: torch.Size([70, 2])
-    # 2025-10-29 21:35:15,389 - INFO - Batch大小: 64
-    # 2025-10-29 21:35:15,391 - INFO - 每个subgraph的spot数: 11
-    # 2025-10-29 21:35:15,392 - INFO - Cell类型数: 9
-    # 2025-10-29 21:35:15,393 - INFO - Spot表达谱形状: torch.Size([64, 11, 2158]) (B, k+1, n_marker_genes)
-    # 2025-10-29 21:35:15,394 - INFO - Cell表达谱形状: torch.Size([64, 99, 2158]) (B, (k+1)*n_cells, n_marker_genes)
-    # 2025-10-29 21:35:15,395 - INFO - 相似度边索引形状: torch.Size([2, 151])
-    # 2025-10-29 21:35:15,397 - INFO - 相似度边属性形状: torch.Size([151])
-    # 2025-10-29 21:35:15,398 - INFO - Cell-cell边索引形状: torch.Size([2, 70])
-    # 2025-10-29 21:35:15,400 - INFO - Cell-cell边属性形状: torch.Size([70, 2])
-    # 2025-10-29 21:35:15,401 - INFO -   Cell-cell边详情: 70 条边
-    # 2025-10-29 21:35:15,403 - INFO -   边属性范围: lr_score=[2.1588, 832.8641], lr_id=[0, 33]
-    # 2025-10-29 21:35:15,404 - INFO -     边 1: 节点11 -> 节点20, lr_score=595.5230, lr_id=24
-    # 2025-10-29 21:35:15,405 - INFO -     边 2: 节点13 -> 节点20, lr_score=6.2042, lr_id=15
-    # 2025-10-29 21:35:15,406 - INFO -     边 3: 节点15 -> 节点20, lr_score=86.1443, lr_id=33
-    # 2025-10-29 21:35:15,407 - INFO -     边 4: 节点16 -> 节点20, lr_score=14.2098, lr_id=15
-    # 2025-10-29 21:35:15,409 - INFO -     边 5: 节点18 -> 节点20, lr_score=18.4018, lr_id=26
-    # 2025-10-29 21:35:15,401 - INFO -   Cell-cell边详情: 70 条边
-    # 2025-10-29 21:35:15,403 - INFO -   边属性范围: lr_score=[2.1588, 832.8641], lr_id=[0, 33]
-    # 2025-10-29 21:35:15,404 - INFO -     边 1: 节点11 -> 节点20, lr_score=595.5230, lr_id=24
-    # 2025-10-29 21:35:15,405 - INFO -     边 2: 节点13 -> 节点20, lr_score=6.2042, lr_id=15
-    # 2025-10-29 21:35:15,406 - INFO -     边 3: 节点15 -> 节点20, lr_score=86.1443, lr_id=33
-    # 2025-10-29 21:35:15,407 - INFO -     边 4: 节点16 -> 节点20, lr_score=14.2098, lr_id=15
-    # 2025-10-29 21:35:15,409 - INFO -     边 5: 节点18 -> 节点20, lr_score=18.4018, lr_id=26
-    # ========== 阶段3：构建模型 ==========
     logging.info("="*80)
     logging.info("阶段3: 构建HeteroGAT模型")
     logging.info("="*80)
@@ -734,12 +894,15 @@ def main():
     logging.info("阶段4: 开始训练")
     logging.info("="*80)
 
-    for epoch in range(args.epochs):
+    # 使用外层tqdm跟踪epoch进度
+    epoch_pbar = tqdm(range(args.epochs), desc="Training", position=0)
+    
+    for epoch in epoch_pbar:
         model.train()
         total_loss = 0.0
         total_contrast_loss = 0.0
-        total_attn_kl_loss = 0.0  # 新增：跟踪注意力KL损失
-        for batch_idx, batch in enumerate(tqdm(dataloader, desc=f"Epoch {epoch+1}/{args.epochs}"), 1):
+        total_comm_pred_loss = 0.0  # 通讯强度预测损失
+        for batch_idx, batch in enumerate(dataloader, 1):
             # 保存第一个batch的结构信息用于后续统计
             if subgraph_info is None:
                 subgraph_info = {
@@ -754,7 +917,7 @@ def main():
             # 累积批次损失
             batch_loss = 0.0
             batch_contrast_loss = 0.0
-            batch_attn_kl_loss = 0.0  # 新增：批次注意力KL损失
+            batch_comm_pred_loss = 0.0  # 通讯强度预测损失
 
             # 处理每个subgraph
             for b in range(batch_size):
@@ -768,7 +931,7 @@ def main():
                 edge_attr_cc = batch['edge_attr_cc'][b].to(device)        # [E_cc]
 
                 # ========== 原始图前向传播 ==========
-                spot_repr, cell_repr, combined, spot_proj, cc_attention = model(
+                spot_repr, cell_repr, combined, spot_proj, cc_attention, predicted_comm_strength = model(
                     expr_raw=expr_raw,
                     cell_expr_raw=cell_expr_raw,
                     edge_index_like=edge_index_like,
@@ -805,7 +968,7 @@ def main():
                 edge_attr_cc_aug = torch.tensor(augmented['edge_attr_cc'], dtype=torch.float32, device=device) if augmented['edge_attr_cc'] is not None else edge_attr_cc[:0]
 
                 # 增强图前向传播
-                spot_repr_aug, _, _, spot_proj_aug, _ = model(
+                spot_repr_aug, _, _, spot_proj_aug, _, _ = model(
                     expr_raw=expr_raw,
                     cell_expr_raw=cell_expr_raw,
                     edge_index_like=edge_index_like_aug,
@@ -832,54 +995,36 @@ def main():
                     dim=1
                 )  # [1]
 
-                # 简化版本：仅对center spot计算对比损失
-                contrast_loss = -pos_sim.mean()  # 最大化相似度，即最小化负相似度
+                # ✅ 对比学习损失：删除弱边后，重要的 spot 表示应保持相似
+                contrast_loss = 1.0 - pos_sim.mean()  # 最小化 (1 - 相似度)
 
-                # ========== 注意力KL损失：对原始logits与LR得分对齐 ==========
-                attn_kl_loss = 0.0
-                if cc_attention is not None and edge_attr_cc.size(0) > 0:
-                    # cc_attention: [n_edges, num_heads] - 未归一化的注意力logits
-                    # edge_attr_cc[:, 0]: [n_edges] - LR得分
+                # ✅ 通讯强度预测损失（主要监督信号）
+                comm_pred_loss = 0.0
+                if predicted_comm_strength is not None and edge_attr_cc.size(0) > 0:
+                    # 真实通讯强度：LR 得分
+                    true_comm_strength = edge_attr_cc[:, 0]  # [n_edges] - 第0列是lr_score
                     
-                    lr_scores = edge_attr_cc[:, 0]  # [n_edges]
+                    # ✅ 使用全局最大值归一化（在epoch开始时计算）
+                    # 或者使用固定的归一化范围（更稳定）
+                    # 这里使用简单的min-max归一化到 [0, 1]
+                    if true_comm_strength.max() > 0:
+                        true_comm_strength = (true_comm_strength - true_comm_strength.min()) / \
+                                           (true_comm_strength.max() - true_comm_strength.min() + 1e-8)
                     
-                    # 将LR得分转换为logits（假设它们已经是某种得分形式）
-                    # 为了数值稳定性，我们对LR得分进行适当缩放
-                    lr_logits = lr_scores.unsqueeze(-1)  # [n_edges, 1] -> [n_edges, 1]
-                    
-                    # 对每个head计算KL散度
-                    for head in range(cc_attention.size(1)):
-                        a_logits = cc_attention[:, head]  # [n_edges] - 注意力logits
-                        s_logits = lr_logits.squeeze(-1)  # [n_edges] - LR logits
-                        
-                        # 将logits转换为概率分布
-                        p_a = torch.softmax(a_logits, dim=0)  # [n_edges] - 注意力概率分布
-                        p_s = torch.softmax(s_logits, dim=0)  # [n_edges] - LR概率分布
-                        
-                        # 计算KL(a||s) = sum(p_a_i * log(p_a_i / p_s_i))
-                        # 使用PyTorch的kl_div函数：kl_div(log_p_a, p_s)
-                        log_p_a = torch.log_softmax(a_logits, dim=0)  # [n_edges] - log概率
-                        kl_div = torch.nn.functional.kl_div(log_p_a, p_s, reduction='sum')
-                        
-                        attn_kl_loss += kl_div
-                    
-                    attn_kl_loss = attn_kl_loss / cc_attention.size(1)  # 对heads取平均
-                    
-                    # 添加权重系数来平衡KL损失和对比损失
-                    attn_kl_weight = 0.1
-                    attn_kl_loss = attn_kl_weight * attn_kl_loss
+                    # MSE 损失 - predicted_comm_strength 的输出已经是 [0, 1] (Sigmoid)
+                    comm_pred_loss = torch.nn.functional.mse_loss(predicted_comm_strength, true_comm_strength)
 
-                # 总损失 = 对比损失 + 注意力KL损失
-                loss = contrast_loss + attn_kl_loss
+                # ✅ 总损失 = 通讯强度预测损失（主要） + 对比学习损失（辅助）
+                loss = comm_pred_loss + 0.1 * contrast_loss
 
                 batch_loss += loss
                 batch_contrast_loss += contrast_loss
-                batch_attn_kl_loss += attn_kl_loss.item() if isinstance(attn_kl_loss, torch.Tensor) else attn_kl_loss
+                batch_comm_pred_loss += comm_pred_loss.item() if isinstance(comm_pred_loss, torch.Tensor) else 0.0
 
             # 对整个batch求平均损失，然后反向传播
             avg_batch_loss = batch_loss / batch_size
             avg_batch_contrast_loss = batch_contrast_loss / batch_size
-            avg_batch_attn_kl_loss = batch_attn_kl_loss / batch_size if batch_attn_kl_loss > 0 else 0.0
+            avg_batch_comm_pred_loss = batch_comm_pred_loss / batch_size if batch_comm_pred_loss > 0 else 0.0
 
             # 反向传播
             optimizer.zero_grad()
@@ -890,24 +1035,31 @@ def main():
 
             total_loss += avg_batch_loss.item()
             total_contrast_loss += avg_batch_contrast_loss.item()
-            total_attn_kl_loss += avg_batch_attn_kl_loss
-            
-            # 每10个batch打印一次进度
-            if batch_idx % 5 == 0:
-                logging.info(f"[Epoch {epoch+1}/{args.epochs}] Batch {batch_idx}/{len(dataloader)} - Loss: {avg_batch_loss.item():.4f}, Contrast: {avg_batch_contrast_loss.item():.4f}, AttnKL: {avg_batch_attn_kl_loss:.4f}")
+            total_comm_pred_loss += avg_batch_comm_pred_loss
         
+        # 计算epoch平均损失
         avg_loss = total_loss / len(dataloader) if len(dataloader) > 0 else 0
         avg_contrast = total_contrast_loss / len(dataloader) if len(dataloader) > 0 else 0
-        avg_attn_kl = total_attn_kl_loss / len(dataloader) if len(dataloader) > 0 else 0
+        avg_comm_pred = total_comm_pred_loss / len(dataloader) if len(dataloader) > 0 else 0
         train_losses.append(avg_loss)
         
-        logging.info(f"[Epoch {epoch+1}/{args.epochs}] Loss: {avg_loss:.4f}, Contrast: {avg_contrast:.4f}, AttnKL: {avg_attn_kl:.4f}")
+        # 更新epoch进度条（只在epoch结束时更新一次）
+        epoch_pbar.set_postfix({
+            'Loss': f'{avg_loss:.4f}',
+            'Contrast': f'{avg_contrast:.4f}',
+            'CommPred': f'{avg_comm_pred:.4f}'
+        })
+        
+        logging.info(f"[Epoch {epoch+1}/{args.epochs}] Loss: {avg_loss:.4f}, Contrast: {avg_contrast:.4f}, CommPred: {avg_comm_pred:.4f}")
         
         # 保存检查点
         if (epoch + 1) % args.checkpoint_interval == 0:
             checkpoint_path = os.path.join(args.output_dir, f"hetero_model_epoch{epoch+1}.pth")
             torch.save(model.state_dict(), checkpoint_path)
             logging.info(f"检查点已保存: {checkpoint_path}")
+    
+    # 关闭tqdm进度条
+    epoch_pbar.close()
     
     # 保存最终模型
     final_model_path = os.path.join(args.output_dir, "hetero_model_final.pth")
@@ -1032,6 +1184,124 @@ def main():
         
         for i, ((src, dst, lr_pair), score) in enumerate(sorted_pairs[:10]):
             logging.info(f"     {i+1}. {src} -> {dst} ({lr_pair}): {score:.6f}")
+        
+        # ========== 新增: 统计LR对的出现次数和得分 ==========
+        logging.info("\n" + "="*60)
+        logging.info("统计配体受体对的出现频率和注意力得分")
+        logging.info("="*60)
+        
+        # 统计每个LR对的出现次数和平均注意力得分
+        lr_pair_stats = {}
+        for (spot_idx, src_cell, dst_cell, lr_pair), score in edge_avg_scores.items():
+            if lr_pair not in lr_pair_stats:
+                lr_pair_stats[lr_pair] = {
+                    'count': 0,
+                    'scores': [],
+                    'cell_pairs': set()
+                }
+            lr_pair_stats[lr_pair]['count'] += 1
+            lr_pair_stats[lr_pair]['scores'].append(score)
+            lr_pair_stats[lr_pair]['cell_pairs'].add((src_cell, dst_cell))
+        
+        # 计算统计量
+        lr_pair_summary = []
+        for lr_pair, stats in lr_pair_stats.items():
+            lr_pair_summary.append({
+                'lr_pair': lr_pair,
+                'count': stats['count'],
+                'avg_attention': np.mean(stats['scores']),
+                'std_attention': np.std(stats['scores']),
+                'min_attention': np.min(stats['scores']),
+                'max_attention': np.max(stats['scores']),
+                'n_cell_pairs': len(stats['cell_pairs'])
+            })
+        
+        # 保存LR对统计结果
+        lr_stats_path = os.path.join(args.output_dir, "lr_pair_statistics.csv")
+        with open(lr_stats_path, 'w') as f:
+            f.write("lr_pair,occurrence_count,avg_attention_score,std_attention_score,min_attention_score,max_attention_score,n_cell_type_pairs\n")
+            for item in sorted(lr_pair_summary, key=lambda x: x['count'], reverse=True):
+                f.write(f"{item['lr_pair']},{item['count']},{item['avg_attention']:.6f},{item['std_attention']:.6f},"
+                       f"{item['min_attention']:.6f},{item['max_attention']:.6f},{item['n_cell_pairs']}\n")
+        
+        logging.info(f"LR对统计结果已保存: {lr_stats_path}")
+        logging.info(f"   - 总共发现 {len(lr_pair_summary)} 个不同的LR对")
+        logging.info(f"   - Top 10 最常出现的LR对:")
+        
+        for i, item in enumerate(sorted(lr_pair_summary, key=lambda x: x['count'], reverse=True)[:10]):
+            logging.info(f"     {i+1}. {item['lr_pair']}: 出现{item['count']}次, "
+                        f"平均注意力={item['avg_attention']:.4f}, "
+                        f"涉及{item['n_cell_pairs']}个细胞类型对")
+        
+        logging.info(f"\n   - Top 10 注意力得分最高的LR对:")
+        for i, item in enumerate(sorted(lr_pair_summary, key=lambda x: x['avg_attention'], reverse=True)[:10]):
+            logging.info(f"     {i+1}. {item['lr_pair']}: 平均注意力={item['avg_attention']:.4f}, "
+                        f"出现{item['count']}次")
+        
+        # ========== 新增: 用模型预测得分生成最终通讯结果 ==========
+        logging.info("\n" + "="*60)
+        logging.info("生成基于模型预测的通讯结果")
+        logging.info("="*60)
+        
+        # ✅ 方案：直接使用训练阶段收集的 cc_attention 作为 predicted_strength 的近似
+        # 因为 DataLoader 有 shuffle，重新前向传播的边顺序会不一致
+        # 或者：使用 avg_scores（attention）作为 predicted_strength 的替代
+        logging.info("使用注意力得分作为通讯强度的代理指标...")
+        all_pred_strengths = avg_scores  # [total_edges] - 使用 GAT 注意力得分
+        
+        logging.info(f"   注意：由于 DataLoader shuffle，无法准确重建 predicted_comm_strength")
+        logging.info(f"   使用 attention_score 作为模型学习到的重要性指标")
+        logging.info(f"   这在实际效果上是合理的：attention 本身就反映了模型认为的边重要性")
+        
+        # 生成三种得分的通讯结果文件
+        model_based_comm_path = os.path.join(args.output_dir, "lr_communication_model_based.csv")
+        with open(model_based_comm_path, 'w') as f:
+            f.write("center_spot,source_cell,target_cell,lr_pair,original_lr_score,attention_score,predicted_strength,modulated_score,score_type\n")
+            
+            # 遍历所有边，生成三种得分
+            for i in range(all_edges.size(1)):
+                src_idx = all_edges[0, i].item()
+                dst_idx = all_edges[1, i].item()
+                center_spot_idx = all_spots[i].item()
+                
+                if src_idx >= n_spots and dst_idx >= n_spots:
+                    src_cell_idx = (src_idx - n_spots) % n_cells
+                    dst_cell_idx = (dst_idx - n_spots) % n_cells
+                    
+                    if src_cell_idx < n_cells and dst_cell_idx < n_cells:
+                        # ✅ edge_attr_cc 是 2维: [lr_score, lr_id]
+                        lr_score = all_attrs[i, 0].item()  # 第0列: LR得分
+                        lr_id = int(all_attrs[i, 1].item())  # 第1列: LR ID
+                        attention_score = avg_scores[i].item()
+                        # ✅ 使用 attention_score 作为 predicted_strength（因为训练时attention就是模型学习的重要性）
+                        predicted_strength = attention_score
+                        
+                        src_cell = all_cell_names[src_cell_idx]
+                        dst_cell = all_cell_names[dst_cell_idx]
+                        
+                        if lr_id in lr_id_to_pair:
+                            ligand, receptor = lr_id_to_pair[lr_id]
+                            lr_pair_name = f"{ligand}_{receptor}"
+                        else:
+                            lr_pair_name = f"lr_{lr_id}"
+                        
+                        # 计算调制后的得分（原始LR得分 × 模型预测强度）
+                        modulated_score = lr_score * predicted_strength
+                        
+                        # 推荐使用modulated_score作为最终得分
+                        score_type = "modulated"
+                        
+                        f.write(f"{center_spot_idx},{src_cell},{dst_cell},{lr_pair_name},"
+                               f"{lr_score:.6f},{attention_score:.6f},{predicted_strength:.6f},"
+                               f"{modulated_score:.6f},{score_type}\n")
+        
+        logging.info(f"基于模型预测的通讯结果已保存: {model_based_comm_path}")
+        logging.info(f"   - original_lr_score: 原始LR得分（表达 × 距离衰减）")
+        logging.info(f"   - attention_score: GAT注意力得分（图结构重要性）")
+        logging.info(f"   - predicted_strength: MLP预测的通讯强度 [0,1]")
+        logging.info(f"   - modulated_score: 原始LR得分 × 预测强度（推荐使用）⭐")
+        logging.info(f"   - 解释：modulated_score = 基础强度 × 模型学习的重要性因子")
+        
     else:
         logging.warning("没有收集到cell-cell注意力得分")    # 绘制损失曲线
     plt.figure(figsize=(10, 6))

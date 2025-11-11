@@ -20,7 +20,7 @@ from tqdm import tqdm
 warnings.filterwarnings('ignore')
 
 # Import unified model definitions
-from model import VAE, HeterogeneousGATDeconvolution, SpatialDeconvolutionLoss
+from deconv_model import VAE, HeterogeneousGATDeconvolution, SpatialDeconvolutionLoss
 
 class SpatialDataset(Dataset):
     """Spatial transcriptomics dataset
@@ -105,7 +105,7 @@ class GATDeconvolution:
         if is_dual_decoder:
             print(f"   Architecture: Dual Decoder (SC/ST-specific)")
             # 使用双解码器VAE
-            from model import DualDecoderVAE
+            from deconv_model import DualDecoderVAE
             full_vae = DualDecoderVAE(input_dim=input_dim, latent_dim=latent_dim, output_type=output_type).to(self.device)
         else:
             print(f"   Architecture: Single Decoder")
@@ -157,77 +157,63 @@ class GATDeconvolution:
             print(f"Celltype mode: {self.celltype_key}")
             print(f"Cluster → CellType mapping: {self.cluster_to_celltype}")
         
-        # Load cluster prototypes
-        cluster_prototypes = checkpoint.get('cluster_prototypes', None)
-        if cluster_prototypes is not None:
-            # Convert to tensor format
-            # cluster_prototypes is a dict with numeric keys (0, 1, 2, ...)
-            # regardless of whether using celltype annotation or auto-clustering
-            prototype_list = []
-            for i in range(len(self.label_encoder.classes_)):
-                if i in cluster_prototypes:
-                    prototype_list.append(cluster_prototypes[i])
-                else:
-                    print(f"Warning: cluster {i} missing center, using zero vector")
-                    prototype_list.append(np.zeros(latent_dim))
-            
-            self.celltype_prototypes = torch.FloatTensor(np.array(prototype_list)).to(self.device)
-            print(f"Loaded cluster centers: {self.celltype_prototypes.shape}")
+        # Load cluster data from npz file
+        npz_filepath = self.stage1_model_path.replace('.pth', '_cluster_data.npz')
+        
+        if not os.path.exists(npz_filepath):
+            raise FileNotFoundError(
+                f"Cluster data file not found: {npz_filepath}\n"
+                f"Please retrain Stage 1 with the latest version to generate the npz file."
+            )
+        
+        print(f"Loading cluster data from: {npz_filepath}")
+        cluster_data = np.load(npz_filepath, allow_pickle=True)
+        
+        cluster_ids = cluster_data['cluster_ids']
+        prototypes_array = cluster_data['cluster_prototypes']
+        expressions_array = cluster_data['cluster_expressions']
+        expressions_full_array = cluster_data['cluster_expressions_full']
+        
+        # Verify cluster IDs match label_encoder
+        n_clusters = len(self.label_encoder.classes_)
+        if len(cluster_ids) != n_clusters:
+            raise ValueError(
+                f"Cluster count mismatch! NPZ has {len(cluster_ids)} clusters, "
+                f"but label_encoder has {n_clusters} clusters"
+            )
+        
+        # Convert to tensor
+        self.celltype_prototypes = torch.FloatTensor(prototypes_array).to(self.device)
+        self.celltype_expressions = torch.FloatTensor(expressions_array).to(self.device)
+        
+        # ✅ Handle expressions_full_array (object array containing list of arrays)
+        if expressions_full_array.ndim == 0:
+            # It's a 0-d object array containing a list
+            expressions_full_list = expressions_full_array.item()
         else:
-            self.celltype_prototypes = None
-            print("Warning: cluster centers not found, will recompute")
+            # It's a 1-d object array, each element is an array
+            expressions_full_list = [expressions_full_array[i] for i in range(len(cluster_ids))]
         
-        # Load cluster expressions
-        cluster_expressions = checkpoint.get('cluster_expressions', None)
-        if cluster_expressions is not None:
-            # Convert to tensor format
-            # cluster_expressions is a dict with numeric keys (0, 1, 2, ...)
-            expression_list = []
-            for i in range(len(self.label_encoder.classes_)):
-                if i in cluster_expressions:
-                    expression_list.append(cluster_expressions[i])
-                else:
-                    print(f"Warning: cluster {i} missing expression, using zero vector")
-                    expression_list.append(np.zeros(input_dim))
-            
-            self.celltype_expressions = torch.FloatTensor(np.array(expression_list)).to(self.device)
-            print(f"Loaded cluster expressions: {self.celltype_expressions.shape}")
+        self.celltype_expressions_full = expressions_full_list
+        
+        # Load celltype mapping if available
+        if 'cluster_to_celltype' in cluster_data:
+            celltype_mapping_array = cluster_data['cluster_to_celltype']
+            self.cluster_to_celltype = {str(row['cluster_id']): str(row['celltype']) 
+                                       for row in celltype_mapping_array}
         else:
-            self.celltype_expressions = None
-            print("Warning: cluster expressions not found, will recompute")
+            self.cluster_to_celltype = None
         
-        # Load full gene cluster expressions (count version for reconstruction)
-        cluster_expressions_full_count = checkpoint.get('cluster_expressions_full_count', None)
+        print(f"   Cluster prototypes: {self.celltype_prototypes.shape}")
+        print(f"   Cluster expressions (marker): {self.celltype_expressions.shape}")
+        print(f"   Cluster expressions (all genes): {len(self.celltype_expressions_full)} × {len(self.celltype_expressions_full[0])}")
+        if self.cluster_to_celltype:
+            print(f"   Loaded celltype mapping: {len(self.cluster_to_celltype)} clusters")
         
-        # Load average cell counts (for cells_per_spot scale factor)
+        # Load average cell counts
         self.avg_cell_counts = checkpoint.get('avg_cell_counts', None)
         if self.avg_cell_counts is not None:
-            print(f"Loaded avg_cell_counts: {self.avg_cell_counts:.1f} (for scale factor calculation)")
-        else:
-            print("Warning: avg_cell_counts not found in checkpoint (old model)")
-        
-        if cluster_expressions_full_count is None:
-            # Fall back to log version if count not available
-            cluster_expressions_full_count = checkpoint.get('cluster_expressions_full', None)
-            print("Warning: Using log1p version as count version not found")
-        
-        if cluster_expressions_full_count is not None:
-            # Convert to list format
-            # cluster_expressions_full_count is a dict with numeric keys (0, 1, 2, ...)
-            expression_full_list = []
-            for i in range(len(self.label_encoder.classes_)):
-                if i in cluster_expressions_full_count:
-                    expression_full_list.append(cluster_expressions_full_count[i])
-                else:
-                    print(f"Warning: cluster {i} missing full gene expression")
-                    expression_full_list.append(None)
-            
-            self.celltype_expressions_full = expression_full_list
-            full_gene_count = len(expression_full_list[0]) if expression_full_list[0] is not None else 0
-            print(f"Loaded full gene expressions (count): {len(expression_full_list)} clusters × {full_gene_count} genes")
-        else:
-            self.celltype_expressions_full = None
-            print("Warning: full gene expressions not found")
+            print(f"   Average cell counts: {self.avg_cell_counts:.1f}")
         
         # Load all genes list
         all_genes = checkpoint.get('all_genes', None)
@@ -457,9 +443,15 @@ class GATDeconvolution:
         hetero_losses = []
         proportion_losses = []
         
-        best_loss = float('inf')
-        patience_counter = 0
-        patience = 50
+        # ✅ 早停策略：分别跟踪三个核心重建损失（Pearson, MSE, Cosine）
+        # 只有当三个损失都在 patience 个 epoch 内没有改善时才停止训练
+        best_pearson = float('inf')
+        best_mse = float('inf')
+        best_cosine = float('inf')
+        patience_pearson = 0
+        patience_mse = 0
+        patience_cosine = 0
+        patience = 10  # 每个损失的独立 patience
         
         pbar = tqdm(range(n_epochs), desc="GAT Training", unit="epoch")
         for epoch in pbar:
@@ -481,29 +473,55 @@ class GATDeconvolution:
             hetero_losses.append(0.0)  # 已禁用
             proportion_losses.append(epoch_losses.get('proportion_loss', 0.0))
             
-            # Learning rate schedule
+            # Learning rate schedule (based on total loss)
             scheduler.step(avg_total_loss)
             
-            # Update progress bar with loss info (不显示已禁用的损失)
+            # ✅ 分别跟踪三个核心损失的改善情况
+            current_pearson = epoch_losses['pearson_loss']
+            current_mse = epoch_losses['mse_loss']
+            current_cosine = epoch_losses['cosine_loss']
+            
+            # Update best values and patience counters
+            if current_pearson < best_pearson:
+                best_pearson = current_pearson
+                patience_pearson = 0
+            else:
+                patience_pearson += 1
+            
+            if current_mse < best_mse:
+                best_mse = current_mse
+                patience_mse = 0
+            else:
+                patience_mse += 1
+            
+            if current_cosine < best_cosine:
+                best_cosine = current_cosine
+                patience_cosine = 0
+            else:
+                patience_cosine += 1
+            
+            # Save model when any core loss improves
+            if patience_pearson == 0 or patience_mse == 0 or patience_cosine == 0:
+                self.save_model(f"{self.output_dir}/best_gat_model.pth")
+            
+            # Update progress bar
             pbar.set_postfix({
                 'Total': f'{avg_total_loss:.4f}',
-                'Pearson': f'{epoch_losses["pearson_loss"]:.4f}',
-                'MSE': f'{epoch_losses["mse_loss"]:.4f}',
-                'Cosine': f'{epoch_losses["cosine_loss"]:.4f}',
-                'Proportion': f'{epoch_losses["proportion_loss"]:.4f}'
+                'Pearson': f'{current_pearson:.4f}',
+                'MSE': f'{current_mse:.4f}',
+                'Cosine': f'{current_cosine:.4f}',
+                'P_pat': patience_pearson,  # Patience counter
+                'M_pat': patience_mse,
+                'C_pat': patience_cosine
             })
             
-
-            # Save best model
-            if avg_total_loss < best_loss:
-                best_loss = avg_total_loss
-                self.save_model(f"{self.output_dir}/best_gat_model.pth")
-                patience_counter = 0
-            else:
-                patience_counter += 1
-            
-            # Early stopping
-            if patience_counter >= patience:
+            # ✅ 早停条件：三个核心损失都没有改善
+            if patience_pearson >= patience and patience_mse >= patience and patience_cosine >= patience:
+                print(f"\n⚠️ Early stopping triggered at epoch {epoch+1}/{n_epochs}")
+                print(f"   All three core losses stopped improving:")
+                print(f"      Pearson: best={best_pearson:.4f}, current={current_pearson:.4f}, no improvement for {patience_pearson} epochs")
+                print(f"      MSE: best={best_mse:.4f}, current={current_mse:.4f}, no improvement for {patience_mse} epochs")
+                print(f"      Cosine: best={best_cosine:.4f}, current={current_cosine:.4f}, no improvement for {patience_cosine} epochs")
                 pbar.close()
                 break
         
@@ -519,7 +537,9 @@ class GATDeconvolution:
         self.evaluate_and_visualize(st_data_normalized, self.st_adata, spatial_tensor, sample_name)
         
         return {
-            'best_loss': best_loss,
+            'best_pearson': best_pearson,
+            'best_mse': best_mse,
+            'best_cosine': best_cosine,
             'train_losses': train_losses,
             'sample_name': sample_name
         }
@@ -570,53 +590,17 @@ class GATDeconvolution:
         deconv_weights = deconv_weights / row_sums
         
         print("Saving deconvolution results...")
-        # weights_file = f"{self.output_dir}/{sample_name}_deconv_weights.npz"
-        # np.savez(weights_file, 
-        #         deconv_weights=deconv_weights,
-        #         attention_scores=attention_scores,
-        #         clusters=self.label_encoder.classes_)
-        
-        # ============ Generate expression matrices ============
+
         n_spots = deconv_weights.shape[0]
-        n_clusters = deconv_weights.shape[1]
         
         print("Generating deconvolution expression matrices...")
         
         # Get spot barcodes
         spot_barcodes = list(st_adata.obs.index)
         
-        # 1. Marker gene expression matrix (spot × marker genes)
-        print("   Marker gene expression...")
-        celltype_expr_marker = self.celltype_expressions.cpu().numpy()
-        
-        # ✅ 使用新公式: X̂_i = s_i × Σ(w_ic × R_c)
-        # celltype_expr_marker 来自 Stage 1 (normalize 1e4)
-        # 需要除以 1e4 转换为 sum≈1 的比例向量
-        celltype_expr_marker_normalized = celltype_expr_marker / 1e4
-        
-        # deconv_weights 是细胞类型比例 (sum=1)
-        # 混合比例
-        mixed_proportions_marker = np.dot(deconv_weights, celltype_expr_marker_normalized)  # [n_spots, n_genes]
-        
-        if self.spot_total_counts is not None:
-            # 乘以每个 spot 的总 counts
-            spot_total_marker = self.spot_total_counts[:len(spot_barcodes)]
-            reconstructed_marker_expr = mixed_proportions_marker * spot_total_marker[:, np.newaxis]
-        else:
-            reconstructed_marker_expr = mixed_proportions_marker
-            print("   ⚠️  Warning: spot_total_counts not available, using proportions")
-        
-        marker_expr_df = pd.DataFrame(
-            reconstructed_marker_expr,
-            columns=self.genes,
-            index=spot_barcodes
-        )
-        marker_expr_file = f"{self.output_dir}/{sample_name}_reconstructed_marker_genes.csv"
-        marker_expr_df.to_csv(marker_expr_file)
-        
-        # 2. Full gene expression matrix (use count version with spot_total_counts)
+        # Full gene expression matrix (use count version with spot_total_counts)
         if self.celltype_expressions_full is not None and all(expr is not None for expr in self.celltype_expressions_full):
-            print("   Full gene expression...")
+            print("   Reconstructing all gene expression...")
             celltype_expr_full = np.array(self.celltype_expressions_full)
             
             # ✅ 使用新公式: X̂_i = s_i × Σ(w_ic × R_c)
@@ -646,119 +630,93 @@ class GATDeconvolution:
             )
             full_expr_file = f"{self.output_dir}/{sample_name}_reconstructed_all_genes.csv"
             full_expr_df.to_csv(full_expr_file)
+            print(f"   Saved: {full_expr_file}")
+        else:
+            print("   ⚠️  Warning: Full gene expressions not available, skipping reconstruction")
         
         # 3. Cell type composition matrix (spot × cluster/celltype)
         print("   Cell type composition...")
+
+        cluster_list = list(self.label_encoder.classes_)
         
-        if self.cluster_to_celltype is not None:
-            # Celltype mode: only save celltype composition
-            columns = [self.cluster_to_celltype[i] for i in range(len(self.label_encoder.classes_))]
-            composition_df = pd.DataFrame(
-                deconv_weights,
-                columns=columns,
-                index=spot_barcodes
-            )
-            composition_file = f"{self.output_dir}/{sample_name}_celltype_composition.csv"
-            composition_df.to_csv(composition_file)
-            print(f"   Saved celltype composition: {composition_file}")
-        else:
-            # Auto-cluster mode: map clusters to celltypes
-            # First, load the cluster-celltype mapping from checkpoint
-            cluster_list = list(self.label_encoder.classes_)
-            
-            # Get cluster-to-celltype mapping from checkpoint if available
-            checkpoint_cluster_to_celltype = {}
+        # Get cluster-to-celltype mapping from checkpoint if available
+        checkpoint_cluster_to_celltype = {}
 
-            sc_clustered_path = f"{os.path.dirname(self.stage1_model_path)}/sc_adata_clustered.h5ad"
-            
-            if os.path.exists(sc_clustered_path):
-                # Load the clustered adata to get cluster-celltype mapping
-                sc_clustered = sc.read_h5ad(sc_clustered_path)
-                if 'leiden' in sc_clustered.obs.columns and 'cell_type' in sc_clustered.obs.columns:
-                    for cluster_id in sorted(sc_clustered.obs['leiden'].unique()):
-                        cluster_mask = sc_clustered.obs['leiden'] == cluster_id
+        sc_clustered_path = f"{os.path.dirname(self.stage1_model_path)}/sc_adata_clustered.h5ad"
+        
+        if os.path.exists(sc_clustered_path):
+            # Load the clustered adata to get cluster-celltype mapping
+            sc_clustered = sc.read_h5ad(sc_clustered_path)
+            if 'leiden' in sc_clustered.obs.columns:
+                for cluster_id in sorted(sc_clustered.obs['leiden'].unique()):
+                    cluster_mask = sc_clustered.obs['leiden'] == cluster_id
+                    if 'cell_type' in sc_clustered.obs.columns:
                         celltype_counts = sc_clustered.obs[cluster_mask]['cell_type'].value_counts()
-                        major_celltype = celltype_counts.index[0]
-                        checkpoint_cluster_to_celltype[str(cluster_id)] = major_celltype
-            
-            # Map cluster columns to celltype names
-            celltype_columns = []
-            cluster_columns = []
-            for cluster_id in cluster_list:
-                cluster_columns.append(str(cluster_id))
-                # Use the mapping if available, otherwise use cluster ID as is
-                celltype_name = checkpoint_cluster_to_celltype.get(str(cluster_id), f"Cluster_{cluster_id}")
-                celltype_columns.append(celltype_name)
+                    else:
+                        celltype_counts = sc_clustered.obs[cluster_mask]['celltype'].value_counts()
+                    major_celltype = celltype_counts.index[0]
+                    checkpoint_cluster_to_celltype[str(cluster_id)] = major_celltype
+        
+        # Map cluster columns to celltype names
+        celltype_columns = []
+        cluster_columns = []
+        for cluster_id in cluster_list:
+            cluster_columns.append(str(cluster_id))
+            # Use the mapping if available, otherwise use cluster ID as is
+            celltype_name = checkpoint_cluster_to_celltype.get(str(cluster_id), f"Cluster_{cluster_id}")
+            celltype_columns.append(celltype_name)
 
-            # Create DataFrame with possibly duplicate column names (multiple clusters -> same celltype)
-            composition_df = pd.DataFrame(
-                deconv_weights,
-                columns=celltype_columns,
-                index=spot_barcodes
-            )
+        # Create DataFrame with possibly duplicate column names (multiple clusters -> same celltype)
+        composition_df = pd.DataFrame(
+            deconv_weights,
+            columns=celltype_columns,
+            index=spot_barcodes
+        )
 
-            # 如果存在重复的 celltype 名称，则将对应列合并（按列求和）并记录日志
-            dup_names = [name for name in set(celltype_columns) if celltype_columns.count(name) > 1]
-            if len(dup_names) > 0:
-                print(f"   Found duplicate celltype names: {dup_names}. Merging corresponding cluster columns by summing weights.")
-                # groupby on columns will sum duplicated-named columns
-                composition_by_celltype = composition_df.groupby(by=composition_df.columns, axis=1).sum()
-                print(f"   Columns before: {len(composition_df.columns)}, after merge: {len(composition_by_celltype.columns)}")
-            else:
-                composition_by_celltype = composition_df
+        # 如果存在重复的 celltype 名称，则将对应列合并（按列求和）并记录日志
+        dup_names = [name for name in set(celltype_columns) if celltype_columns.count(name) > 1]
+        if len(dup_names) > 0:
+            print(f"   Found duplicate celltype names: {dup_names}. Merging corresponding cluster columns by summing weights.")
+            # groupby on columns will sum duplicated-named columns
+            composition_by_celltype = composition_df.groupby(by=composition_df.columns, axis=1).sum()
+            print(f"   Columns before: {len(composition_df.columns)}, after merge: {len(composition_by_celltype.columns)}")
+        else:
+            composition_by_celltype = composition_df
 
-            # Save aggregated celltype composition
-            composition_file = f"{self.output_dir}/{sample_name}_cell_composition.csv"
-            composition_by_celltype.to_csv(composition_file)
-            print(f"   Saved cell composition (celltype): {composition_file}")
+        # Save aggregated celltype composition
+        composition_file = f"{self.output_dir}/{sample_name}_cell_composition.csv"
+        composition_by_celltype.to_csv(composition_file)
+        print(f"   Saved cell composition (celltype): {composition_file}")
 
-            # Also save cluster-level composition (columns are cluster IDs) for reproducibility
-            cluster_composition_df = pd.DataFrame(
-                deconv_weights,
-                columns=cluster_columns,
-                index=spot_barcodes
-            )
-            cluster_file = f"{self.output_dir}/{sample_name}_cluster_composition.csv"
-            cluster_composition_df.to_csv(cluster_file)
-            print(f"   Saved cluster composition: {cluster_file}")
+        # Also save cluster-level composition (columns are cluster IDs) for reproducibility
+        cluster_composition_df = pd.DataFrame(
+            deconv_weights,
+            columns=cluster_columns,
+            index=spot_barcodes
+        )
+        cluster_file = f"{self.output_dir}/{sample_name}_cluster_composition.csv"
+        cluster_composition_df.to_csv(cluster_file)
+        print(f"   Saved cluster composition: {cluster_file}")
         
         # ============ Compute reconstruction quality (Cosine Similarity) ============
         print("\nComputing reconstruction quality per spot...")
         
-        # Reconstruct spot expression using deconv_weights
-        if self.celltype_expressions_full is not None and all(expr is not None for expr in self.celltype_expressions_full):
-            # Use full gene expression
-            # Check if expressions are tensors or numpy arrays
-            if isinstance(self.celltype_expressions_full[0], torch.Tensor):
-                celltype_expr_full = np.array([expr.cpu().numpy() for expr in self.celltype_expressions_full])
-            else:
-                celltype_expr_full = np.array(self.celltype_expressions_full)
-            
-            reconstructed_full_expr = np.dot(deconv_weights, celltype_expr_full)
-            
-            # IMPORTANT: 确保 true_expr 和 reconstructed_full_expr 使用相同的基因集
-            # celltype_expr_full 对应的是 self.all_genes（从 stage1 加载）
-            if hasattr(self, 'all_genes') and self.all_genes is not None:
-                # 只提取 all_genes 对应的基因表达
-                true_expr_full = st_adata[:, self.all_genes].X
-                true_expr = true_expr_full.toarray() if hasattr(true_expr_full, 'toarray') else true_expr_full
-                print(f"   Using {len(self.all_genes)} genes for reconstruction quality")
-            else:
-                # Fallback: 如果没有 all_genes，使用 st_adata 的所有基因（可能不匹配）
-                print("   Warning: all_genes not found, using all ST genes (may cause dimension mismatch)")
-                true_expr = st_adata.X.toarray() if hasattr(st_adata.X, 'toarray') else st_adata.X
-        else:
-            # Fall back to marker genes
-            celltype_expr_marker = self.celltype_expressions.cpu().numpy()
-            reconstructed_full_expr = np.dot(deconv_weights, celltype_expr_marker)
-            
-            # 使用 marker genes 对应的真实表达
-            st_marker_subset = st_adata[:, self.genes].X
-            true_expr = st_marker_subset.toarray() if hasattr(st_marker_subset, 'toarray') else st_marker_subset
-            print(f"   Using {len(self.genes)} marker genes for reconstruction quality")
+        # ✅ 重建质量评估应该只看 marker 基因（模型训练优化的目标）
+        # 不使用全基因集，因为：
+        # 1. GAT 模型训练时只优化 marker 基因的重建
+        # 2. Loss 函数（Pearson/MSE/Cosine）都是基于 marker 基因计算
+        # 3. 全基因重建只是用于生成完整表达矩阵，不代表模型真实性能
+        
+        celltype_expr_marker = self.celltype_expressions.cpu().numpy()
+        reconstructed_marker_expr = np.dot(deconv_weights, celltype_expr_marker)
+        
+        # 使用 marker genes 对应的真实表达
+        st_marker_subset = st_adata[:, self.genes].X
+        true_expr = st_marker_subset.toarray() if hasattr(st_marker_subset, 'toarray') else st_marker_subset
+        print(f"   Using {len(self.genes)} marker genes for reconstruction quality (consistent with training objective)")
         
         # Compute cosine similarity per spot (log-normalized space)
-        reconstructed_log = np.log1p(reconstructed_full_expr)
+        reconstructed_log = np.log1p(reconstructed_marker_expr)
         true_log = np.log1p(true_expr)
         
         cosine_similarities = []
@@ -784,88 +742,14 @@ class GATDeconvolution:
         # Plot reconstruction quality curve (sorted by similarity)
         self.plot_reconstruction_quality_curve(cosine_similarities, sample_name)
         
-        # Save results summary
-        # results = {
-        #     'deconv_weights': deconv_weights,
-        #     'attention_scores': attention_scores,
-        #     'clusters': list(self.label_encoder.classes_),
-        #     'sample_name': sample_name,
-        #     'marker_genes': self.genes,
-        #     'n_spots': n_spots,
-        #     'n_clusters': n_clusters
-        # }
-        
-        # results_file = f"{self.output_dir}/{sample_name}_deconvolution_results.npz"
-        # np.savez(results_file, **results)
-        # print(f"   Complete results saved: {results_file}")
-        
-        # ========== 额外保存 CSV 供 train.py 使用 ==========
-        print("\nSaving cluster expression data for train.py...")
-        
-        # 1. 保存 cluster 平均 marker 基因表达 CSV
-        cluster_list = list(self.label_encoder.classes_)
-        celltype_expr_marker = self.celltype_expressions.cpu().numpy()
-        
-        marker_expr_df = pd.DataFrame(
-            celltype_expr_marker,
-            columns=self.genes,
-            index=[f"Cluster_{i}" for i in cluster_list]
-        )
-        marker_expr_file = f"{self.output_dir}/{sample_name}_cluster_marker_expr.csv"
-        marker_expr_df.to_csv(marker_expr_file)
-        print(f"   ✅ Cluster marker gene expression: {marker_expr_file}")
-        
-        # 2. 保存 cluster 平均全基因表达 CSV
-        if self.celltype_expressions_full is not None and all(expr is not None for expr in self.celltype_expressions_full):
-            celltype_expr_full = np.array(self.celltype_expressions_full)
-            
-            # Get full gene names
-            if self.all_genes is not None:
-                all_gene_names = self.all_genes
-            else:
-                all_gene_names = [f"Gene_{i}" for i in range(celltype_expr_full.shape[1])]
-            
-            full_expr_df = pd.DataFrame(
-                celltype_expr_full,
-                columns=all_gene_names,
-                index=[f"Cluster_{i}" for i in cluster_list]
-            )
-            full_expr_file = f"{self.output_dir}/{sample_name}_cluster_full_expr.csv"
-            full_expr_df.to_csv(full_expr_file)
-            print(f"   ✅ Cluster full gene expression: {full_expr_file}")
-        
-        # 3. 保存 celltype-cluster 映射 TXT
-        if self.cluster_to_celltype is not None:
-            # Celltype mode: 直接从 cluster_to_celltype 映射保存
-            mapping_file = f"{self.output_dir}/{sample_name}_celltype_cluster_mapping.txt"
-            with open(mapping_file, 'w') as f:
-                f.write("cluster_id\tcelltype_name\n")
-                for cluster_id in cluster_list:
-                    celltype_name = self.cluster_to_celltype.get(cluster_id, f"Cluster_{cluster_id}")
-                    f.write(f"{cluster_id}\t{celltype_name}\n")
-            print(f"   ✅ Celltype-cluster mapping: {mapping_file}")
+        # Note: celltype-cluster mapping is now saved in Stage 1 NPZ file
+        # train.py should load it directly from the NPZ file
+        if self.cluster_to_celltype is None:
+            print("\n⚠️ Warning: Celltype mapping not found in Stage 1 NPZ file.")
+            print("   train.py may need to handle clusters without celltype names.")
         else:
-            # Auto-cluster mode: 从 checkpoint 加载映射
-            checkpoint_cluster_to_celltype = {}
-
-            sc_clustered_path = f"{os.path.dirname(self.stage1_model_path)}/sc_adata_clustered.h5ad"
-            
-            if os.path.exists(sc_clustered_path):
-                sc_clustered = sc.read_h5ad(sc_clustered_path)
-                if 'leiden' in sc_clustered.obs.columns and 'cell_type' in sc_clustered.obs.columns:
-                    for cluster_id in sorted(sc_clustered.obs['leiden'].unique()):
-                        cluster_mask = sc_clustered.obs['leiden'] == cluster_id
-                        celltype_counts = sc_clustered.obs[cluster_mask]['cell_type'].value_counts()
-                        major_celltype = celltype_counts.index[0]
-                        checkpoint_cluster_to_celltype[str(cluster_id)] = major_celltype
-            
-            mapping_file = f"{self.output_dir}/{sample_name}_celltype_cluster_mapping.txt"
-            with open(mapping_file, 'w') as f:
-                f.write("cluster_id\tcelltype_name\n")
-                for cluster_id in cluster_list:
-                    celltype_name = checkpoint_cluster_to_celltype.get(str(cluster_id), f"Cluster_{cluster_id}")
-                    f.write(f"{cluster_id}\t{celltype_name}\n")
-            print(f"   ✅ Celltype-cluster mapping: {mapping_file}")
+            print(f"\n✅ Celltype mapping available: {len(self.cluster_to_celltype)} clusters")
+            print("   train.py will load this mapping from Stage 1 NPZ file.")
     
     def plot_reconstruction_quality_curve(self, cosine_similarities, sample_name):
         """Plot reconstruction quality curve (sorted by cosine similarity)
@@ -941,96 +825,43 @@ class GATDeconvolution:
     def plot_training_curves(self, train_losses, pearson_losses, mse_losses, cos_losses, 
                            weight_regs, sparsity_regs, diversity_losses, hetero_losses, 
                            proportion_losses, sample_name):
-        """Plot training curves (diversity and hetero losses are now disabled, plotted as zeros)"""
-        fig, axes = plt.subplots(3, 3, figsize=(24, 18))
+        """Plot simplified training curves: 3 subplots in 1 figure"""
+        fig, axes = plt.subplots(1, 3, figsize=(18, 5))
         
         epochs = range(1, len(train_losses) + 1)
         
-        # Total loss
-        axes[0, 0].plot(epochs, train_losses, 'b-', linewidth=2)
-        axes[0, 0].set_title('Total Loss', fontsize=14, fontweight='bold')
-        axes[0, 0].set_xlabel('Epochs')
-        axes[0, 0].set_ylabel('Loss')
-        axes[0, 0].grid(True, alpha=0.3)
+        # 1. Total loss
+        axes[0].plot(epochs, train_losses, 'b-', linewidth=2.5)
+        axes[0].set_title('Total Loss', fontsize=14, fontweight='bold')
+        axes[0].set_xlabel('Epochs', fontsize=12)
+        axes[0].set_ylabel('Loss', fontsize=12)
+        axes[0].grid(True, alpha=0.3, linestyle='--')
         
-        # Reconstruction losses
-        axes[0, 1].plot(epochs, pearson_losses, 'orange', label='Pearson', linewidth=2)
-        axes[0, 1].plot(epochs, mse_losses, 'green', label='MSE', linewidth=2)
-        axes[0, 1].plot(epochs, cos_losses, 'red', label='Cosine', linewidth=2)
-        axes[0, 1].set_title('Reconstruction Losses', fontsize=14, fontweight='bold')
-        axes[0, 1].set_xlabel('Epochs')
-        axes[0, 1].set_ylabel('Loss')
-        axes[0, 1].legend()
-        axes[0, 1].grid(True, alpha=0.3)
+        # 2. Cosine + Pearson
+        axes[1].plot(epochs, cos_losses, 'red', label='Cosine', linewidth=2.5)
+        axes[1].plot(epochs, pearson_losses, 'orange', label='Pearson', linewidth=2.5)
+        axes[1].set_title('Cosine & Pearson Loss', fontsize=14, fontweight='bold')
+        axes[1].set_xlabel('Epochs', fontsize=12)
+        axes[1].set_ylabel('Loss', fontsize=12)
+        axes[1].legend(fontsize=11)
+        axes[1].grid(True, alpha=0.3, linestyle='--')
         
-        # Pearson loss
-        axes[0, 2].plot(epochs, pearson_losses, 'orange', linewidth=2)
-        axes[0, 2].set_title('Pearson Loss', fontsize=14, fontweight='bold')
-        axes[0, 2].set_xlabel('Epochs')
-        axes[0, 2].set_ylabel('Loss')
-        axes[0, 2].grid(True, alpha=0.3)
+        # 3. MSE loss
+        axes[2].plot(epochs, mse_losses, 'green', linewidth=2.5)
+        axes[2].set_title('MSE Loss', fontsize=14, fontweight='bold')
+        axes[2].set_xlabel('Epochs', fontsize=12)
+        axes[2].set_ylabel('Loss', fontsize=12)
+        axes[2].grid(True, alpha=0.3, linestyle='--')
         
-        # MSE loss
-        axes[1, 0].plot(epochs, mse_losses, 'green', linewidth=2)
-        axes[1, 0].set_title('MSE Loss', fontsize=14, fontweight='bold')
-        axes[1, 0].set_xlabel('Epochs')
-        axes[1, 0].set_ylabel('Loss')
-        axes[1, 0].grid(True, alpha=0.3)
-        
-        # Proportion loss (移到这个位置，替换原来的diversity和hetero)
-        axes[1, 1].plot(epochs, proportion_losses, 'olive', linewidth=2)
-        axes[1, 1].set_title('Proportion Loss', fontsize=14, fontweight='bold')
-        axes[1, 1].set_xlabel('Epochs')
-        axes[1, 1].set_ylabel('Loss')
-        axes[1, 1].grid(True, alpha=0.3)
-        
-        # Cosine loss
-        axes[1, 2].plot(epochs, cos_losses, 'red', linewidth=2)
-        axes[1, 2].set_title('Cosine Loss', fontsize=14, fontweight='bold')
-        axes[1, 2].set_xlabel('Epochs')
-        axes[1, 2].set_ylabel('Loss')
-        axes[1, 2].grid(True, alpha=0.3)
-        
-        # Weight regularization
-        axes[2, 0].plot(epochs, weight_regs, 'brown', linewidth=2)
-        axes[2, 0].set_title('Weight Regularization', fontsize=14, fontweight='bold')
-        axes[2, 0].set_xlabel('Epochs')
-        axes[2, 0].set_ylabel('Loss')
-        axes[2, 0].grid(True, alpha=0.3)
-        
-        # Sparsity regularization
-        axes[2, 1].plot(epochs, sparsity_regs, 'purple', linewidth=2)
-        axes[2, 1].set_title('Sparsity Regularization', fontsize=14, fontweight='bold')
-        axes[2, 1].set_xlabel('Epochs')
-        axes[2, 1].set_ylabel('Loss')
-        axes[2, 1].grid(True, alpha=0.3)
-        
-        # All regularizations comparison (移除diversity和hetero)
-        axes[2, 2].plot(epochs, weight_regs, 'brown', label='Weight', linewidth=2)
-        axes[2, 2].plot(epochs, sparsity_regs, 'purple', label='Sparsity', linewidth=2)
-        axes[2, 2].plot(epochs, proportion_losses, 'olive', label='Proportion', linewidth=2)
-        axes[2, 2].set_title('All Regularizations', fontsize=14, fontweight='bold')
-        axes[2, 2].set_xlabel('Epochs')
-        axes[2, 2].set_ylabel('Loss')
-        axes[2, 2].legend()
-        axes[2, 2].grid(True, alpha=0.3)
-        
-        plt.suptitle(f'GAT Deconvolution Training - {sample_name}', fontsize=16, fontweight='bold')
+        plt.suptitle(f'GAT Deconvolution Training - {sample_name}', fontsize=16, fontweight='bold', y=1.02)
         plt.tight_layout()
         plt.savefig(f"{self.output_dir}/gat_training_curves_{sample_name}.png", dpi=300, bbox_inches='tight')
-        # plt.show()
+        plt.close()
     
     def save_model(self, filepath: str):
-        """Save model"""
+        """Save model (weights only)"""
         torch.save({
-            'gat_state_dict': self.gat_model.state_dict(),
-            'celltype_prototypes': self.celltype_prototypes,
-            'celltype_expressions': self.celltype_expressions,
-            'celltype_expressions_full': getattr(self, 'celltype_expressions_full', None),
-            'label_encoder': self.label_encoder,
-            'marker_genes': self.marker_genes,
-            'genes': self.genes,
-            'stage1_model_path': self.stage1_model_path
+            'gat_state_dict': self.gat_model.state_dict()
         }, filepath)
 
 def main():

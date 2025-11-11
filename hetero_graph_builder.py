@@ -20,8 +20,16 @@ class GraphAugmentor:
         self.mask_node_rate = mask_node_rate
     
     def drop_edges(self, edge_index: np.ndarray, edge_attr: np.ndarray,
-                   rate: float = None) -> Tuple[np.ndarray, np.ndarray]:
-        """随机删除边"""
+                   rate: float = None, strategy: str = 'random') -> Tuple[np.ndarray, np.ndarray]:
+        """
+        删除边
+        
+        Args:
+            edge_index: [2, n_edges]
+            edge_attr: [n_edges] or [n_edges, d]
+            rate: 删除率
+            strategy: 'random' 随机删除, 'weak' 删除弱边（基于 edge_attr 的第一列）
+        """
         if rate is None:
             rate = self.drop_edge_rate
         
@@ -29,7 +37,27 @@ class GraphAugmentor:
             return edge_index, edge_attr
         
         n_edges = edge_index.shape[1]
-        mask = np.random.binomial(1, 1 - rate, n_edges).astype(bool)
+        
+        if strategy == 'random':
+            # 随机删除
+            mask = np.random.binomial(1, 1 - rate, n_edges).astype(bool)
+        elif strategy == 'weak':
+            # ✅ 删除弱边：基于 edge_attr 的值（假设第一列是边权重/得分）
+            if edge_attr is not None and edge_attr.size > 0:
+                # 提取边权重
+                if edge_attr.ndim == 1:
+                    edge_weights = edge_attr
+                else:
+                    edge_weights = edge_attr[:, 0]  # 取第一列作为权重
+                
+                # 计算阈值：删除最弱的 rate% 的边
+                threshold = np.percentile(edge_weights, rate * 100)
+                mask = edge_weights >= threshold
+            else:
+                # 如果没有边属性，回退到随机删除
+                mask = np.random.binomial(1, 1 - rate, n_edges).astype(bool)
+        else:
+            raise ValueError(f"Unknown strategy: {strategy}")
         
         edge_index_aug = edge_index[:, mask]
         edge_attr_aug = edge_attr[mask] if edge_attr is not None else None
@@ -45,17 +73,16 @@ class GraphAugmentor:
             edge_index_like: [2, E_like] 合并的spot-spot和spot-cell边
             edge_attr_like: [E_like] 对应的边属性
             edge_index_cc: [2, E_cc] cell-cell边
-            edge_attr_cc: [E_cc] 对应的边属性
+            edge_attr_cc: [E_cc, 2] 对应的边属性 [lr_score, lr_id]
         
         Returns:
             augmented_graph: 增强后的图数据
         """
-        # 由于我们无法轻易分离edge_index_like中的spot-spot和spot-cell边，
-        # 我们对所有"like"边使用相同的删除率
-        ei_like_aug, ea_like_aug = self.drop_edges(edge_index_like, edge_attr_like, 0.1)
+        # 相似度边：随机删除（这些边基于空间/表达相似度）
+        ei_like_aug, ea_like_aug = self.drop_edges(edge_index_like, edge_attr_like, 0.1, strategy='random')
         
-        # Celltype-Celltype边：随机删除
-        ei_cc_aug, ea_cc_aug = self.drop_edges(edge_index_cc, edge_attr_cc, 0.2)
+        # ✅ 通讯边：删除弱边（基于 LR 通讯得分）
+        ei_cc_aug, ea_cc_aug = self.drop_edges(edge_index_cc, edge_attr_cc, 0.2, strategy='weak')
         
         return {
             'edge_index_like': ei_like_aug,

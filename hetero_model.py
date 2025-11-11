@@ -112,17 +112,19 @@ class HeteroGATLayer(nn.Module):
         # 计算注意力权重（未归一化）
         attn_logits = (Q_dst * K_src).sum(dim=-1) / self.scaling_factor  # [n_edges, num_heads]
         
-        # 注意：不再进行softmax归一化，直接使用原始logits作为注意力得分
-        # 这样可以保留原始的重要性评分，而不受概率分布约束
+        # ✅ 使用sigmoid而不是softmax，保持注意力得分在[0,1]范围
+        # 不使用softmax的原因：
+        # 1. softmax会将注意力归一化为概率分布，限制了绝对重要性的表达
+        # 2. sigmoid允许每条边独立地表示其重要性，不受其他边影响
+        attn_weights = torch.sigmoid(attn_logits)  # [n_edges, num_heads]
         
-        # 聚合（使用未归一化的logits作为权重）
+        # 聚合（使用sigmoid后的权重）
         out = torch.zeros(n_nodes, self.num_heads, self.head_dim,
                          device=node_feat.device, dtype=node_feat.dtype)
         
         for i in range(n_edges):
             dst = dst_idx[i]
-            # 使用sigmoid将logits转换为0-1范围的权重，但保持相对重要性
-            weight = torch.sigmoid(attn_logits[i]).unsqueeze(-1)  # [num_heads, 1]
+            weight = attn_weights[i].unsqueeze(-1)  # [num_heads, 1]
             out[dst] += weight * V_src[i]  # [num_heads, head_dim]
         
         # 重塑
@@ -134,9 +136,9 @@ class HeteroGATLayer(nn.Module):
         
         # 返回注意力得分（如果需要）
         if return_attention:
-            # 返回未归一化的原始注意力logits [n_edges, num_heads]
-            # 这样可以保留完整的得分信息，用于后续的KL对齐
-            return out, attn_logits
+            # 返回sigmoid后的注意力权重 [n_edges, num_heads]
+            # 这些权重在[0,1]范围，可以直接用于替换LR通讯得分
+            return out, attn_weights
         else:
             return out, None
 
@@ -239,8 +241,19 @@ class HeteroSTModel(nn.Module):
             raise ValueError("必须提供预训练的VAE编码器 (vae_encoder)")
         self.vae_encoder = vae_encoder
         
-        # 异构GAT
-        self.gat = HeteroGAT(vae_latent_dim, gat_hidden_dims, gat_heads, gat_dropout)
+        # ✅ 分离的异构GAT - 处理不同类型的图
+        self.gat_spatial = HeteroGAT(vae_latent_dim, gat_hidden_dims, gat_heads, gat_dropout)  # 空间相似度图
+        self.gat_comm = HeteroGAT(vae_latent_dim, gat_hidden_dims, gat_heads, gat_dropout)     # 通讯图
+        
+        # ✅ 备用投影层：当没有边时，将 VAE latent 投影到 GAT 输出维度
+        self.fallback_proj = nn.Linear(vae_latent_dim, gat_hidden_dims[-1])
+        
+        # ✅ 融合层：融合空间表示和通讯表示
+        self.fusion_layer = nn.Sequential(
+            nn.Linear(gat_hidden_dims[-1] * 2, gat_hidden_dims[-1]),
+            nn.ReLU(),
+            nn.Dropout(gat_dropout)
+        )
         
         # 输出层
         self.output_proj = nn.Linear(gat_hidden_dims[-1], output_dim)
@@ -250,6 +263,15 @@ class HeteroSTModel(nn.Module):
             nn.Linear(output_dim, output_dim),
             nn.ReLU(),
             nn.Linear(output_dim, output_dim)
+        )
+        
+        # ✅ 通讯强度预测头
+        self.comm_predictor = nn.Sequential(
+            nn.Linear(gat_hidden_dims[-1] * 2, gat_hidden_dims[-1]),
+            nn.ReLU(),
+            nn.Dropout(gat_dropout),
+            nn.Linear(gat_hidden_dims[-1], 1),
+            nn.Sigmoid()  # 输出 [0, 1] 表示通讯强度
         )
         
         # 可学习的相似度边权重调节因子
@@ -319,21 +341,22 @@ class HeteroSTModel(nn.Module):
         else:
             edge_attr_like_regulated = edge_attr_like
         
-        # GAT编码 - 相似度边
+        # ✅ 分离的GAT处理 - 空间相似度边
         if edge_index_like.size(1) > 0:
-            like_repr, _ = self.gat(all_feat, edge_index_like, edge_attr_like_regulated, return_attention=False)
+            spatial_repr, _ = self.gat_spatial(all_feat, edge_index_like, edge_attr_like_regulated, return_attention=False)
         else:
-            like_repr = all_feat
+            spatial_repr = self.fallback_proj(all_feat)
         
-        # Celltype-Celltype通讯（主要关注）
+        # ✅ 分离的GAT处理 - 通讯边
         if edge_index_cc.size(1) > 0:
-            cc_repr, cc_attention = self.gat(all_feat, edge_index_cc, edge_attr_cc, return_attention=return_attention)
+            comm_repr, cc_attention = self.gat_comm(all_feat, edge_index_cc, edge_attr_cc, return_attention=return_attention)
         else:
-            cc_repr = all_feat
+            comm_repr = self.fallback_proj(all_feat)
             cc_attention = None
         
-        # 加权组合：Cell-Cell边权重更大
-        combined = 0.4 * like_repr + 0.6 * cc_repr
+        # ✅ 融合空间表示和通讯表示
+        combined_feat = torch.cat([spatial_repr, comm_repr], dim=-1)  # [n_nodes, hidden_dim*2]
+        combined = self.fusion_layer(combined_feat)  # [n_nodes, hidden_dim]
         
         # 输出投影
         repr_out = self.output_proj(combined)  # [n_spots+n_cells_total, output_dim]
@@ -345,7 +368,17 @@ class HeteroSTModel(nn.Module):
         # 对比学习投影
         spot_proj = self.projection_head(spot_repr_out)  # [n_spots, output_dim]
         
+        # ✅ 预测通讯强度（如果有通讯边）
+        predicted_comm_strength = None
+        if edge_index_cc.size(1) > 0 and return_attention:
+            src_idx, dst_idx = edge_index_cc
+            src_repr = comm_repr[src_idx]  # [n_edges_cc, hidden_dim]
+            dst_repr = comm_repr[dst_idx]  # [n_edges_cc, hidden_dim]
+            
+            edge_repr = torch.cat([src_repr, dst_repr], dim=-1)  # [n_edges_cc, hidden_dim*2]
+            predicted_comm_strength = self.comm_predictor(edge_repr).squeeze(-1)  # [n_edges_cc]
+        
         if return_attention:
-            return spot_repr_out, cell_repr_out, combined, spot_proj, cc_attention
+            return spot_repr_out, cell_repr_out, combined, spot_proj, cc_attention, predicted_comm_strength
         else:
-            return spot_repr_out, cell_repr_out, combined, spot_proj, None
+            return spot_repr_out, cell_repr_out, combined, spot_proj, None, None

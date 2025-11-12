@@ -4,53 +4,6 @@ import numpy as np
 from typing import Tuple, Optional
 import math
 
-
-class SimpleViTEncoder(nn.Module):
-    """简化的Vision Transformer编码器"""
-    
-    def __init__(self, img_size: int = 224, patch_size: int = 16, 
-                 in_channels: int = 3, hidden_dim: int = 256, num_layers: int = 4):
-        super().__init__()
-        
-        self.img_size = img_size
-        self.patch_size = patch_size
-        self.hidden_dim = hidden_dim
-        
-        # Patch embedding
-        num_patches = (img_size // patch_size) ** 2
-        patch_dim = in_channels * patch_size * patch_size
-        
-        self.patch_embed = nn.Linear(patch_dim, hidden_dim)
-        self.pos_embed = nn.Parameter(torch.randn(1, num_patches, hidden_dim))
-        
-        # Transformer blocks
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=hidden_dim, nhead=8, dim_feedforward=hidden_dim*4,
-            dropout=0.1, batch_first=True
-        )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-    
-    def forward(self, x):
-        B, C, H, W = x.shape
-        
-        # Patch embedding
-        x = x.reshape(B, C, H // self.patch_size, self.patch_size, 
-                     W // self.patch_size, self.patch_size)
-        x = x.permute(0, 2, 4, 1, 3, 5).contiguous()
-        x = x.reshape(B, -1, C * self.patch_size * self.patch_size)
-        
-        x = self.patch_embed(x)  # [B, num_patches, hidden_dim]
-        x = x + self.pos_embed
-        
-        # Transformer
-        x = self.transformer(x)
-        
-        # 使用平均池化作为全局特征
-        x = x.mean(dim=1)  # [B, hidden_dim]
-        
-        return x
-
-
 class HeteroGATLayer(nn.Module):
     """异构图注意力层"""
     

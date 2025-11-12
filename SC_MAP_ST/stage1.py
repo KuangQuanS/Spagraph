@@ -389,16 +389,12 @@ class coEncoder:
         if isinstance(self.cluster_expressions, dict):
             cluster_ids_sorted = sorted(self.cluster_expressions.keys())
             expressions_array = np.stack([self.cluster_expressions[cid] for cid in cluster_ids_sorted], axis=0)
-        else:
-            expressions_array = self.cluster_expressions
-        
+
         # Convert cluster_expressions_full_count dict to list of arrays
         if isinstance(self.cluster_expressions_full_count, dict):
             cluster_ids_sorted = sorted(self.cluster_expressions_full_count.keys())
             expressions_full_list = [self.cluster_expressions_full_count[cid] for cid in cluster_ids_sorted]
-        else:
-            expressions_full_list = self.cluster_expressions_full_count
-        
+  
         # Prepare celltype mapping as structured array if available
         if self.cluster_to_celltype is not None:
             celltype_mapping = np.array(

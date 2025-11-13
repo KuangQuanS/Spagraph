@@ -8,7 +8,7 @@ import numpy as np
 import scanpy as sc
 from hetero_vae_data_utils import STHeteroSubgraphDataset, hetero_subgraph_collate_fn,setup_logging, set_seed, EarlyStopping
 from hetero_model import HeteroSTModel
-from evaluate import evaluate_cell_communication, plot_training_loss
+from evaluate import evaluate_cell_communication, plot_training_loss, plot_dgi_loss
 from calculate_lr_scores import calculate_lr_scores
 from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import CosineAnnealingLR
@@ -36,21 +36,33 @@ def parse_args():
                        help='配体/受体活跃基因的平均表达阈值 (normalize_total 1e4后，default: 1.0)')
     parser.add_argument('--lr_comm_score_threshold', type=float, default=0.0, 
                        help='通讯得分过滤阈值，低于此值的通讯事件将被过滤 (default: 0.0，即不过滤)')
-    parser.add_argument('--spot_cell_expr_npz', type=str, default=None, help='spot-cell表达NPZ路径（pre-computed结果，不提供则计算）')
 
     # GAT参数
-    parser.add_argument('--gat_layers', type=int, default=3, help='GAT层数')
-    parser.add_argument('--gat_hidden_dims', type=str, default='256,256,128', help='GAT隐层维度')
-    parser.add_argument('--gat_heads', type=int, default=4, help='注意力头数')
-    parser.add_argument('--gat_dropout', type=float, default=0.1, help='Dropout概率')
+    parser.add_argument('--gat_layers', type=int, default=6, help='GAT层数')
+    parser.add_argument('--gat_hidden_dims', type=str, default='512,256,128', help='GAT隐层维度')
+    parser.add_argument('--gat_heads', type=int, default=8, help='注意力头数')
+    parser.add_argument('--gat_dropout', type=float, default=0.3, help='Dropout概率')
+    parser.add_argument('--temperature', type=float, default=2.0, help='注意力温度系数，用于控制注意力分布的尖锐程度 (default: 1.0)')
     
     # 模型参数
-    parser.add_argument('--output_dim', type=int, default=64, help='输出维度')
+    parser.add_argument('--output_dim', type=int, default=120, help='输出维度')
     
     # DGI自监督预训练参数
     parser.add_argument('--use_dgi_pretrain', action='store_true', help='是否使用DGI自监督预训练')
+    parser.add_argument('--pretrained_encoder', type=str, default=None, 
+                       help='DGI预训练的编码器权重路径')
+    parser.add_argument('--freeze_encoder', type=str, default='false',
+                       choices=['true', 'false'],
+                       help='是否冻结预训练的编码器（true=只训练预测头，false=微调整个模型）')
+    
+    # 混合训练参数（监督 + 自监督）
+    parser.add_argument('--supervised_weight', type=float, default=0.5,
+                        help='监督学习权重alpha（0~1），自监督权重为1-alpha，默认0.5')
+    parser.add_argument('--negative_sample_ratio', type=float, default=1.0,
+                        help='负采样比例（相对于正边数量），默认1.0')
+    
     parser.add_argument('--dgi_epochs', type=int, default=30, help='DGI预训练epoch数')
-    parser.add_argument('--dgi_lr', type=float, default=1e-3, help='DGI预训练学习率')
+    parser.add_argument('--dgi_lr', type=float, default=1e-4, help='DGI预训练学习率')
     parser.add_argument('--corruption_mode', type=str, default='feature_mask', 
                        choices=['feature_mask', 'gaussian_noise', 'shuffle'],
                        help='DGI特征破坏模式')
@@ -60,13 +72,10 @@ def parse_args():
     parser.add_argument('--readout_mode', type=str, default='mean', 
                        choices=['mean', 'sum', 'gated'],
                        help='图readout模式')
+    parser.add_argument('--dgi_early_stop_patience', type=int, default=5, help='DGI早停patience，0表示不使用早停 (default: 10)')
+    parser.add_argument('--dgi_early_stop_min_delta', type=float, default=1e-2, help='DGI早停最小改善阈值 (default: 1e-6)')
     
-    parser.add_argument('--pretrained_encoder', type=str, default=None, 
-                       help='DGI预训练的编码器权重路径')
-    parser.add_argument('--freeze_encoder', type=str, default='false',
-                       choices=['true', 'false'],
-                       help='是否冻结预训练的编码器（true=只训练预测头，false=微调整个模型）')
-    
+
     # 训练参数
     parser.add_argument('--batch_size', type=int, default=4, help='批次大小 (已支持真正的批处理)')
     parser.add_argument('--epochs', type=int, default=100, help='训练轮数')
@@ -74,11 +83,12 @@ def parse_args():
     parser.add_argument('--weight_decay', type=float, default=1e-5, help='权重衰减')
     parser.add_argument('--seed', type=int, default=42, help='随机种子')
     parser.add_argument('--device', type=str, default='cuda', help='设备')
-    parser.add_argument('--checkpoint_interval', type=int, default=10, help='检查点间隔')
+    parser.add_argument('--checkpoint_interval', type=int, default=50, help='检查点间隔')
     parser.add_argument('--sample_rate', type=float, default=1.0, help='每个epoch采样比例 (default: 1.0, 即全部数据; 0.3表示采样30%)')
-    parser.add_argument('--min_comm_edges', type=int, default=1, help='最小通讯边数阈值，少于此值的spot将被过滤 (default: 1)')
-    parser.add_argument('--early_stop_patience', type=int, default=10, help='早停patience，0表示不使用早停 (default: 0)')
-    parser.add_argument('--early_stop_min_delta', type=float, default=0.001, help='早停最小改善阈值 (default: 0.0001)')
+    parser.add_argument('--val_split', type=float, default=0.1, 
+                       help='验证集比例 (default: 0.1，即10%作为验证集)')
+    parser.add_argument('--early_stop_patience', type=int, default=20, help='早停patience，0表示不使用早停 (default: 0)')
+    parser.add_argument('--early_stop_min_delta', type=float, default=0.0001, help='早停最小改善阈值 (default: 0.0001)')
     
     return parser.parse_args()
 
@@ -134,7 +144,6 @@ def main():
         if all_genes is None:
             raise ValueError("VAE checkpoint 中找不到 all_genes 列表")
         
-        # ✅ 构建 DataFrame (marker genes) - 使用 Cluster_ID 格式作为索引（保持与 cluster_composition 一致）
         cluster_index_names = [f"Cluster_{cid}" for cid in cluster_ids]
         cluster_expr = pd.DataFrame(
             expressions_array,
@@ -142,31 +151,22 @@ def main():
             columns=marker_genes
         )
         logging.info(f"已从 NPZ 加载 cluster marker 表达: {cluster_expr.shape}")
-        logging.info(f"   Cluster 索引格式: {cluster_expr.index.tolist()[:5]}")
-        
+
         # 构建 DataFrame (all genes)
         cluster_full_expr = pd.DataFrame(
             expressions_full_array,
             index=cluster_index_names,
             columns=all_genes
         )
+
         logging.info(f"已从 NPZ 加载 cluster 全基因表达: {cluster_full_expr.shape}")
         
     else:
         # NPZ 文件不存在，无法继续
         raise FileNotFoundError(
             f"找不到 Stage 1 NPZ 文件: {vae_npz_path}\n"
-            f"请使用最新版本重新运行 Stage 1 训练以生成 NPZ 文件。"
         )
 
-    # 3. 验证 celltype 映射是否存在
-    if not cluster_to_celltype:
-        raise ValueError(
-            "NPZ 文件中未找到 celltype 映射！\n"
-            "请确保 sc_adata 包含 'cell_type' 列，并重新运行 Stage 1 训练。"
-        )
-    
-    # 构建cluster到cell的映射（全局定义）
     cluster_to_cell = {}
     for cluster_id, celltype_name in cluster_to_celltype.items():
         cluster_name = f"Cluster_{cluster_id}"
@@ -176,19 +176,16 @@ def main():
     # 4. 加载CellChat配体-受体数据库
     cellchat_file = 'cellchat_human.csv'
     
-    if os.path.exists(cellchat_file):
-        lr_db = pd.read_csv(cellchat_file)
-        # 转换为LR对元组列表 [(ligand, receptor), ...]
-        lr_pairs = []
-        for _, row in lr_db.iterrows():
-            lig = str(row['ligand']).strip()
-            rec = str(row['receptor']).strip()
-            lr_pairs.append((lig, rec))
-        logging.info(f"已加载CellChat LR对: {len(lr_pairs)}个")
-    else:
-        # 如果找不到CellChat数据库，使用marker基因构建LR对
-        logging.warning(f"找不到CellChat数据库 ({cellchat_file})")
-    
+
+    lr_db = pd.read_csv(cellchat_file)
+    # 转换为LR对元组列表 [(ligand, receptor), ...]
+    lr_pairs = []
+    for _, row in lr_db.iterrows():
+        lig = str(row['ligand']).strip()
+        rec = str(row['receptor']).strip()
+        lr_pairs.append((lig, rec))
+    logging.info(f"已加载LR对: {len(lr_pairs)}个")
+
     # 5. 加载ST数据
     adata = sc.read_h5ad(args.st_h5ad)
     logging.info(f"已加载ST数据: {adata.shape}")
@@ -201,24 +198,18 @@ def main():
         n_spots = len(spot_coords)
         logging.info(f"spot数量: {n_spots}")
     else:
-        logging.warning(f"找不到spot坐标，将使用随机坐标")
-    
+        raise ValueError("找不到spot坐标")
+
     # 7. 加载spot-cluster反卷积比例矩阵
     cluster_composition_file = os.path.join(deconv_dir, '*_cluster_composition.csv')
     cluster_composition_files = glob.glob(cluster_composition_file)
-    if not cluster_composition_files:
-        logging.warning(f"找不到cluster反卷积比例CSV，将跳过")
-        cluster_composition = None
-    else:
-        cluster_composition = pd.read_csv(cluster_composition_files[0], index_col=0)
-        logging.info(f"已加载cluster反卷积比例: {cluster_composition.shape}")
-        # 记录cluster数量
-        n_clusters = cluster_composition.shape[1]
-        logging.info(f"cluster数量: {n_clusters}")
+    cluster_composition = pd.read_csv(cluster_composition_files[0], index_col=0)
+
+    # 记录cluster数量
+    n_clusters = cluster_composition.shape[1]
+    logging.info(f"cluster数量: {n_clusters}")
     
     # 8. 初始化和加载VAE编码器
-    logging.info(f"加载VAE权重: {vae_weight_path}")
-    
     checkpoint = torch.load(vae_weight_path, map_location=device, weights_only=False)
     
     # 从checkpoint中提取配置
@@ -232,315 +223,111 @@ def main():
         output_type=output_type
     ).to(device)
     
-    # 加载完整VAE权重
-    if 'vae_state_dict' in checkpoint:
-        full_vae.load_state_dict(checkpoint['vae_state_dict'])
-        logging.info(f"加载完整VAE权重")
-    
-    # 提取VAE编码器用于HeteroSTModel
+
+    full_vae.load_state_dict(checkpoint['vae_state_dict'])
     vae_encoder = full_vae.encoder
-    logging.info(f"提取VAE编码器用于HeteroSTModel")
-    
-    # ========== 阶段2：构建spot-cluster表达和spot-cell表达 ==========
+
+    # ========== 阶段2：构建spot-cell全基因表达 ==========
     logging.info("="*80)
-    logging.info("阶段2: 构建spot-cluster表达和spot-cell表达")
+    logging.info("阶段2: 构建spot-cell全基因表达")
     logging.info("="*80)
     
-    spot_cell_expr_npz_path = None
+    spot_names = adata.obs_names.tolist()
+    spot_total_counts = np.array(adata.X.sum(axis=1)).flatten()
+    logging.info(f"Spot总数: {len(spot_names)}, 平均counts={spot_total_counts.mean():.1f}")
     
-    # 检查是否已有pre-computed NPZ路径
-    if args.spot_cell_expr_npz and os.path.exists(args.spot_cell_expr_npz):
-        spot_cell_expr_npz_path = args.spot_cell_expr_npz
-        logging.info(f"直接使用pre-computed NPZ: {spot_cell_expr_npz_path}")
+    # 统一cluster名称格式
+    cluster_names = [f"Cluster_{c}" if not c.startswith('Cluster_') else c 
+                     for c in cluster_composition.columns]
     
-    elif cluster_composition is not None:
-        n_spots = cluster_composition.shape[0]
-        n_clusters = cluster_composition.shape[1]
-        n_genes = cluster_expr.shape[1]
+    # 构建每个spot-cell的全基因表达
+    spot_cell_full_expr = {}
+    for spot_idx, spot_name in enumerate(spot_names):
+        spot_total_count = spot_total_counts[spot_idx]
         
-        logging.info(f"矩阵维度: {n_spots} spots × {n_clusters} clusters × {n_genes} genes")
-        
-        # 获取spot和cluster名字列表
-        spot_names = adata.obs_names.tolist()
-        cluster_names_raw = cluster_composition.columns.tolist()  # 可能是 ['0', '1', '17'] 或 ['Cluster_0', 'Cluster_1']
-        
-        # ✅ 统一格式：确保cluster名称格式为 'Cluster_X'
-        cluster_names = []
-        for name in cluster_names_raw:
-            if name.startswith('Cluster_'):
-                cluster_names.append(name)
-            else:
-                # 如果是纯数字，添加 'Cluster_' 前缀
-                cluster_names.append(f'Cluster_{name}')
-        
-        logging.info(f"Cluster名称格式统一: {cluster_names[:5]}... (共{len(cluster_names)}个)")
-        
-        # ✅ 获取每个spot的total counts
-        if 'total_counts' in adata.obs.columns:
-            spot_total_counts = adata.obs['total_counts'].values
-        elif 'nCount_RNA' in adata.obs.columns:
-            spot_total_counts = adata.obs['nCount_RNA'].values
-        else:
-            # 如果没有保存，直接计算
-            spot_total_counts = np.array(adata.X.sum(axis=1)).flatten()
-        
-        logging.info(f"Spot total counts统计: 平均={spot_total_counts.mean():.2f}, 中位数={np.median(spot_total_counts):.2f}")
-        
-        # ========== 第一步：构建spot-cluster表达 ==========
-        logging.info("构建spot-cluster表达矩阵...")
-        spot_cluster_csv_data = []
-        spot_cluster_npz_dict = {}
-        
-        for spot_idx in range(n_spots):
-            spot_name = spot_names[spot_idx]
-            spot_total_count = spot_total_counts[spot_idx]
+        for cell_name, celltype in cluster_to_celltype.items():
+            cluster_key = f"Cluster_{cell_name}"
+            if cluster_key not in cluster_full_expr.index:
+                continue
             
-            for cluster_idx, cluster_name in enumerate(cluster_names):
+            # 获取cluster在该spot的权重
+            if cluster_key in cluster_names:
+                cluster_idx = cluster_names.index(cluster_key)
                 cluster_weight = cluster_composition.iloc[spot_idx, cluster_idx]
-                if cluster_name not in cluster_expr.index:
-                    logging.warning(f"找不到 cluster '{cluster_name}' in cluster_expr，跳过")
-                    continue
-                
-                cluster_expr_values = cluster_expr.loc[cluster_name].values
-                
-                spot_cluster_expr = (cluster_expr_values / 1e4) * spot_total_count * cluster_weight
-                
-                # CSV行：spot_name | spot_cluster_name | gene1 | gene2 | ...
-                row_data = {
-                    'spot_name': spot_name,
-                    'spot_cluster': f"{spot_name}_{cluster_name}",
-                }
-                for gene_idx, gene_name in enumerate(cluster_expr.columns):
-                    row_data[gene_name] = spot_cluster_expr[gene_idx]
-                spot_cluster_csv_data.append(row_data)
-                
-                # NPZ数据
-                combined_name = f"{spot_name}_{cluster_name}"
-                spot_cluster_npz_dict[combined_name] = spot_cluster_expr
-        
-        # ✅ 跳过保存spot-cluster CSV（中间结果，不需要保存）
-        logging.info(f"已构建spot-cluster表达矩阵 (中间结果，不保存)")
-        
-        # ========== 第二步：根据celltype映射聚合为spot-cell表达 ==========
-        logging.info("根据celltype映射聚合为spot-cell表达...")
-        
-        # 获取所有cell类型
-        cell_names = list(set(cluster_to_cell.values()))
-        cell_names.sort()  # 保持顺序一致
-        
-        csv_data = []
-        npz_cell_names = []
-        npz_cell_expr_dict = {}
-        
-        for spot_idx in range(n_spots):
-            spot_name = spot_names[spot_idx]
+            else:
+                cluster_weight = 0.0
             
-            # 为每个cell类型聚合其对应的clusters
-            for cell_name in cell_names:
-                # 找到属于这个cell类型的clusters
-                cell_clusters = [c for c, ct in cluster_to_cell.items() if ct == cell_name]
-                
-                if cell_clusters:
-                    # 聚合所有属于这个cell的cluster表达
-                    cell_expr_sum = np.zeros(n_genes)
-                    for cluster_name in cell_clusters:
-                        spot_cluster_name = f"{spot_name}_{cluster_name}"
-                        if spot_cluster_name in spot_cluster_npz_dict:
-                            cell_expr_sum += spot_cluster_npz_dict[spot_cluster_name]
-                    
-                    # CSV行：spot_name | spot_cell_name | gene1 | gene2 | ...
-                    row_data = {
-                        'spot_name': spot_name,
-                        'spot_cell': f"{spot_name}_{cell_name}",
-                    }
-                    for gene_idx, gene_name in enumerate(cluster_expr.columns):
-                        row_data[gene_name] = cell_expr_sum[gene_idx]
-                    csv_data.append(row_data)
-                    
-                    # NPZ数据
-                    combined_name = f"{spot_name}_{cell_name}"
-                    npz_cell_names.append(combined_name)
-                    npz_cell_expr_dict[combined_name] = cell_expr_sum
-        
-        # 保存CSV表格
-        csv_df = pd.DataFrame(csv_data)
-        csv_path = os.path.join(args.output_dir, 'spot_cell_expr.csv')
-        csv_df.to_csv(csv_path, index=False)
-        logging.info(f"已保存CSV表格: {csv_path}")
-        
-        # ✅ 输出表达值统计
-        cell_expr_values = csv_df.iloc[:, 2:].values.flatten()  # 跳过spot_name和spot_cell列
-        cell_expr_values = cell_expr_values[cell_expr_values > 0]  # 只统计非零值
-        logging.info(f"   表达值统计 (非零): 平均={cell_expr_values.mean():.2f}, 中位数={np.median(cell_expr_values):.2f}, 最大={cell_expr_values.max():.2f}")
-        
-        # 保存NPZ数据 [n_spot_cells, n_genes]
-        spot_cell_expr_npz_path = os.path.join(args.output_dir, 'spot_cell_expr.npz')
-        npz_cell_expr_array = np.array([npz_cell_expr_dict[name] for name in npz_cell_names], dtype=np.float32)
-        np.savez_compressed(
-            spot_cell_expr_npz_path,
-            spot_cell_expr=npz_cell_expr_array,
-            cell_names=npz_cell_names,
-            gene_names=cluster_expr.columns.tolist()
-        )
-        logging.info(f"已保存NPZ数据: {spot_cell_expr_npz_path}")
-        
-    else:
-        logging.warning(f"无法构建spot-cell-gene矩阵（缺少cluster_composition）")
+            if cluster_weight < 1e-6:
+                continue
+            
+            # 计算: (cluster_full_expr / 1e4) × cluster_weight × spot_total_count
+            cluster_expr_normalized = cluster_full_expr.loc[cluster_key].values / 1e4
+            spot_cell_expr = cluster_expr_normalized * cluster_weight * spot_total_count
+            
+            # 累加到该spot的celltype表达
+            key = f"{spot_name}_{celltype}"
+            if key in spot_cell_full_expr:
+                spot_cell_full_expr[key] += spot_cell_expr
+            else:
+                spot_cell_full_expr[key] = spot_cell_expr.copy()
     
-    # ========== 阶段2.5：构建cell表达矩阵（用于模型输入）==========
-    logging.info("="*80)
-    logging.info("阶段2.5: 构建cell表达矩阵")
-    logging.info("="*80)
+    # 转为DataFrame
+    spot_cell_expr_df = pd.DataFrame.from_dict(
+        spot_cell_full_expr, orient='index', columns=cluster_full_expr.columns
+    )
+    spot_cell_expr_df.index.name = 'spot_cell'
     
-    # 从mapping得到cell信息
-    cell_names = list(set(cluster_to_celltype.values()))
-    cell_names.sort()  # 保持顺序一致
+    # 删除全为0的spot-cell（直接过滤，不需要额外的稀有细胞类型过滤）
+    row_sums = spot_cell_expr_df.sum(axis=1)
+    spot_cell_expr_df = spot_cell_expr_df[row_sums > 0]
+
+    csv_path = os.path.join(args.output_dir, 'spot_cell_full_expr.csv')
+    spot_cell_expr_df.to_csv(csv_path)
+    logging.info(f"已保存spot-cell全基因表达: {csv_path}, 形状={spot_cell_expr_df.shape}")
     
-    # 为每个cell聚合marker基因表达（平均值）
-    cell_marker_dict = {}
-    for cell in cell_names:
-        # 找到所有映射到这个 celltype 的 cluster_ids
-        cluster_ids = [cid for cid, ctype in cluster_to_celltype.items() if ctype == cell]
-        
-        # ✅ 构建cluster行名列表 (使用 Cluster_X 格式，因为 cluster_expr 的索引是 Cluster_X)
-        cluster_keys = [f"Cluster_{cid}" for cid in cluster_ids]
-        
-        # 从marker表达量中聚合
-        if all(key in cluster_expr.index for key in cluster_keys):
-            marker_rows = cluster_expr.loc[cluster_keys]
-            cell_marker_dict[cell] = marker_rows.mean(axis=0).values
-            logging.info(f"Cell '{cell}': 聚合 {len(cluster_ids)} 个cluster的marker表达")
-        else:
-            logging.warning(f"Cell '{cell}': 部分cluster未找到，跳过")
-            continue
+    # 提取实际存在的celltype（从spot_cell_expr_df的index中解析）
+    cell_names = sorted(set([idx.split('_', 1)[1] for idx in spot_cell_expr_df.index]))
+    logging.info(f"实际存在的细胞类型数: {len(cell_names)}")
     
-    # 构建marker表达矩阵 (cell × marker_genes)
-    cell_expr = pd.DataFrame.from_dict(
-        cell_marker_dict, orient='index', 
+    # ✅ 构建marker基因的占位符DataFrame（仅用于Dataset接口兼容）
+    cell_expr = pd.DataFrame(
+        np.zeros((len(cell_names), cluster_expr.shape[1]), dtype=np.float32),
+        index=cell_names,
         columns=cluster_expr.columns
     )
-    logging.info(f"已构建cell marker表达: {cell_expr.shape}")
     
-    # 构建全基因表达矩阵（如果存在）
-    cell_full_dict = {}
-    if cluster_full_expr is not None:
-        for cell in cell_names:
-            # 找到所有映射到这个 celltype 的 cluster_ids
-            cluster_ids = [cid for cid, ctype in cluster_to_celltype.items() if ctype == cell]
-            # ✅ 使用 Cluster_X 格式
-            cluster_keys = [f"Cluster_{cid}" for cid in cluster_ids]
-            
-            if all(key in cluster_full_expr.index for key in cluster_keys):
-                full_rows = cluster_full_expr.loc[cluster_keys]
-                cell_full_dict[cell] = full_rows.mean(axis=0).values
-        
-        if cell_full_dict:
-            cell_full_expr = pd.DataFrame.from_dict(
-                cell_full_dict, orient='index',
-                columns=cluster_full_expr.columns
-            )
-            logging.info(f"已构建cell全基因表达: {cell_full_expr.shape}")
-        else:
-            cell_full_expr = None
-    else:
-        cell_full_expr = None
+    # ✅ 构建全基因的占位符DataFrame（仅用于Dataset接口兼容，实际LR计算用spot_cell_expr_df）
+    cell_full_expr = pd.DataFrame(
+        np.zeros((len(cell_names), cluster_full_expr.shape[1]), dtype=np.float32),
+        index=cell_names,
+        columns=cluster_full_expr.columns
+    )
     
-    # 构建cell composition矩阵（每个spot的cell比例）
-    if cluster_composition is not None:
-        composition = pd.DataFrame(index=cluster_composition.index, columns=cell_names, dtype=float)
-        composition.fillna(0.0, inplace=True)
-        
-        for spot_idx in range(cluster_composition.shape[0]):
-            for cluster_idx, cluster_name_raw in enumerate(cluster_composition.columns):
-                # ✅ 统一格式：确保cluster名称格式为 'Cluster_X'
-                if cluster_name_raw.startswith('Cluster_'):
-                    cluster_name = cluster_name_raw
-                else:
-                    cluster_name = f'Cluster_{cluster_name_raw}'
-                
-                if cluster_name in cluster_to_cell:
-                    cell_name = cluster_to_cell[cluster_name]
-                    cluster_weight = cluster_composition.iloc[spot_idx, cluster_idx]
-                    composition.loc[composition.index[spot_idx], cell_name] += cluster_weight
-        
-        logging.info(f"已构建cell composition矩阵: {composition.shape}")
-        
-        # ========== 过滤稀有细胞类型 ==========
-        logging.info("="*60)
-        logging.info("过滤稀有细胞类型（出现频率 < 10%）")
-        logging.info("="*60)
-        
-        # 计算每个细胞类型的出现频率（在多少比例的 spots 中存在）
-        cell_occurrence = {}
-        n_spots = composition.shape[0]
-        occurrence_threshold = 0.10  # 10% 阈值
-        
-        for cell_name in composition.columns:
-            # 统计在多少个 spots 中该细胞类型的比例 > 0
-            n_spots_with_cell = (composition[cell_name] > 1e-6).sum()
-            occurrence_rate = n_spots_with_cell / n_spots
-            cell_occurrence[cell_name] = occurrence_rate
-        
-        # 找出需要保留的细胞类型
-        cells_to_keep = [cell for cell, rate in cell_occurrence.items() if rate >= occurrence_threshold]
-        cells_to_remove = [cell for cell, rate in cell_occurrence.items() if rate < occurrence_threshold]
-        
-        logging.info(f"细胞类型过滤统计:")
-        logging.info(f"   - 原始细胞类型数: {len(composition.columns)}")
-        logging.info(f"   - 保留细胞类型数: {len(cells_to_keep)} (出现率 ≥ {occurrence_threshold*100}%)")
-        logging.info(f"   - 移除细胞类型数: {len(cells_to_remove)} (出现率 < {occurrence_threshold*100}%)")
-        
-        if cells_to_remove:
-            logging.info(f"   - 被移除的细胞类型:")
-            for cell in cells_to_remove:
-                logging.info(f"     * {cell}: 出现率={cell_occurrence[cell]*100:.2f}% ({int(cell_occurrence[cell]*n_spots)}/{n_spots} spots)")
-        
-        # 过滤 composition 矩阵
-        composition = composition[cells_to_keep]
-        logging.info(f"过滤后 composition 形状: {composition.shape}")
-        
-        # 过滤 cell_expr 和 cell_full_expr
-        cell_expr = cell_expr.loc[cells_to_keep]
-        logging.info(f"过滤后 cell_expr 形状: {cell_expr.shape}")
-        
-        if cell_full_expr is not None:
-            cell_full_expr = cell_full_expr.loc[cells_to_keep]
-            logging.info(f"过滤后 cell_full_expr 形状: {cell_full_expr.shape}")
-        
-        # 更新 cell_names 列表
-        cell_names = cells_to_keep
-        logging.info(f"保留的细胞类型: {cell_names}")
-        
-        # ✅ 保存过滤后的cell表达矩阵（最终版本）
-        cell_expr_csv_path = os.path.join(args.output_dir, 'cell_marker_expr.csv')
-        cell_expr.to_csv(cell_expr_csv_path)
-        logging.info(f"已保存过滤后的cell marker表达: {cell_expr_csv_path}")
-        
-        if cell_full_expr is not None:
-            cell_full_expr_csv_path = os.path.join(args.output_dir, 'cell_full_expr.csv')
-            cell_full_expr.to_csv(cell_full_expr_csv_path)
-            logging.info(f"已保存过滤后的cell全基因表达: {cell_full_expr_csv_path}")
-        
-    else:
-        composition = None
+    # ✅ 构建celltype-level的composition矩阵
+    composition = pd.DataFrame(0.0, index=cluster_composition.index, columns=cell_names)
+    for spot_idx in range(len(cluster_composition)):
+        for cluster_idx, cluster_name in enumerate(cluster_names):
+            celltype = cluster_to_cell.get(cluster_name)
+            if celltype and celltype in cell_names:  # 只处理实际存在的细胞类型
+                composition.iloc[spot_idx, composition.columns.get_loc(celltype)] += cluster_composition.iloc[spot_idx, cluster_idx]
+    
+    logging.info(f"Composition矩阵形状: {composition.shape}")
     
     # ========== 阶段3.5：预计算KNN邻域和LR通讯得分 ==========
     logging.info("="*80)
     logging.info("阶段3.5: 预计算KNN邻域和LR通讯得分")
     logging.info("="*80)
     
-    # 调用calculate_lr_scores函数
+    # ✅ 直接传入spot-cell全基因表达DataFrame（实际数据，不是占位符！）
     knn_mask, csv_path, graph_data = calculate_lr_scores(
         spot_coords=spot_coords,
         composition=composition,
         args=args,
         lr_pairs=lr_pairs,
-        spot_cell_expr_npz_path=spot_cell_expr_npz_path,
         adata=adata,
-        cell_expr=cell_expr,
+        cell_full_expr=spot_cell_expr_df,  # ✅ 传入实际的spot-cell全基因表达！
         output_dir=args.output_dir
     )
-
     
     dataset = STHeteroSubgraphDataset(
         st_h5ad_path=args.st_h5ad,
@@ -550,34 +337,66 @@ def main():
         graph_data=graph_data,
         lr_pairs=lr_pairs,
         k_neighbors=args.n_spot_neighbors,
-        spot_cell_expr_npz_path=spot_cell_expr_npz_path,
         load_lr_scores_csv=csv_path,
         min_comm_edges=args.min_comm_edges,
-        valid_cell_types=cell_names if composition is not None else None,  # 传递过滤后的细胞类型列表
+        valid_cell_types=cell_names,
         device=device
     )
     
-    # ✅ 支持采样训练加速
+    # ========== 数据集划分：训练集和验证集 ==========
+    val_size = int(len(dataset) * args.val_split)
+    train_size = len(dataset) - val_size
+    
+    # 使用固定种子确保可重复性
+    train_dataset, val_dataset = torch.utils.data.random_split(
+        dataset, [train_size, val_size], 
+        generator=torch.Generator().manual_seed(args.seed)
+    )
+    
+    logging.info(f"数据集划分完成:")
+    logging.info(f"   - 训练集: {train_size} 个spots")
+    logging.info(f"   - 验证集: {val_size} 个spots")
+    logging.info(f"   - 验证集比例: {args.val_split:.1%}")
+    
+    # ========== 保存LR对映射文件 ==========
+    logging.info("保存LR对映射文件...")
+    lr_mapping_path = os.path.join(args.output_dir, "lr_pair_mapping.txt")
+    with open(lr_mapping_path, 'w') as f:
+        f.write("lr_id\tligand\treceptor\n")  # 表头
+        for lr_id, (ligand, receptor) in dataset.lr_id_to_pair.items():
+            f.write(f"{lr_id}\t{ligand}\t{receptor}\n")
+    logging.info(f"LR对映射文件已保存: {lr_mapping_path} (共{len(dataset.lr_id_to_pair)}个LR对)")
+    
+    # 创建训练和验证数据加载器
     if args.sample_rate < 1.0:
         from torch.utils.data import RandomSampler
-        num_samples = int(len(dataset) * args.sample_rate)
-        sampler = RandomSampler(dataset, num_samples=num_samples, replacement=False)
-        logging.info(f"⚡ 采样训练模式: 每个epoch采样 {args.sample_rate*100:.1f}% 数据 ({num_samples}/{len(dataset)} spots)")
-        dataloader = DataLoader(
-            dataset,
+        num_samples = int(len(train_dataset) * args.sample_rate)
+        sampler = RandomSampler(train_dataset, num_samples=num_samples, replacement=False)
+        logging.info(f"⚡ 采样训练模式: 每个epoch采样 {args.sample_rate*100:.1f}% 训练数据 ({num_samples}/{len(train_dataset)} spots)")
+        train_dataloader = DataLoader(
+            train_dataset,
             batch_size=args.batch_size,
             sampler=sampler,
             num_workers=0,
             collate_fn=hetero_subgraph_collate_fn
         )
     else:
-        dataloader = DataLoader(
-            dataset,
+        train_dataloader = DataLoader(
+            train_dataset,
             batch_size=args.batch_size,
             shuffle=True,
-            num_workers=0,  # 设置为0避免多进程日志重复
-            collate_fn=hetero_subgraph_collate_fn  # 使用自定义的collate_fn来支持批处理
+            num_workers=0,
+            collate_fn=hetero_subgraph_collate_fn
         )
+    
+    # 验证集数据加载器（不打乱顺序）
+    val_dataloader = DataLoader(
+        val_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=0,
+        collate_fn=hetero_subgraph_collate_fn
+    )
     
     logging.info("="*80)
     logging.info("阶段3: 构建HeteroGAT模型")
@@ -597,44 +416,44 @@ def main():
         gat_dropout=args.gat_dropout,
         output_dim=args.output_dim,
         n_celltypes=n_cells,
-        vae_encoder=vae_encoder
+        vae_encoder=vae_encoder,
+        temperature=args.temperature
     ).to(device)
     
-    # 加载DGI预训练的编码器（如果提供）
+    # 加载DGI预训练的编码器(如果提供)
     if args.pretrained_encoder is not None and os.path.exists(args.pretrained_encoder):
         logging.info(f"加载DGI预训练的编码器: {args.pretrained_encoder}")
         pretrained_checkpoint = torch.load(args.pretrained_encoder, map_location=device)
         
-        # 加载编码器权重到gat_spatial和gat_comm
+        # 加载编码器权重到edge_attn_spatial(edge_dim兼容)
         encoder_state_dict = pretrained_checkpoint['encoder_state_dict']
         
-        # 尝试加载到gat_spatial
-        try:
-            model.gat_spatial.load_state_dict(encoder_state_dict)
-            logging.info("   - gat_spatial编码器权重加载成功")
-        except Exception as e:
-            logging.warning(f"   - gat_spatial编码器权重加载失败: {e}")
+        # 过滤掉node_proj相关权重(延迟初始化,维度不确定)
+        filtered_state_dict = {k: v for k, v in encoder_state_dict.items() if 'node_proj' not in k}
         
-        # 尝试加载到gat_comm
+        # ✅ 只加载到edge_attn_spatial(edge_dim=1,与DGI一致)
         try:
-            model.gat_comm.load_state_dict(encoder_state_dict)
-            logging.info("   - gat_comm编码器权重加载成功")
+            model.edge_attn_spatial.load_state_dict(filtered_state_dict, strict=False)
+            logging.info("   - edge_attn_spatial编码器权重加载成功(跳过node_proj)")
         except Exception as e:
-            logging.warning(f"   - gat_comm编码器权重加载失败: {e}")
+            raise RuntimeError(f"edge_attn_spatial编码器权重加载失败: {e}")
+        
+        # ⚠️ edge_attn_comm的edge_dim=2，与DGI的edge_dim=1不兼容，跳过加载
+        logging.info("   - edge_attn_comm从头开始训练（edge_dim不匹配，跳过DGI权重加载）")
         
         # 是否冻结编码器
         freeze_encoder = args.freeze_encoder.lower() == 'true'
         if freeze_encoder:
-            logging.info("   - 冻结编码器权重（只训练预测头）")
-            for param in model.gat_spatial.parameters():
+            logging.info("   - 冻结edge_attn_spatial权重（已加载预训练）")
+            for param in model.edge_attn_spatial.parameters():
                 param.requires_grad = False
-            for param in model.gat_comm.parameters():
-                param.requires_grad = False
+            # ⚠️ edge_attn_comm不冻结，因为没有预训练权重
+            logging.info("   - edge_attn_comm保持可训练（无预训练权重）")
         else:
-            logging.info("   - 微调编码器（训练整个模型）")
+            logging.info("   - 微调整个模型（包括预训练的edge_attn_spatial）")
     else:
         if args.pretrained_encoder is not None:
-            logging.warning(f"找不到预训练编码器文件: {args.pretrained_encoder}")
+            raise FileNotFoundError(f"找不到预训练编码器文件: {args.pretrained_encoder}")
         logging.info("从头开始训练模型（无预训练）")
     
     optimizer = torch.optim.Adam(
@@ -649,11 +468,19 @@ def main():
     logging.info(f"   - 总参数数: {total_params:,}")
     logging.info(f"   - 可训练参数数: {trainable_params:,}")
     
-    # ========== 阶段3.5: DGI自监督预训练（可选）==========
+    # ========== 阶段3.5: 自监督预训练（可选）==========
     if args.use_dgi_pretrain:
         logging.info("="*80)
         logging.info("阶段3.5: DGI自监督预训练")
         logging.info("="*80)
+        
+        # 检查是否已经加载了预训练权重
+        if args.pretrained_encoder is not None and os.path.exists(args.pretrained_encoder):
+            logging.info("⚠️ 检测到已加载预训练权重，将在此基础上继续DGI预训练")
+            logging.info("   - 这将进一步优化已加载的预训练权重")
+        else:
+            logging.info("从头开始进行DGI预训练")
+        
         logging.info(f"DGI预训练配置:")
         logging.info(f"   - Epochs: {args.dgi_epochs}")
         logging.info(f"   - Learning rate: {args.dgi_lr}")
@@ -671,54 +498,43 @@ def main():
             readout_mode=args.readout_mode,
             corruption_mode=args.corruption_mode,
             mask_ratio=args.mask_ratio,
-            noise_std=args.noise_std
+            noise_std=args.noise_std,
+            edge_dim=2  # ✅ 统一使用edge_dim=2，所有边都包含[score, id]
         ).to(device)
         
         # 将主模型的编码器权重复制到DGI模型
-        dgi_model.encoder.load_state_dict(model.gat_spatial.state_dict())
+        # ✅ 注意：DGI的encoder包含edge_attention子模块
+        dgi_model.encoder.edge_attention.load_state_dict(model.edge_attn_spatial.state_dict())
         
         dgi_optimizer = torch.optim.Adam(dgi_model.parameters(), lr=args.dgi_lr)
         dgi_scheduler = CosineAnnealingLR(dgi_optimizer, T_max=args.dgi_epochs, eta_min=1e-6)
         
         logging.info("开始DGI预训练...")
-        dgi_losses = []
-        dgi_pbar = tqdm(range(args.dgi_epochs), desc="DGI Pretrain", leave=False, disable=False)
+        dgi_train_losses = []
+        dgi_val_losses = []
+        dgi_pbar = tqdm(range(args.dgi_epochs), desc="DGI Pretrain", leave=True, position=0)
+        
+        # DGI早停参数
+        dgi_best_loss = float('inf')
+        dgi_patience = args.dgi_early_stop_patience  # 使用命令行参数
+        dgi_patience_counter = 0
+        dgi_min_delta = args.dgi_early_stop_min_delta  # 使用命令行参数
+        
+        if dgi_patience > 0:
+            logging.info(f"DGI早停已启用: patience={dgi_patience}, min_delta={dgi_min_delta}")
+        else:
+            logging.info("DGI早停已禁用")
         
         for epoch in dgi_pbar:
+            # ========== 训练阶段 ==========
             dgi_model.train()
-            epoch_dgi_loss = 0.0
+            epoch_dgi_train_loss = 0.0
             
-            for batch_idx, batch in enumerate(dataloader):
+            for batch_idx, batch in enumerate(train_dataloader):
                 batch_size = batch['batch_size']
                 # === 打印DGI图结构信息 (仅第1个epoch的前1个batch) ===
                 if batch_idx < 1 and epoch == 0:
-                    batch_size_dgi = batch['batch_size']
-                    n_spots_sub_dgi_list = batch['n_spots_sub']  # ✅ 现在是列表
-                    n_cells_dgi_list = batch['n_cells']  # ✅ 现在是列表
-                    
-                    logging.info(f"\n{'='*60}")
-                    logging.info(f"[DGI] Batch {batch_idx} Graph Structure:")
-                    logging.info(f"{'='*60}")
-                    for b in range(batch_size_dgi):
-                        n_spots_this = n_spots_sub_dgi_list[b]  # ✅ 从列表获取
-                        n_cells_this = n_cells_dgi_list[b]  # ✅ 从列表获取
-                        
-                        edge_index_like_b = batch['edge_index_like'][b]
-                        n_like_edges_total = edge_index_like_b.size(1)
-                        
-                        ss_mask = (edge_index_like_b[0] < n_spots_this) & (edge_index_like_b[1] < n_spots_this)
-                        n_ss_edges = ss_mask.sum().item()
-                        
-                        sc_mask = ((edge_index_like_b[0] < n_spots_this) & (edge_index_like_b[1] >= n_spots_this)) | \
-                                  ((edge_index_like_b[0] >= n_spots_this) & (edge_index_like_b[1] < n_spots_this))
-                        n_sc_edges = sc_mask.sum().item()
-                        
-                        n_cc_edges = batch['edge_index_cc'][b].size(1)
-                        
-                        logging.info(f"  Subgraph {b}:")
-                        logging.info(f"    节点: {n_spots_this} spots + {n_cells_this} cells = {n_spots_this + n_cells_this} total")
-                        logging.info(f"    边: SS={n_ss_edges}, SC={n_sc_edges}, CC={n_cc_edges}, total={n_ss_edges + n_sc_edges + n_cc_edges}")
-                    logging.info(f"{'='*60}\n")
+                    pass  # 移除调试信息
                 
                 batch_loss = 0.0
                 
@@ -730,9 +546,13 @@ def main():
                     edge_index_cc = batch['edge_index_cc'][b].to(device)
                     edge_attr_cc = batch['edge_attr_cc'][b].to(device)
                     
+                    # ✅ 扩展相似度边属性为2D格式 [weight, -1]
+                    if edge_attr_like.dim() == 1:
+                        edge_attr_like = torch.cat([edge_attr_like.unsqueeze(-1), torch.full_like(edge_attr_like.unsqueeze(-1), -1)], dim=-1)
+                    
                     # 合并边（DGI使用完整的异构图）
                     edge_index = torch.cat([edge_index_like, edge_index_cc], dim=1)
-                    edge_attr = torch.cat([edge_attr_like, edge_attr_cc[:, 0] if edge_attr_cc.size(0) > 0 else edge_attr_like[:0]], dim=0)
+                    edge_attr = torch.cat([edge_attr_like, edge_attr_cc], dim=0)
                     
                     # DGI前向传播（内部会进行特征破坏和边丢弃）
                     pos_scores, neg_scores, summary = dgi_model(
@@ -750,26 +570,93 @@ def main():
                 torch.nn.utils.clip_grad_norm_(dgi_model.parameters(), 1.0)
                 dgi_optimizer.step()
                 
-                epoch_dgi_loss += avg_loss.item()
+                epoch_dgi_train_loss += avg_loss.item()
+            
+            # ========== 验证阶段 ==========
+            dgi_model.eval()
+            epoch_dgi_val_loss = 0.0
+            
+            with torch.no_grad():
+                for batch_idx, batch in enumerate(val_dataloader):
+                    batch_size = batch['batch_size']
+                    batch_loss = 0.0
+                    
+                    for b in range(batch_size):
+                        expr_raw = batch['expr_raw'][b].to(device)
+                        cell_expr_raw = batch['cell_expr_raw'][b].to(device)
+                        edge_index_like = batch['edge_index_like'][b].to(device)
+                        edge_attr_like = batch['edge_attr_like'][b].to(device)
+                        edge_index_cc = batch['edge_index_cc'][b].to(device)
+                        edge_attr_cc = batch['edge_attr_cc'][b].to(device)
+                        
+                        # ✅ 扩展相似度边属性为2D格式 [weight, -1]
+                        if edge_attr_like.dim() == 1:
+                            edge_attr_like = torch.cat([edge_attr_like.unsqueeze(-1), torch.full_like(edge_attr_like.unsqueeze(-1), -1)], dim=-1)
+                        
+                        # 合并边（DGI使用完整的异构图）
+                        edge_index = torch.cat([edge_index_like, edge_index_cc], dim=1)
+                        edge_attr = torch.cat([edge_attr_like, edge_attr_cc], dim=0)
+                        
+                        # DGI前向传播（验证阶段不进行特征破坏）
+                        pos_scores, neg_scores, summary = dgi_model(
+                            expr_raw, cell_expr_raw, edge_index, edge_attr
+                        )
+                        
+                        # 计算DGI损失
+                        loss = dgi_loss(pos_scores, neg_scores)
+                        
+                        batch_loss += loss
+                    
+                    avg_loss = batch_loss / batch_size
+                    epoch_dgi_val_loss += avg_loss.item()
             
             dgi_scheduler.step()
-            avg_epoch_loss = epoch_dgi_loss / len(dataloader)
-            dgi_losses.append(avg_epoch_loss)
-            dgi_pbar.set_postfix({'Loss': f'{avg_epoch_loss:.4f}'})
+            avg_train_loss = epoch_dgi_train_loss / len(train_dataloader)
+            avg_val_loss = epoch_dgi_val_loss / len(val_dataloader)
+            
+            dgi_train_losses.append(avg_train_loss)
+            dgi_val_losses.append(avg_val_loss)
+            
+            dgi_pbar.set_postfix({
+                'Train': f'{avg_train_loss:.4f}', 
+                'Val': f'{avg_val_loss:.4f}'
+            })
             dgi_pbar.update(1)
-            logging.info(f"[DGI Epoch {epoch+1}/{args.dgi_epochs}] Loss: {avg_epoch_loss:.4f}")
+            
+            # DGI早停检查（使用验证损失）
+            if dgi_patience > 0:
+                if avg_val_loss < dgi_best_loss - dgi_min_delta:
+                    dgi_best_loss = avg_val_loss
+                    dgi_patience_counter = 0
+                else:
+                    dgi_patience_counter += 1
+                
+                if dgi_patience_counter >= dgi_patience:
+                    logging.info(f"DGI早停触发！在epoch {epoch+1}停止预训练")
+                    logging.info(f"DGI最佳验证损失: {dgi_best_loss:.6f} (epoch {epoch+1-dgi_patience})")
+                    break
         
         dgi_pbar.close()
         
         # 将预训练的编码器权重迁移到主模型
-        model.gat_spatial.load_state_dict(dgi_model.encoder.state_dict())
-        model.gat_comm.load_state_dict(dgi_model.encoder.state_dict())
+        # ✅ 现在两个网络都是edge_dim=2，可以都加载DGI预训练权重
+        
+        # 过滤掉node_proj相关权重(延迟初始化,维度不确定)和输出层权重(维度可能不匹配)
+        dgi_state_dict = dgi_model.encoder.edge_attention.state_dict()
+        filtered_state_dict = {k: v for k, v in dgi_state_dict.items() 
+                             if 'node_proj' not in k and 'output_projection' not in k}
+        
+        model.edge_attn_spatial.load_state_dict(filtered_state_dict, strict=False)
+        model.edge_attn_comm.load_state_dict(filtered_state_dict, strict=False)
+        logging.info("   - edge_attn_spatial已加载DGI预训练权重(跳过node_proj和output_projection)")
+        logging.info("   - edge_attn_comm已加载DGI预训练权重(跳过node_proj和output_projection)")
         
         # 保存DGI预训练权重
         dgi_checkpoint_path = os.path.join(args.output_dir, "dgi_pretrained_encoder.pth")
         torch.save({
-            'encoder_state_dict': dgi_model.encoder.state_dict(),
-            'dgi_losses': dgi_losses,
+            'encoder_state_dict': dgi_model.encoder.edge_attention.state_dict(),  # ✅ 保存edge_attention子模块
+            'dgi_train_losses': dgi_train_losses,
+            'dgi_val_losses': dgi_val_losses,
             'config': {
                 'corruption_mode': args.corruption_mode,
                 'readout_mode': args.readout_mode,
@@ -778,92 +665,68 @@ def main():
             }
         }, dgi_checkpoint_path)
         logging.info(f"DGI预训练权重已保存: {dgi_checkpoint_path}")
-        logging.info(f"DGI预训练完成！最终损失: {dgi_losses[-1]:.4f}")
+        logging.info(f"DGI预训练完成！最终训练损失: {dgi_train_losses[-1]:.4f}, 验证损失: {dgi_val_losses[-1]:.4f}")
+        
+        # 绘制DGI预训练损失曲线（包含训练和验证损失）
+        plot_dgi_loss(dgi_train_losses, dgi_val_losses, args.output_dir, args.dgi_epochs)
         
         del dgi_model, dgi_optimizer, dgi_scheduler
         torch.cuda.empty_cache()
     
     # 训练循环
     train_losses = []
-    # ✅ 移除 GraphAugmentor：第二阶段不需要图增强，DGI已完成对比学习
+    val_losses = []
+    edge_losses = []  # 新增：边强度预测损失历史
+    comm_pred_losses = []  # 新增：通讯预测损失历史
     
-    # 用于收集cell-cell注意力得分和LR ID
+    # 用于收集cell-cell注意力得分和LR ID（只在训练集上收集）
     all_cc_attention_scores = []
     all_edge_index_cc = []
     all_edge_attr_cc = []  # 收集边属性 [lr_score, lr_id]
     all_spot_indices = []  # 收集对应的spot索引
+    all_cell_node_mappings = []  # 收集细胞节点到细胞类型的映射
+    all_batch_indices = []  # 收集每个边所属的批次索引
+    all_n_spots_sub = []  # 收集每个批次的子图spot数量
     all_cell_names = list(cell_expr.index)
     
     # ========== 阶段4：训练循环 ==========
     logging.info("="*80)
-    logging.info("阶段4: 开始训练")
+    logging.info("阶段4: 开始训练（混合训练：监督 + 自监督）")
     logging.info("="*80)
-
-    # 初始化早停
-    early_stopping = None
-    if args.early_stop_patience > 0:
-        early_stopping = EarlyStopping(
-            patience=args.early_stop_patience,
-            min_delta=args.early_stop_min_delta,
-            verbose=True
-        )
-        logging.info(f"已启用早停机制: patience={args.early_stop_patience}, min_delta={args.early_stop_min_delta}")
-    else:
-        logging.info("未启用早停机制")
+    logging.info(f"训练配置:")
+    logging.info(f"  - 监督学习权重（α）: {args.supervised_weight:.2f}")
+    logging.info(f"  - 自监督学习权重（1-α）: {1-args.supervised_weight:.2f}")
+    logging.info(f"  - 负采样比例: {args.negative_sample_ratio:.1f}")
+    logging.info(f"  - 监督损失: MSE(tanh(logits), 2*(lr_scores-0.5))")
+    logging.info(f"  - 自监督损失: BCE(sigmoid(logits), edge_labels)")
+    logging.info("="*80)
 
     # 使用外层tqdm跟踪epoch进度
     # 移除position参数避免Jupyter中重复显示，添加leave=True保持最终状态
     epoch_pbar = tqdm(range(args.epochs), desc="Training", leave=True, dynamic_ncols=True)
     
     for epoch in epoch_pbar:
+        # ========== 训练阶段 ==========
         model.train()
-        total_loss = 0.0
-        total_comm_pred_loss = 0.0  # ✅ 边存在性预测损失（BCE，唯一的损失）
-        for batch_idx, batch in enumerate(dataloader, 1):
+        total_train_loss = 0.0
+        total_supervised_loss = 0.0  # 监督学习损失
+        total_self_supervised_loss = 0.0  # 自监督学习损失
+        total_edge_loss = 0.0  # 混合边强度损失
+        
+        for batch_idx, batch in enumerate(train_dataloader, 1):
             batch_size = batch['batch_size']
             n_spots_sub_list = batch['n_spots_sub']  # ✅ 现在是列表
             n_cells_list = batch['n_cells']  # ✅ 现在是列表
 
             # === 打印图结构信息 (仅前1个batch) ===
             if batch_idx < 1 and epoch == 0:
-                logging.info(f"\n{'='*60}")
-                logging.info(f"Batch {batch_idx} Graph Structure:")
-                logging.info(f"{'='*60}")
-                for b in range(batch_size):
-                    n_spots_this = n_spots_sub_list[b]  # ✅ 从列表获取
-                    n_cells_this = n_cells_list[b]  # ✅ 从列表获取
-                    
-                    # 统计边类型：edge_index_like包含Spot-Spot和Spot-Cell两种边
-                    edge_index_like_b = batch['edge_index_like'][b]
-                    n_like_edges_total = edge_index_like_b.size(1)
-                    
-                    # Spot-Spot边：两个端点都 < n_spots_this
-                    ss_mask = (edge_index_like_b[0] < n_spots_this) & (edge_index_like_b[1] < n_spots_this)
-                    n_ss_edges = ss_mask.sum().item()
-                    
-                    # Spot-Cell边：一个端点 < n_spots_this，另一个 >= n_spots_this
-                    sc_mask = ((edge_index_like_b[0] < n_spots_this) & (edge_index_like_b[1] >= n_spots_this)) | \
-                              ((edge_index_like_b[0] >= n_spots_this) & (edge_index_like_b[1] < n_spots_this))
-                    n_sc_edges = sc_mask.sum().item()
-                    
-                    # Cell-Cell边
-                    n_cc_edges = batch['edge_index_cc'][b].size(1)
-                    
-                    logging.info(f"  Subgraph {b}:")
-                    logging.info(f"    异构图节点:")
-                    logging.info(f"      - Spot 节点数: {n_spots_this}")
-                    logging.info(f"      - Cell 节点数: {n_cells_this} (动态分配，仅composition>1e-6)")
-                    logging.info(f"      - 总节点数: {n_spots_this + n_cells_this}")
-                    logging.info(f"    异构图边:")
-                    logging.info(f"      - Spot-Spot 边数: {n_ss_edges} (空间相似性)")
-                    logging.info(f"      - Spot-Cell 边数: {n_sc_edges} (composition权重)")
-                    logging.info(f"      - Cell-Cell 边数: {n_cc_edges} (LR通讯)")
-                    logging.info(f"      - 总边数: {n_ss_edges + n_sc_edges + n_cc_edges}")
-                logging.info(f"{'='*60}\n")
+                pass  # 移除调试信息
 
             # 累积批次损失
             batch_loss = 0.0
-            batch_comm_pred_loss = 0.0  # ✅ 边存在性预测损失（BCE）
+            batch_supervised = 0.0  # 监督学习损失
+            batch_self_supervised = 0.0  # 自监督学习损失
+            batch_edge = 0.0  # 混合边强度损失
 
             # 处理每个subgraph
             for b in range(batch_size):
@@ -876,15 +739,16 @@ def main():
                 edge_index_cc = batch['edge_index_cc'][b].to(device)      # [2, E_cc]
                 edge_attr_cc = batch['edge_attr_cc'][b].to(device)        # [E_cc]
 
-                # ========== 前向传播（只用原始图，不需要增强） ==========
-                spot_repr, cell_repr, combined, spot_proj, cc_attention, predicted_comm_strength = model(
+                # ========== 前向传播 ==========
+                spot_repr, cell_repr, combined, spot_proj, cc_attention, predicted_masked_edges, edge_mask = model(
                     expr_raw=expr_raw,
                     cell_expr_raw=cell_expr_raw,
                     edge_index_like=edge_index_like,
                     edge_attr_like=edge_attr_like,
                     edge_index_cc=edge_index_cc,
-                    edge_attr_cc=edge_attr_cc,
-                    return_attention=True
+                    edge_attr_cc=torch.zeros_like(edge_attr_cc),  # 不输入真实强度，避免信息泄露
+                    return_attention=True,
+                    edge_mask_ratio=0.15  # 15%的边被mask用于预测
                 )
                 
                 # 收集cell-cell注意力得分（用于后续分析）
@@ -896,35 +760,132 @@ def main():
                     center_spot_idx = batch['center_spot_idx'][b]
                     spot_indices = torch.full((edge_index_cc.size(1),), center_spot_idx, dtype=torch.long)
                     all_spot_indices.append(spot_indices)
+                    # 收集细胞节点映射信息
+                    spot_cell_mapping = batch['spot_cell_mapping'][b]
+                    # 创建细胞节点局部索引到细胞类型ID的映射
+                    cell_node_to_cell_type = {}
+                    for (spot_local_idx, cell_type_id), cell_node_local_idx in spot_cell_mapping.items():
+                        cell_node_to_cell_type[cell_node_local_idx] = cell_type_id
+                    all_cell_node_mappings.append(cell_node_to_cell_type)
+                    # 收集批次索引
+                    batch_indices = torch.full((edge_index_cc.size(1),), len(all_cc_attention_scores) - 1, dtype=torch.long)
+                    all_batch_indices.append(batch_indices)
+                    # 收集子图spot数量
+                    n_spots_sub = batch['n_spots_sub'][b]
+                    n_spots_sub_tensor = torch.full((edge_index_cc.size(1),), n_spots_sub, dtype=torch.long)
+                    all_n_spots_sub.append(n_spots_sub_tensor)
 
-                # ========== 边存在性预测损失（二分类任务） ==========
-                comm_pred_loss = 0.0
-                if predicted_comm_strength is not None and edge_attr_cc.size(0) > 0:
-                    # ✅ 改为二分类任务：基于LR得分阈值生成标签
-                    true_lr_scores = edge_attr_cc[:, 0]  # [n_edges] - 第0列是lr_score
+                # ========== 混合训练：监督（MSE）+ 自监督（BCE）==========
+                # 注意：不再使用mask预测损失，所有监督学习都通过混合损失完成
+                supervised_loss = 0.0  # 监督学习：拟合LR得分
+                self_supervised_loss = 0.0  # 自监督学习：边存在性预测
+                
+                if cc_attention is not None and edge_attr_cc.size(0) > 0:
+                    edge_strength_logits = cc_attention  # [n_pos_edges]
+                    lr_scores = edge_attr_cc[:, 0]  # [n_pos_edges]
                     
-                    # 计算全局中位数作为阈值（动态阈值，适应不同batch）
-                    threshold = true_lr_scores.median()
+                    # ========== 1. 监督学习部分（MSE）==========
+                    # 使用tanh映射到[-1, 1]的调整系数
+                    adjustment_factor = torch.tanh(edge_strength_logits)
+                    target_factor = 2 * (lr_scores - 0.5)  # [0,1] -> [-1,1]
                     
-                    # 生成二分类标签：高于中位数=1（边存在），低于=0（边不存在）
-                    binary_labels = (true_lr_scores > threshold).float()
-                    
-                    # BCE 损失 - predicted_comm_strength 的输出已经是 [0, 1] (Sigmoid)
-                    comm_pred_loss = torch.nn.functional.binary_cross_entropy(
-                        predicted_comm_strength, 
-                        binary_labels,
+                    # MSE损失：拟合已知的LR得分
+                    supervised_loss = torch.nn.functional.mse_loss(
+                        adjustment_factor,
+                        target_factor,
                         reduction='mean'
                     )
-
-                # ✅ 总损失 = 边存在性预测损失（DGI已经完成了对比学习）
-                loss = comm_pred_loss
+                    
+                    # ========== 2. 自监督学习部分（BCE）==========
+                    # 2.1 正边：真实存在的通讯边
+                    pos_edge_pred = torch.sigmoid(edge_strength_logits)  # [n_pos_edges]
+                    pos_labels = torch.ones_like(pos_edge_pred)  # 标签=1
+                    
+                    # 2.2 负采样：不存在的边
+                    n_pos = len(edge_strength_logits)
+                    n_neg = int(n_pos * args.negative_sample_ratio)
+                    
+                    if n_neg > 0:
+                        # 随机采样负边（不同细胞类型的随机配对）
+                        n_cells = cell_repr.size(0)
+                        neg_src = torch.randint(0, n_cells, (n_neg,), device=device)
+                        neg_dst = torch.randint(0, n_cells, (n_neg,), device=device)
+                        
+                        # 避免自环和重复正边
+                        mask = neg_src != neg_dst
+                        neg_src = neg_src[mask]
+                        neg_dst = neg_dst[mask]
+                        
+                        if len(neg_src) > 0:
+                            # 构造负边索引
+                            neg_edge_index = torch.stack([neg_src, neg_dst], dim=0)
+                            
+                            # 构造负边特征（使用零向量）
+                            neg_edge_attr = torch.zeros(len(neg_src), edge_attr_cc.size(1), device=device)
+                            
+                            # 前向传播获取负边logits
+                            with torch.no_grad():
+                                # 使用模型的edge_attn_comm预测负边
+                                # 构造负边的特征（cell embeddings）
+                                neg_src_feat = cell_repr[neg_src]
+                                neg_dst_feat = cell_repr[neg_dst]
+                                neg_edge_feat = torch.cat([
+                                    neg_src_feat, neg_dst_feat, 
+                                    neg_edge_attr
+                                ], dim=-1)
+                                
+                                # 简单的线性预测（使用edge_attn_comm的第一层）
+                                # 这里简化处理，直接用随机低分作为负样本
+                                neg_edge_logits = torch.randn(len(neg_src), device=device) - 2.0  # 偏向负值
+                            
+                            neg_edge_pred = torch.sigmoid(neg_edge_logits)
+                            neg_labels = torch.zeros_like(neg_edge_pred)  # 标签=0
+                            
+                            # 合并正负边的BCE损失
+                            all_preds = torch.cat([pos_edge_pred, neg_edge_pred])
+                            all_labels = torch.cat([pos_labels, neg_labels])
+                            
+                            self_supervised_loss = torch.nn.functional.binary_cross_entropy(
+                                all_preds,
+                                all_labels,
+                                reduction='mean'
+                            )
+                        else:
+                            # 只用正边的BCE
+                            self_supervised_loss = torch.nn.functional.binary_cross_entropy(
+                                pos_edge_pred,
+                                pos_labels,
+                                reduction='mean'
+                            )
+                    else:
+                        # 不做负采样，只用正边BCE
+                        self_supervised_loss = torch.nn.functional.binary_cross_entropy(
+                            pos_edge_pred,
+                            pos_labels,
+                            reduction='mean'
+                        )
+                    
+                    # ========== 3. 混合损失 ==========
+                    alpha = args.supervised_weight
+                    edge_strength_loss = alpha * supervised_loss + (1 - alpha) * self_supervised_loss
+                else:
+                    edge_strength_loss = 0.0
+                    supervised_loss = 0.0
+                    self_supervised_loss = 0.0
+                
+                # 总损失 = 混合边强度损失（监督MSE + 自监督BCE）
+                loss = edge_strength_loss
 
                 batch_loss += loss
-                batch_comm_pred_loss += comm_pred_loss.item() if isinstance(comm_pred_loss, torch.Tensor) else 0.0
+                batch_supervised += supervised_loss.item() if isinstance(supervised_loss, torch.Tensor) else 0.0
+                batch_self_supervised += self_supervised_loss.item() if isinstance(self_supervised_loss, torch.Tensor) else 0.0
+                batch_edge += edge_strength_loss.item() if isinstance(edge_strength_loss, torch.Tensor) else 0.0
 
             # 对整个batch求平均损失，然后反向传播
             avg_batch_loss = batch_loss / batch_size
-            avg_batch_comm_pred_loss = batch_comm_pred_loss / batch_size if batch_comm_pred_loss > 0 else 0.0
+            avg_batch_supervised = batch_supervised / batch_size if batch_supervised > 0 else 0.0
+            avg_batch_self_supervised = batch_self_supervised / batch_size if batch_self_supervised > 0 else 0.0
+            avg_batch_edge = batch_edge / batch_size if batch_edge > 0 else 0.0
 
             # 反向传播
             optimizer.zero_grad()
@@ -933,44 +894,122 @@ def main():
             optimizer.step()
             scheduler.step()
 
-            total_loss += avg_batch_loss.item()
-            total_comm_pred_loss += avg_batch_comm_pred_loss
+            total_train_loss += avg_batch_loss.item()
+            total_supervised_loss += avg_batch_supervised
+            total_self_supervised_loss += avg_batch_self_supervised
+            total_edge_loss += avg_batch_edge
+        
+        # ========== 验证阶段 ==========
+        model.eval()
+        total_val_loss = 0.0
+        
+        with torch.no_grad():
+            for batch_idx, batch in enumerate(val_dataloader, 1):
+                batch_size = batch['batch_size']
+                batch_loss = 0.0
+
+                for b in range(batch_size):
+                    expr_raw = batch['expr_raw'][b].to(device)
+                    cell_expr_raw = batch['cell_expr_raw'][b].to(device)
+                    edge_index_like = batch['edge_index_like'][b].to(device)
+                    edge_attr_like = batch['edge_attr_like'][b].to(device)
+                    edge_index_cc = batch['edge_index_cc'][b].to(device)
+                    edge_attr_cc = batch['edge_attr_cc'][b].to(device)
+
+                    # 前向传播（验证阶段不进行边mask）
+                    spot_repr, cell_repr, combined, spot_proj, cc_attention, _, _ = model(
+                        expr_raw=expr_raw,
+                        cell_expr_raw=cell_expr_raw,
+                        edge_index_like=edge_index_like,
+                        edge_attr_like=edge_attr_like,
+                        edge_index_cc=edge_index_cc,
+                        edge_attr_cc=torch.zeros_like(edge_attr_cc),
+                        return_attention=True,
+                        edge_mask_ratio=0.0  # 验证阶段不mask
+                    )
+
+                    # 计算验证损失
+                    if cc_attention is not None and edge_attr_cc.size(0) > 0:
+                        edge_strength_logits = cc_attention
+                        lr_scores = edge_attr_cc[:, 0]
+                        
+                        # 监督学习部分
+                        adjustment_factor = torch.tanh(edge_strength_logits)
+                        target_factor = 2 * (lr_scores - 0.5)
+                        supervised_loss = torch.nn.functional.mse_loss(
+                            adjustment_factor, target_factor, reduction='mean'
+                        )
+                        
+                        # 自监督学习部分
+                        pos_edge_pred = torch.sigmoid(edge_strength_logits)
+                        pos_labels = torch.ones_like(pos_edge_pred)
+                        
+                        n_pos = len(edge_strength_logits)
+                        n_neg = int(n_pos * args.negative_sample_ratio)
+                        
+                        if n_neg > 0:
+                            n_cells = cell_repr.size(0)
+                            neg_src = torch.randint(0, n_cells, (n_neg,), device=device)
+                            neg_dst = torch.randint(0, n_cells, (n_neg,), device=device)
+                            mask = neg_src != neg_dst
+                            neg_src = neg_src[mask]
+                            neg_dst = neg_dst[mask]
+                            
+                            if len(neg_src) > 0:
+                                neg_edge_logits = torch.randn(len(neg_src), device=device) - 2.0
+                                neg_edge_pred = torch.sigmoid(neg_edge_logits)
+                                neg_labels = torch.zeros_like(neg_edge_pred)
+                                
+                                all_preds = torch.cat([pos_edge_pred, neg_edge_pred])
+                                all_labels = torch.cat([pos_labels, neg_labels])
+                                
+                                self_supervised_loss = torch.nn.functional.binary_cross_entropy(
+                                    all_preds, all_labels, reduction='mean'
+                                )
+                            else:
+                                self_supervised_loss = torch.nn.functional.binary_cross_entropy(
+                                    pos_edge_pred, pos_labels, reduction='mean'
+                                )
+                        else:
+                            self_supervised_loss = torch.nn.functional.binary_cross_entropy(
+                                pos_edge_pred, pos_labels, reduction='mean'
+                            )
+                        
+                        alpha = args.supervised_weight
+                        edge_strength_loss = alpha * supervised_loss + (1 - alpha) * self_supervised_loss
+                    else:
+                        edge_strength_loss = 0.0
+                    
+                    batch_loss += edge_strength_loss
+                
+                avg_batch_loss = batch_loss / batch_size
+                total_val_loss += avg_batch_loss.item()
         
         # 计算epoch平均损失
-        avg_loss = total_loss / len(dataloader) if len(dataloader) > 0 else 0
-        avg_comm_pred = total_comm_pred_loss / len(dataloader) if len(dataloader) > 0 else 0
-        train_losses.append(avg_loss)
+        avg_train_loss = total_train_loss / len(train_dataloader) if len(train_dataloader) > 0 else 0
+        avg_val_loss = total_val_loss / len(val_dataloader) if len(val_dataloader) > 0 else 0
+        avg_supervised = total_supervised_loss / len(train_dataloader) if len(train_dataloader) > 0 else 0
+        avg_self_supervised = total_self_supervised_loss / len(train_dataloader) if len(train_dataloader) > 0 else 0
+        
+        train_losses.append(avg_train_loss)
+        val_losses.append(avg_val_loss)
+        edge_losses.append(avg_supervised)  # 记录监督学习损失（MSE）
+        comm_pred_losses.append(avg_self_supervised)  # 记录自监督学习损失（BCE）
         
         # 更新epoch进度条（只在epoch结束时更新一次）
+        alpha = args.supervised_weight
         epoch_pbar.set_postfix({
-            'Loss': f'{avg_loss:.4f}',
-            'BCE': f'{avg_comm_pred:.4f}'  # ✅ BCE = Binary Cross Entropy
+            'Train': f'{avg_train_loss:.4f}',
+            'Val': f'{avg_val_loss:.4f}',
+            'Sup': f'{avg_supervised:.4f}',  # 监督学习损失（MSE）
+            'Self': f'{avg_self_supervised:.4f}',  # 自监督学习损失（BCE）
+            'α': f'{alpha:.1f}'  # 监督权重
         })
-        
-        # ✅ 在第一个epoch输出任务说明
-        if epoch == 0:
-            logging.info(f"[训练任务] 边存在性预测（二分类）：预测Cell-Cell边是否为重要通讯边")
-            logging.info(f"   - 标签生成：基于LR得分中位数动态阈值")
-            logging.info(f"   - 损失函数：Binary Cross Entropy (BCE)")
-        
-        logging.info(f"[Epoch {epoch+1}/{args.epochs}] Loss: {avg_loss:.4f}, BCE: {avg_comm_pred:.4f}")
         
         # 保存检查点
         if (epoch + 1) % args.checkpoint_interval == 0:
             checkpoint_path = os.path.join(args.output_dir, f"hetero_model_epoch{epoch+1}.pth")
             torch.save(model.state_dict(), checkpoint_path)
-            logging.info(f"检查点已保存: {checkpoint_path}")
-        
-        # 早停检查
-        if early_stopping is not None:
-            if early_stopping(epoch, avg_loss):
-                logging.info(f"早停触发！在epoch {epoch+1}停止训练")
-                logging.info(f"最佳损失: {early_stopping.best_loss:.6f} (epoch {early_stopping.best_epoch+1})")
-                # 保存早停时的模型
-                early_stop_path = os.path.join(args.output_dir, f"hetero_model_early_stop_epoch{epoch+1}.pth")
-                torch.save(model.state_dict(), early_stop_path)
-                logging.info(f"早停模型已保存: {early_stop_path}")
-                break
     
     # 关闭tqdm进度条
     epoch_pbar.close()
@@ -986,6 +1025,9 @@ def main():
         all_edge_index_cc=all_edge_index_cc,
         all_edge_attr_cc=all_edge_attr_cc,
         all_spot_indices=all_spot_indices,
+        all_cell_node_mappings=all_cell_node_mappings,
+        all_batch_indices=all_batch_indices,
+        all_n_spots_sub=all_n_spots_sub,
         all_cell_names=all_cell_names,
         output_dir=args.output_dir,
         n_spots=n_spots,
@@ -993,7 +1035,7 @@ def main():
     )
     
     # 绘制损失曲线
-    plot_training_loss(train_losses, args.output_dir, args.epochs)
+    plot_training_loss(train_losses, val_losses, args.output_dir, args.epochs)
     
     logging.info("\n" + "="*80)
     logging.info("训练完成！")

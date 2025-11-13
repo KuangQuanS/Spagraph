@@ -41,19 +41,12 @@ class GraphAugmentor:
             # 随机删除
             mask = np.random.binomial(1, 1 - rate, n_edges).astype(bool)
         elif strategy == 'weak':
-            # ✅ 删除弱边：基于 edge_attr 的值（假设第一列是边权重/得分）
+            # 删除弱边：基于edge_attr的第一列
             if edge_attr is not None and edge_attr.size > 0:
-                # 提取边权重
-                if edge_attr.ndim == 1:
-                    edge_weights = edge_attr
-                else:
-                    edge_weights = edge_attr[:, 0]  # 取第一列作为权重
-                
-                # 计算阈值：删除最弱的 rate% 的边
+                edge_weights = edge_attr if edge_attr.ndim == 1 else edge_attr[:, 0]
                 threshold = np.percentile(edge_weights, rate * 100)
                 mask = edge_weights >= threshold
             else:
-                # 如果没有边属性，回退到随机删除
                 mask = np.random.binomial(1, 1 - rate, n_edges).astype(bool)
         else:
             raise ValueError(f"Unknown strategy: {strategy}")
@@ -77,10 +70,10 @@ class GraphAugmentor:
         Returns:
             augmented_graph: 增强后的图数据
         """
-        # 相似度边：随机删除（这些边基于空间/表达相似度）
+        # 相似度边：随机删除
         ei_like_aug, ea_like_aug = self.drop_edges(edge_index_like, edge_attr_like, 0.1, strategy='random')
         
-        # ✅ 通讯边：删除弱边（基于 LR 通讯得分）
+        # 通讯边：删除弱边
         ei_cc_aug, ea_cc_aug = self.drop_edges(edge_index_cc, edge_attr_cc, 0.2, strategy='weak')
         
         return {
@@ -99,7 +92,6 @@ class HeteroGraphBuilder:
         self.n_spot_neighbors = n_spot_neighbors
         self.spot_distance_sigma = spot_distance_sigma
         self.composition_weight_mode = composition_weight_mode
-        self.logger = logging.getLogger(__name__)
     
     def build_spot_spot_edges(self, coords: np.ndarray, 
                              edge_weight_mode: str = 'gaussian') -> Tuple[np.ndarray, np.ndarray]:
@@ -139,7 +131,6 @@ class HeteroGraphBuilder:
         edge_index = np.array(edges_list).T  # [2, n_edges]
         edge_attr = np.array(weights_list)  # [n_edges]
         
-        self.logger.info(f"Spot-Spot edges: {edge_index.shape[1]}")
         return edge_index, edge_attr
     
     def build_spot_celltype_edges(self, spot_celltype_composition: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
@@ -163,7 +154,7 @@ class HeteroGraphBuilder:
             for celltype_id in range(n_celltypes):
                 comp = spot_celltype_composition.iloc[spot_id, celltype_id]
                 
-                # 权重转换：sqrt, log1p, 或直接使用
+                # 权重转换
                 if self.composition_weight_mode == 'sqrt':
                     weight = np.sqrt(comp)
                 elif self.composition_weight_mode == 'log1p':
@@ -178,32 +169,15 @@ class HeteroGraphBuilder:
         edge_index = np.array(edges_list).T  # [2, n_edges]
         edge_attr = np.array(weights_list)  # [n_edges]
         
-        self.logger.info(f"Spot-Celltype edges: {edge_index.shape[1]}")
         return edge_index, edge_attr
     
     def _compute_lr_score(self, celltype_expr: pd.DataFrame, 
                          celltype_i: int, celltype_j: int,
                          ligand: str, receptor: str) -> float:
-        """
-        计算从celltype_i到celltype_j的LR通讯得分
-        
-        支持联合受体（用下划线分隔的多个基因），例如：
-        - 单受体: 'EGFR'
-        - 联合受体: 'TGFbR1_TGFbR2' (两个基因都需要表达)
-        
-        Args:
-            celltype_expr: [n_celltypes, n_genes] 表达矩阵
-            celltype_i: 配体来源celltype索引
-            celltype_j: 受体来源celltype索引
-            ligand: 配体基因名
-            receptor: 受体基因名（可能包含下划线分隔的多个基因）
-        
-        Returns:
-            score: 配体和所有受体表达量的乘积
-        """
+        """计算LR通讯得分，支持联合受体（用下划线分隔）"""
         ligand_upper = ligand.upper()
         
-        # 查找配体基因表达（在celltype_i中）
+        # 查找配体基因表达
         lig_expr = None
         for col in celltype_expr.columns:
             if col.upper() == ligand_upper:
@@ -213,7 +187,7 @@ class HeteroGraphBuilder:
         if lig_expr is None or lig_expr < 1e-6:
             return 0.0
         
-        # 处理受体（可能是联合受体，用下划线分隔）
+        # 处理联合受体
         receptor_genes = [r.strip() for r in receptor.split('_')]
         receptor_product = 1.0
         
@@ -221,21 +195,17 @@ class HeteroGraphBuilder:
             receptor_upper = receptor_gene.upper()
             rec_expr = None
             
-            # 在celltype_j中查找受体基因
             for col in celltype_expr.columns:
                 if col.upper() == receptor_upper:
                     rec_expr = celltype_expr.iloc[celltype_j][col]
                     break
             
-            # 如果联合受体中任何一个基因找不到或不表达，返回0
             if rec_expr is None or rec_expr < 1e-6:
                 return 0.0
             
             receptor_product *= rec_expr
         
-        # LR通讯强度：配体表达 × 受体乘积
-        score = float(lig_expr) * receptor_product
-        return score
+        return float(lig_expr) * receptor_product
     
     def build_celltype_celltype_edges(self, celltype_expr: pd.DataFrame,
                                      lr_genes: List[Tuple[str, str]]) -> Tuple[np.ndarray, np.ndarray]:
@@ -277,7 +247,6 @@ class HeteroGraphBuilder:
         edge_index = np.array(edges_list).T if edges_list else np.array([[], []]).astype(int)
         edge_attr = np.array(weights_list) if weights_list else np.array([])
         
-        self.logger.info(f"Celltype-Celltype edges: {edge_index.shape[1] if edge_index.size > 0 else 0}")
         return edge_index, edge_attr
     
     def build_lr_score_matrix(self, celltype_expr: pd.DataFrame,
@@ -351,7 +320,6 @@ class HeteroGraphBuilder:
                         if ct_i != ct_j:
                             celltype_neighbor_mask[ct_i, ct_j] = 1
         
-        self.logger.info(f"Celltype neighbor mask built: {np.sum(celltype_neighbor_mask) / 2:.0f} neighbor pairs")
         return celltype_neighbor_mask
     
     def build_complete_graph(self, celltype_expr: pd.DataFrame,
@@ -371,20 +339,14 @@ class HeteroGraphBuilder:
             graph_data: 包含所有边信息的字典
         """
         n_celltypes = celltype_expr.shape[0]
-        n_spots = coords.shape[0] if coords is not None else 100
         
-        # 如果没有坐标，生成随机坐标
         if coords is None:
-            coords = np.random.randn(n_spots, 2) * 100
-            logging.warning(f"⚠️  未提供坐标，生成随机坐标: {coords.shape}")
+            raise ValueError("必须提供spot坐标")
         
-        # 如果没有composition，生成随机
         if composition is None:
-            composition = pd.DataFrame(
-                np.random.dirichlet(np.ones(n_celltypes), n_spots),
-                columns=celltype_expr.index
-            )
-            logging.warning(f"⚠️  未提供composition，生成随机composition: {composition.shape}")
+            raise ValueError("必须提供celltype成分矩阵")
+        
+        n_spots = coords.shape[0]
         
         # 构建三种边
         ei_ss, ea_ss = self.build_spot_spot_edges(coords)
@@ -451,5 +413,4 @@ def convert_to_torch_geometric(graph_data: Dict):
         return data
     
     except ImportError:
-        logging.warning("PyTorch Geometric not installed, returning dict format instead")
-        return graph_data
+        raise ImportError("需要安装torch_geometric: pip install torch-geometric")

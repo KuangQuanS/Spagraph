@@ -11,7 +11,7 @@ import random
 
 class EarlyStopping:
     """早停机制"""
-    def __init__(self, patience=10, min_delta=0.0001, verbose=True):
+    def __init__(self, patience=5, min_delta=0.0001, verbose=True):
         """
         Args:
             patience: 在多少个epoch内没有改善就停止
@@ -35,20 +35,16 @@ class EarlyStopping:
         if self.best_loss is None:
             self.best_loss = val_loss
             self.best_epoch = epoch
-        elif val_loss > self.best_loss - self.min_delta:
-            # 损失没有改善
-            self.counter += 1
-            if self.verbose:
-                logging.info(f'EarlyStopping counter: {self.counter}/{self.patience} (Best: {self.best_loss:.6f} at epoch {self.best_epoch+1})')
-            if self.counter >= self.patience:
-                self.early_stop = True
-        else:
-            # 损失有改善
-            if self.verbose and self.best_loss - val_loss > self.min_delta:
-                logging.info(f'Loss improved from {self.best_loss:.6f} to {val_loss:.6f}')
+        elif val_loss < self.best_loss - self.min_delta:
+            # 损失有显著改善
             self.best_loss = val_loss
             self.best_epoch = epoch
             self.counter = 0
+        else:
+            # 损失没有显著改善
+            self.counter += 1
+            if self.counter >= self.patience:
+                self.early_stop = True
         
         return self.early_stop
 
@@ -97,7 +93,6 @@ class STHeteroSubgraphDataset:
                  graph_data: Dict, lr_pairs: List[Tuple[str, str]],
                  k_neighbors: int = 10,
                  expr_threshold: float = 1.0,
-                 spot_cell_expr_npz_path: Optional[str] = None,
                  load_lr_scores_csv: Optional[str] = None,
                  min_comm_edges: int = 1,
                  valid_cell_types: Optional[List[str]] = None,
@@ -113,7 +108,6 @@ class STHeteroSubgraphDataset:
             lr_pairs: [(ligand, receptor), ...] 配体受体对列表
             k_neighbors: 邻域spot数量
             expr_threshold: LR配体受体的表达量阈值 (default: 1.0)
-            spot_cell_expr_npz_path: 预构建的spot-cell-gene表达矩阵路径
             load_lr_scores_csv: 加载预先计算的LR通讯得分CSV路径
                                CSV格式: spot_i, spot_j, cell_i, cell_j, ligand, receptor, comm_score
             min_comm_edges: 最小通讯边数阈值，少于此值的spot将被过滤 (default: 1)
@@ -137,6 +131,9 @@ class STHeteroSubgraphDataset:
         # LR对编码映射
         self.lr_pair_to_id = {}  # {(ligand, receptor): lr_id}
         self.lr_id_to_pair = {}  # {lr_id: (ligand, receptor)}
+        
+        # 用于过滤的辅助字典
+        self.lr_keys_by_spot_pair = {}  # {(spot_i, spot_j, ct_i, ct_j): [keys]}
         
         # 加载ST数据
         self.adata = sc.read_h5ad(st_h5ad_path)
@@ -186,31 +183,28 @@ class STHeteroSubgraphDataset:
         # marker基因表达用于embedding计算
         self.cell_marker_expr = cell_expr
         
-        # 加载预构建的spot-cell-gene表达矩阵
-        self.spot_cell_expr = None
-        self.cell_names = None
-        self.gene_names = None
-        self.spot_cell_expr_index = {}  # {(spot_id, cell_id): row_idx}
+        # 使用cell_expr作为细胞表达数据
+        # 假设所有spot的相同细胞类型有相同的表达
+        self.spot_cell_expr = cell_expr.values  # [n_cells, n_marker_genes]
+        self.cell_names = cell_expr.index.tolist()
+        self.gene_names = cell_expr.columns.tolist()
+        self.spot_cell_expr_index = {}
+
+        # 每个细胞类型在所有spot中共享表达
+        spot_names = self.adata.obs_names.tolist()
+        cell_names_list = self.cell_expr.index.tolist()
+        for spot_idx in range(self.n_spots):
+            for cell_idx in range(len(cell_names_list)):
+                if self.composition.iloc[spot_idx, cell_idx] > 1e-6:
+                    self.spot_cell_expr_index[(spot_idx, cell_idx)] = cell_idx
         
-        if spot_cell_expr_npz_path is not None:
-            self._load_spot_cell_expr(spot_cell_expr_npz_path)
-        else:
-            print("[Warning] spot_celltype_expr_npz_path not provided.")
-        
-        # 加载预先计算的LR通讯得分（如果提供）
         if load_lr_scores_csv is not None:
             self._load_lr_scores_from_csv(load_lr_scores_csv)
-            # _load_lr_scores_from_csv 会在末尾调用 _filter_valid_spots
         else:
-            # 如果没有提供LR得分CSV，初始化valid_spot_indices为所有spot
-            print(f"[Warning] No LR scores CSV provided. Using all {self.n_spots} spots.")
-            self.valid_spot_indices = np.arange(self.n_spots)
-            self.spot_comm_counts = np.zeros(self.n_spots)
-            # 初始化其他相关属性
-            self.lr_scores_dict = {}
-            self.lr_keys_by_spot_pair = {}
-            self.lr_pair_to_id = {}
-            self.lr_id_to_pair = {}
+            raise ValueError("必须提供load_lr_scores_csv")
+        
+        # 过滤有效spot
+        self._filter_valid_spots(self.min_comm_edges)
         
         # ========== 预计算基因索引映射，避免每次都查找 ==========
         self.marker_gene_to_idx = {}
@@ -227,118 +221,16 @@ class STHeteroSubgraphDataset:
             else:
                 # 如果cell marker基因不在cluster基因中，用-1表示缺失
                 self.spot_gene_order_to_cell.append(-1)
-        
         print(f"[Optimized] Pre-computed gene index mapping for {len(self.marker_gene_to_idx)} marker genes")
         print(f"[Aligned] Spot and cell gene orders aligned to {len(self.spot_gene_order_to_cell)} marker genes")
-        
-        # ========== 最后的安全检查：确保所有关键属性被初始化 ==========
-        if not hasattr(self, 'valid_spot_indices') or self.valid_spot_indices is None:
-            print(f"[Warning] valid_spot_indices not initialized. Using all {self.n_spots} spots as fallback.")
-            self.valid_spot_indices = np.arange(self.n_spots)
-            self.spot_comm_counts = np.zeros(self.n_spots)
-        
-        if not hasattr(self, 'lr_keys_by_spot_pair') or self.lr_keys_by_spot_pair is None:
-            print(f"[Warning] lr_keys_by_spot_pair not initialized. Using empty dict as fallback.")
-            self.lr_keys_by_spot_pair = {}
-        
-        if not hasattr(self, 'lr_scores_dict') or self.lr_scores_dict is None:
-            print(f"[Warning] lr_scores_dict not initialized. Using empty dict as fallback.")
-            self.lr_scores_dict = {}
     
-    def _load_spot_cell_expr(self, npz_path: str):
-        """
-        加载预构建的spot-cell-gene表达矩阵
-        
-        Args:
-            npz_path: npz文件路径，包含：
-                - spot_cell_expr: [n_spot_cells, n_genes] 2D数组，行名为"spot_name_cell_name"
-                - cell_names: cell名称列表，格式为["spot1_c1", "spot1_c2", ..., "spot2_c1", ...]
-                - gene_names: 基因名称列表
-        """
-        npz_path = Path(npz_path)
-        if not npz_path.exists():
-            print(f"[Warning] Spot-cell expression file not found: {npz_path}")
-            return
-        
-        print(f"[Loading] Spot-cell expression from {npz_path}")
-        data = np.load(npz_path, allow_pickle=True)
-        
-        # 支持向后兼容：新版本使用'spot_cell_expr'，旧版本使用'spot_celltype_expr'
-        if 'spot_cell_expr' in data:
-            spot_cell_expr_full = data['spot_cell_expr']  # [n_spot_cells, n_genes]
-            cell_names_full = list(data['cell_names'])  # ["spot1_c1", "spot1_c2", ...]
-        else:
-            raise KeyError("NPZ file must contain either 'spot_cell_expr' or 'spot_celltype_expr' key")
-        
-        self.gene_names = list(data['gene_names'])
-        
-        # ========== 应用细胞类型过滤 ==========
-        if self.valid_cell_types is not None:
-            print(f"[Filtering] Applying cell type filter: {len(self.valid_cell_types)} valid cell types")
-            filtered_indices = []
-            filtered_cell_names = []
-            
-            for idx, cell_name_combined in enumerate(cell_names_full):
-                # 解析 "spot_name_cell_name" 格式
-                parts = cell_name_combined.rsplit('_', 1)
-                if len(parts) == 2:
-                    spot_name, cell_name = parts
-                    if cell_name in self.valid_cell_types:
-                        filtered_indices.append(idx)
-                        filtered_cell_names.append(cell_name_combined)
-            
-            self.spot_cell_expr = spot_cell_expr_full[filtered_indices]
-            self.cell_names = filtered_cell_names
-            print(f"[Filtered] Kept {len(filtered_cell_names)}/{len(cell_names_full)} spot-cell entries")
-        else:
-            self.spot_cell_expr = spot_cell_expr_full
-            self.cell_names = cell_names_full
-        
-        # 构建快速查询字典：{(spot_name, cell_id): row_idx_in_array}
-        self.spot_cell_expr_index = {}
-        for idx, name in enumerate(self.cell_names):
-            parts = name.rsplit('_', 1)  # 从右边分割，分离出spot_name和cell_name
-            if len(parts) == 2:
-                spot_name, cell_name = parts
-                # 查找cell_id
-                try:
-                    cell_id = self.cell_expr.index.tolist().index(cell_name)
-                    # 查找spot的全局索引
-                    spot_id = self.adata.obs_names.tolist().index(spot_name)
-                    self.spot_cell_expr_index[(spot_id, cell_id)] = idx
-                except ValueError:
-                    pass
-        
-        print(f"[Loaded] Spot-cell expression shape: {self.spot_cell_expr.shape}")
-        print(f"[Loaded] Cells: {len(self.cell_names)} entries")
-        print(f"[Loaded] Genes: {len(self.gene_names)}")
-    
+
     def _load_lr_scores_from_csv(self, csv_path: str):
-        """
-        从CSV文件加载预先计算的LR通讯得分
-        
-        Args:
-            csv_path: CSV文件路径
-                     CSV格式: spot_i, spot_j, cell_i, cell_j, ligand, receptor, comm_score
-                     其中 spot_i/spot_j 是spot的barcode
-                     cell_i/cell_j 是 "barcode_celltype" 格式
-        """
+        """从CSV文件加载预先计算的LR通讯得分"""
         csv_path = Path(csv_path)
         if not csv_path.exists():
-            print(f"[Warning] LR scores CSV file not found: {csv_path}")
-            # 如果CSV文件不存在，初始化valid_spot_indices为所有spot
-            self.valid_spot_indices = np.arange(self.n_spots)
-            self.spot_comm_counts = np.zeros(self.n_spots)
-            # 初始化其他相关属性
-            self.lr_scores_dict = {}
-            self.lr_keys_by_spot_pair = {}
-            if not hasattr(self, 'lr_pair_to_id'):
-                self.lr_pair_to_id = {}
-            if not hasattr(self, 'lr_id_to_pair'):
-                self.lr_id_to_pair = {}
-            return
+            raise FileNotFoundError(f"找不到LR得分CSV文件: {csv_path}")
         
-        print(f"[Loading] LR communication scores from {csv_path}")
         df = pd.read_csv(csv_path)
         
         # 获取spot名称列表和cell名称列表
@@ -346,7 +238,7 @@ class STHeteroSubgraphDataset:
         cell_names_list = self.cell_expr.index.tolist()
         
         # 构建查询字典：{(spot_i_idx, spot_j_idx, cell_i_idx, cell_j_idx, ligand, receptor): score}
-        lr_id_counter = 0
+        lr_id_counter = 1  # 从1开始，避免与相似度边的ID=0冲突
         for idx, row in df.iterrows():
             spot_i_barcode = row['spot_i']
             spot_j_barcode = row['spot_j']
@@ -380,43 +272,21 @@ class STHeteroSubgraphDataset:
                 
                 key = (spot_i_idx, spot_j_idx, cell_i_idx, cell_j_idx, ligand, receptor)
                 self.lr_scores_dict[key] = float(row['comm_score'])
+                
+                # 同时更新lr_keys_by_spot_pair
+                spot_pair_key = (spot_i_idx, spot_j_idx, cell_i_idx, cell_j_idx)
+                if spot_pair_key not in self.lr_keys_by_spot_pair:
+                    self.lr_keys_by_spot_pair[spot_pair_key] = []
+                self.lr_keys_by_spot_pair[spot_pair_key].append(key)
             except ValueError:
                 # 如果barcode或cell名称找不到，跳过这条记录
                 continue
         
         print(f"[Loaded] Total LR score entries: {len(self.lr_scores_dict)}")
         print(f"[Loaded] Unique LR pairs: {len(self.lr_pair_to_id)}")
-        
-        # 保存LR对映射到文件
-        lr_mapping_path = csv_path.parent / "lr_pair_mapping.txt"
-        with open(lr_mapping_path, 'w') as f:
-            f.write("lr_id\tligand\treceptor\n")
-            for lr_id, (ligand, receptor) in self.lr_id_to_pair.items():
-                f.write(f"{lr_id}\t{ligand}\t{receptor}\n")
-        print(f"[Saved] LR pair mapping to {lr_mapping_path}")
-        
-        # ========== 预处理LR查询优化 ==========
-        # 构建按spot-cell对分组的LR键索引，避免每次都遍历所有LR对
-        self.lr_keys_by_spot_pair = {}  # {(spot_i, spot_j, cell_i, cell_j): [key1, key2, ...]}
-        for key in self.lr_scores_dict.keys():
-            spot_i, spot_j, cell_i, cell_j, ligand, receptor = key
-            pair_key = (spot_i, spot_j, cell_i, cell_j)
-            if pair_key not in self.lr_keys_by_spot_pair:
-                self.lr_keys_by_spot_pair[pair_key] = []
-            self.lr_keys_by_spot_pair[pair_key].append(key)
-        
-        print(f"[Optimized] LR keys grouped by {len(self.lr_keys_by_spot_pair)} spot-cell pairs")
-        
-        # ========== 预过滤：只保留有足够通讯边的spot ==========
-        self._filter_valid_spots(self.min_comm_edges)
     
     def _filter_valid_spots(self, min_comm_edges: int):
-        """
-        预先过滤掉没有通讯边（或通讯边太少）的spot
-        
-        Args:
-            min_comm_edges: 最小通讯边数阈值（默认1，即至少有1条通讯边）
-        """
+        """预过滤掉没有通讯边或通讯边太少的spot"""
         print(f"\n[Filtering] 检查每个spot的通讯边数量...")
         valid_spots = []
         spot_comm_counts = []
@@ -460,44 +330,22 @@ class STHeteroSubgraphDataset:
         
         self.valid_spot_indices = np.array(valid_spots)
         self.spot_comm_counts = np.array(spot_comm_counts)
-        
-        print(f"[Filtering] 统计结果:")
-        print(f"   - 总spot数: {self.n_spots}")
-        print(f"   - 有通讯边的spot: {len(valid_spots)} ({len(valid_spots)/self.n_spots*100:.1f}%)")
-        print(f"   - 无通讯边的spot: {self.n_spots - len(valid_spots)} ({(self.n_spots-len(valid_spots))/self.n_spots*100:.1f}%)")
-        print(f"   - 平均通讯边数: {np.mean(spot_comm_counts):.1f}")
-        print(f"   - 中位数通讯边数: {np.median(spot_comm_counts):.1f}")
-        print(f"   - 最大通讯边数: {np.max(spot_comm_counts)}")
-        
-        if len(valid_spots) < self.n_spots * 0.5:
-            print(f"[Warning] 超过50%的spot没有通讯边，请检查LR通讯得分阈值设置")
     
     def __len__(self):
-        # 返回有效spot数量，而不是全部spot数量
-        return len(self.valid_spot_indices)
+        # 返回有效spot数量，如果没有过滤则返回全部spot数量
+        if hasattr(self, 'valid_spot_indices'):
+            return len(self.valid_spot_indices)
+        else:
+            return self.n_spots
     
     def __getitem__(self, idx):
-        """获取单个子图样本 - 固定celltype数量的异构子图
-        
-        返回：
-            dict包含：
-            - center_spot_idx: 中心spot全局索引
-            - subgraph_spot_indices: 子图中所有spot的全局索引 [center, neighbor1, ..., neighbork]
-            - expr_raw: [k+1, n_marker_genes] 所有spot的marker基因原始表达谱（顺序与cell一致）
-            - cell_expr_raw: [(k+1)*n_cells, n_marker_genes] 所有cell的原始marker基因表达谱
-            - cell_full_expr: [n_cells, n_all_genes] 所有cell的全基因表达（用于LR计算）
-            - edge_index_ss: [2, num_edges] spot-spot边
-            - edge_attr_ss: [num_edges] spot-spot权重
-            - edge_index_sc: [2, num_edges] spot-cell边（固定9个cell节点）
-            - edge_attr_sc: [num_edges] spot-cell权重（由composition决定，无则为0）
-            - edge_index_cc: [2, num_edges] cell-cell边
-            - edge_attr_cc: [num_edges] cell-cell权重
-            - coords_subgraph: [k+1, 2] 子图中spot的坐标
-            - composition_subgraph: [k+1, n_cells] 子图中spot的composition（完整9个）
-        """
+        """获取单个子图样本"""
         # ========== Step 1: 获取邻域spot（从有效spot列表中映射）==========
         # idx是有效spot列表中的索引，需要映射到原始spot索引
-        center_idx = self.valid_spot_indices[idx]
+        if hasattr(self, 'valid_spot_indices'):
+            center_idx = self.valid_spot_indices[idx]
+        else:
+            center_idx = idx
         neighbor_indices = self.knn_indices[center_idx]
         subgraph_spot_indices = np.concatenate([[center_idx], neighbor_indices])
         n_spots_sub = len(subgraph_spot_indices)
@@ -718,18 +566,7 @@ class STHeteroSubgraphDataset:
 
 
 def hetero_subgraph_collate_fn(batch):
-    """
-    自定义 collate_fn 处理异构子图批次
-    
-    ✅ 支持动态 cell 节点数：每个 subgraph 可以有不同数量的 cell 节点
-    返回列表而不是堆叠的张量（因为维度可能不同）
-    
-    Args:
-        batch: 列表，每个元素是 STHeteroSubgraphDataset 返回的字典
-    
-    Returns:
-        batch_dict: 包含数据列表的字典
-    """
+    """自定义collate_fn处理异构子图批次"""
     batch_size = len(batch)
     
     # ✅ 每个样本的 spot 数量可能不同（因为邻居数量受距离阈值影响）
@@ -743,9 +580,9 @@ def hetero_subgraph_collate_fn(batch):
     
     # 边保持为列表（因为边数可能不同）
     edge_index_like_list = [sample['edge_index_like'] for sample in batch]  # list of [2, E_i]
-    edge_attr_like_list = [sample['edge_attr_like'] for sample in batch]    # list of [E_i]
+    edge_attr_like_list = [torch.cat([sample['edge_attr_like'].unsqueeze(-1), torch.zeros_like(sample['edge_attr_like'].unsqueeze(-1))], dim=-1) for sample in batch]    # list of [E_i, 2] - [weight, 0]
     edge_index_cc_list = [sample['edge_index_cc'] for sample in batch]      # list of [2, E_i]
-    edge_attr_cc_list = [sample['edge_attr_cc'] for sample in batch]        # list of [E_i, 2] - [lr_score, lr_id]
+    edge_attr_cc_list = [sample['edge_attr_cc'] for sample in batch]        # list of [E_i, 2] - [lr_score, lr_id+1]
     
     # ✅ 收集每个样本的实际 cell 节点数
     n_cells_list = [sample['n_cells'] for sample in batch]
@@ -755,6 +592,7 @@ def hetero_subgraph_collate_fn(batch):
         'n_spots_sub': n_spots_sub_list,  # ✅ 改为列表，每个样本可能不同
         'n_cells': n_cells_list,  # ✅ 改为列表，每个样本可能不同
         'center_spot_idx': [sample['center_spot_idx'] for sample in batch],
+        'spot_cell_mapping': [sample['spot_cell_mapping'] for sample in batch],  # ✅ 添加spot_cell_mapping
         'expr_raw': expr_raw_list,  # ✅ list of [n_spots_i, n_marker_genes]
         'cell_expr_raw': cell_expr_raw_list,  # ✅ list of [n_cells_i, n_marker_genes]
         'edge_index_like': edge_index_like_list,  # list of [2, E_i]

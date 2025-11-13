@@ -19,9 +19,8 @@ def calculate_lr_scores(
     composition: Optional[pd.DataFrame],
     args: Any,
     adata: Any,
-    cell_expr: pd.DataFrame,
+    cell_full_expr: pd.DataFrame,
     lr_pairs: List[Tuple[str, str]],
-    spot_cell_expr_npz_path: str,
     output_dir: str
 ) -> Tuple[np.ndarray, str, Dict[str, Any]]:
     """
@@ -32,9 +31,8 @@ def calculate_lr_scores(
         composition: Cell composition matrix [n_spots, n_cells]
         args: Arguments object containing various parameters
         adata: ST data object (AnnData)
-        cell_expr: Cell expression matrix [n_cells, n_genes]
+        cell_full_expr: Cell full expression matrix [n_cells, n_genes]
         lr_pairs: List of LR pairs [(ligand, receptor), ...]
-        spot_cell_expr_npz_path: Path to spot-cell expression NPZ file
         output_dir: Output directory for results
 
     Returns:
@@ -83,7 +81,7 @@ def calculate_lr_scores(
 
     # ✅ 计算并保存LR通讯得分矩阵（使用 output_dir）
     logging.info("开始计算LR通讯得分...")
-    logging.info(f"   - 活跃基因筛选: 表达比例≥10% 且 normalize_total(1e4) > {args.mean_expr_threshold}")
+    logging.info(f"   - 活跃基因筛选: normalize_total(1e4) > {args.mean_expr_threshold}")
     logging.info(f"   - 通讯得分过滤阈值: {args.lr_comm_score_threshold}")
     logging.info(f"   - 距离衰减参数sigma: {args.lr_distance_sigma}")
 
@@ -92,27 +90,21 @@ def calculate_lr_scores(
     logging.info(f"   - KNN mask中非零元素数: {np.count_nonzero(knn_mask)}")
     logging.info(f"   - 平均每个spot的邻居数: {np.count_nonzero(knn_mask) / N:.2f}")
 
-    # 加载spot-cell表达数据
-    npz_data = np.load(spot_cell_expr_npz_path, allow_pickle=True)
-    spot_cell_expr_array = npz_data['spot_cell_expr']
-    cell_names_in_npz = list(npz_data['cell_names'])
-    gene_names_in_npz = list(npz_data['gene_names'])
-
-    # 构建查询字典: {(spot_idx, cell_idx): array_row_idx}
+    # ✅ 准备数据结构
     spot_names = adata.obs_names.tolist()
-    cell_names_list = cell_expr.index.tolist()
-    spot_cell_expr_index = {}
-
-    for idx, name in enumerate(cell_names_in_npz):
-        parts = name.rsplit('_', 1)
-        if len(parts) == 2:
-            spot_name, cell_name = parts
-            try:
-                cell_id = cell_names_list.index(cell_name)
-                spot_id = spot_names.index(spot_name)
-                spot_cell_expr_index[(spot_id, cell_id)] = idx
-            except ValueError:
-                pass
+    spot_cell_expr_array = cell_full_expr.values  # [n_spot_cells, n_genes]
+    spot_cell_names = cell_full_expr.index.tolist()  # ['spot_barcode_celltype', ...]
+    gene_names_in_npz = cell_full_expr.columns.tolist()
+    
+    # 构建快速查询字典: spot_cell_name -> array_row_idx
+    spot_cell_name_to_idx = {name: idx for idx, name in enumerate(spot_cell_names)}
+    
+    # 提取实际存在的细胞类型（从composition的列名）
+    cell_types = composition.columns.tolist()
+    
+    logging.info(f"   - Spot数量: {N}")
+    logging.info(f"   - 细胞类型数: {len(cell_types)}")
+    logging.info(f"   - Spot-cell总数: {len(spot_cell_names)}")
 
     # ========== 优化1：预构建基因索引字典 ==========
     # 避免在循环中重复查找基因索引
@@ -143,66 +135,42 @@ def calculate_lr_scores(
     logging.info(f"   - 血红蛋白基因: {sum(1 for g in filtered_genes if g.upper().startswith('HB'))}")
     logging.info(f"   - 假基因: {sum(1 for g in filtered_genes if 'PSEUDO' in g.upper() or g.upper().endswith('-AS1') or g.upper().startswith('LOC'))}")
 
-    # ========== 新增：筛选每个细胞类型中的活跃基因 ==========
-    # 活跃基因定义：表达比例≥10% 且 normalize_total(1e4) > threshold
-    logging.info("筛选每个细胞类型中的活跃基因...")
-    cell_active_genes_ligand = {}  # cell_name -> set of active ligand gene indices
-    cell_active_genes_receptor = {}  # cell_name -> set of active receptor gene indices
+    # ========== 筛选每个细胞中的活跃基因（表达值过滤）==========
+    logging.info("筛选每个细胞中的活跃基因（基于表达阈值）...")
+    cell_active_genes_ligand = {}  # spot_cell_key -> set of active ligand gene indices
+    cell_active_genes_receptor = {}  # spot_cell_key -> set of active receptor gene indices
 
-    expr_proportion_threshold = 0.1  # 10%的细胞中表达
-    mean_expr_threshold = args.mean_expr_threshold  # ✅ 使用超参数，配体和受体统一阈值
+    mean_expr_threshold = args.mean_expr_threshold  # 表达阈值
+    
+    # 过滤掉不参与通讯的基因索引（提前计算）
+    filtered_gene_indices = set()
+    for gene_name in filtered_genes:
+        if gene_name in gene_names_in_npz:
+            gene_idx = gene_names_in_npz.index(gene_name)
+            filtered_gene_indices.add(gene_idx)
 
-    for cell_idx, cell_name in enumerate(cell_names_list):
-        # 收集该细胞类型的所有表达数据
-        cell_exprs = []
-        for spot_idx in range(N):
-            spot_name = spot_names[spot_idx]
-            cell_combined_name = f"{spot_name}_{cell_name}"
-            if cell_combined_name in cell_names_in_npz:
-                array_idx = cell_names_in_npz.index(cell_combined_name)
-                cell_exprs.append(spot_cell_expr_array[array_idx])
+    # 遍历每个具体的细胞，计算其活跃基因
+    for spot_cell_name in spot_cell_names:
+        idx = spot_cell_name_to_idx[spot_cell_name]
+        cell_expr = spot_cell_expr_array[idx, :]  # [n_genes]
+        
+        # 对单个细胞进行normalize
+        total_count = cell_expr.sum()
+        if total_count > 0:
+            cell_expr_normalized = cell_expr / total_count * 1e4  # [n_genes]
+        else:
+            cell_expr_normalized = cell_expr  # 表达全为0的情况
+        
+        # 筛选活跃基因：归一化后的表达值 > threshold
+        active_mask = cell_expr_normalized > mean_expr_threshold
+        active_gene_indices = set(np.where(active_mask)[0]) - filtered_gene_indices
+        
+        # 配体和受体使用相同的活跃基因集合
+        cell_active_genes_ligand[spot_cell_name] = active_gene_indices
+        cell_active_genes_receptor[spot_cell_name] = active_gene_indices
 
-        if not cell_exprs:
-            cell_active_genes_ligand[cell_name] = set()
-            cell_active_genes_receptor[cell_name] = set()
-            continue
-
-        cell_expr_matrix = np.array(cell_exprs)  # [n_cells_of_this_type, n_genes]
-
-        # ✅ 归一化 - 每个细胞normalize到总和为10000
-        cell_totals = cell_expr_matrix.sum(axis=1, keepdims=True)  # [n_cells, 1]
-        cell_totals[cell_totals == 0] = 1  # 避免除以0
-        cell_expr_normalized = cell_expr_matrix / cell_totals * 1e4  # [n_cells, n_genes]
-
-        # 计算每个基因的统计信息
-        # 1. 表达比例：在多少比例的细胞中表达 (原始expr > 0)
-        expr_proportion = np.mean(cell_expr_matrix > 0, axis=0)  # [n_genes]
-
-        # 2. 标准化后的平均表达：mean(normalized_expr)
-        mean_expr = np.mean(cell_expr_normalized, axis=0)  # [n_genes]
-
-        # 3. 过滤掉不参与通讯的基因
-        filtered_gene_indices = set()
-        for gene_name in filtered_genes:
-            if gene_name in gene_names_in_npz:
-                gene_idx = gene_names_in_npz.index(gene_name)
-                filtered_gene_indices.add(gene_idx)
-
-        # ✅ 筛选活跃配体基因：表达比例≥10% 且 平均表达 > threshold（统一阈值）
-        active_mask_ligand = (expr_proportion >= expr_proportion_threshold) & \
-                             (mean_expr > mean_expr_threshold)
-        active_ligand_indices = set(np.where(active_mask_ligand)[0]) - filtered_gene_indices
-
-        # ✅ 筛选活跃受体基因：表达比例≥10% 且 平均表达 > threshold（统一阈值）
-        active_mask_receptor = (expr_proportion >= expr_proportion_threshold) & \
-                               (mean_expr > mean_expr_threshold)
-        active_receptor_indices = set(np.where(active_mask_receptor)[0]) - filtered_gene_indices
-
-        cell_active_genes_ligand[cell_name] = active_ligand_indices
-        cell_active_genes_receptor[cell_name] = active_receptor_indices
-
-        logging.info(f"   - {cell_name}: 配体={len(active_ligand_indices)}, 受体={len(active_receptor_indices)} "
-                    f"(过滤前: {np.sum(active_mask_ligand)}/{np.sum(active_mask_receptor)})")
+    logging.info(f"   - 处理了 {len(spot_cell_names)} 个细胞")
+    logging.info(f"   - 平均每个细胞活跃基因数: {np.mean([len(genes) for genes in cell_active_genes_ligand.values()]):.1f}")
 
     # ========== 优化2：预处理LR对，构建索引映射 ==========
     # 将LR对转换为索引对，并过滤掉不存在的基因
@@ -235,8 +203,6 @@ def calculate_lr_scores(
     # 初始化通讯事件记录
     comm_event_records = []
 
-    n_cells = len(cell_names_list)
-
     # ========== 优化3：使用进度条和批量处理 ==========
     logging.info("   - 开始遍历KNN邻居对...")
     total_pairs = 0
@@ -246,7 +212,7 @@ def calculate_lr_scores(
 
     # 遍历所有KNN邻居对
     for i in range(N):
-        spot_i_barcode = spot_names[i]  # 获取spot i的barcode
+        spot_i_barcode = spot_names[i]
 
         # 获取spot i的cell composition
         composition_i = composition.iloc[i].values
@@ -263,7 +229,7 @@ def calculate_lr_scores(
                 continue
 
             total_pairs += 1
-            spot_j_barcode = spot_names[j]  # 获取spot j的barcode
+            spot_j_barcode = spot_names[j]
 
             # 获取spot j的cell composition
             composition_j = composition.iloc[j].values
@@ -274,37 +240,43 @@ def calculate_lr_scores(
 
             # 遍历cell对，计算LR通讯
             for cell_i_idx in cell_in_i:
-                idx_i = spot_cell_expr_index.get((i, cell_i_idx))
-                if idx_i is None:
+                # ✅ 获取细胞类型名称（从composition的列名）
+                celltype_i = cell_types[cell_i_idx]
+                spot_cell_i_key = f"{spot_i_barcode}_{celltype_i}"
+                
+                # 查询该spot-cell是否存在
+                if spot_cell_i_key not in spot_cell_name_to_idx:
                     continue
-
+                
+                idx_i = spot_cell_name_to_idx[spot_cell_i_key]
                 cell_i_expr = spot_cell_expr_array[idx_i, :]
-                cell_i_name = cell_names_list[cell_i_idx]  # 获取cell名称
-                cell_i = f"{spot_i_barcode}_{cell_i_name}"  # 组合成cell名称
 
                 for cell_j_idx in cell_in_j:
-                    idx_j = spot_cell_expr_index.get((j, cell_j_idx))
-                    if idx_j is None:
+                    # ✅ 获取细胞类型名称
+                    celltype_j = cell_types[cell_j_idx]
+                    spot_cell_j_key = f"{spot_j_barcode}_{celltype_j}"
+                    
+                    # 查询该spot-cell是否存在
+                    if spot_cell_j_key not in spot_cell_name_to_idx:
                         continue
-
+                    
+                    idx_j = spot_cell_name_to_idx[spot_cell_j_key]
                     cell_j_expr = spot_cell_expr_array[idx_j, :]
-                    cell_j_name = cell_names_list[cell_j_idx]  # 获取cell名称
-                    cell_j = f"{spot_j_barcode}_{cell_j_name}"  # 组合成cell名称
 
                     # ✅ 跳过相同细胞类型之间的通讯
-                    if cell_i_name == cell_j_name:
+                    if celltype_i == celltype_j:
                         same_celltype_skipped += 1
                         continue
 
                     # ========== 优化4：向量化LR得分计算 ==========
                     # 使用预处理的LR索引，避免重复查找
                     for lig_idx, rec_indices, ligand, receptor in valid_lr_pairs:
-                        # 检查配体基因是否在源细胞中活跃（配体阈值 > 0.5）
-                        if lig_idx not in cell_active_genes_ligand[cell_i_name]:
+                        # 检查配体基因是否在源细胞中活跃
+                        if lig_idx not in cell_active_genes_ligand[spot_cell_i_key]:
                             continue
 
-                        # 检查所有受体基因是否在目标细胞中活跃（受体阈值 > 0.3）
-                        receptor_active = all(rec_idx in cell_active_genes_receptor[cell_j_name] for rec_idx in rec_indices)
+                        # 检查所有受体基因是否在目标细胞中活跃
+                        receptor_active = all(rec_idx in cell_active_genes_receptor[spot_cell_j_key] for rec_idx in rec_indices)
                         if not receptor_active:
                             continue
 
@@ -326,7 +298,9 @@ def calculate_lr_scores(
                         # ✅ 过滤低于阈值的通讯事件
                         if score >= args.lr_comm_score_threshold:
                             comm_event_records.append([
-                                spot_i_barcode, spot_j_barcode, cell_i, cell_j, ligand, receptor, score
+                                spot_i_barcode, spot_j_barcode, 
+                                spot_cell_i_key, spot_cell_j_key,  # ✅ 使用完整的spot_cell名称
+                                ligand, receptor, score
                             ])
 
         # 每处理100个spot打印一次进度

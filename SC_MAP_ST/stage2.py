@@ -307,6 +307,17 @@ class GATDeconvolution:
             print("\n   ⚠️ Warning: sc_clusters not available, proportion loss will not be effective")
             print("      Tip: Make sure stage1 saves sc_clusters or sc_adata_clustered.h5ad exists")
         
+        # ✅ 准备 celltype_expressions_full (全部基因) 和 marker_gene_indices
+        # celltype_expressions_full: [n_cell_types, n_all_genes]
+        # 注意: self.celltype_expressions_full 是 list of arrays，需要 stack 成 2D array
+        # 强制转换为 float64 避免 object dtype 问题
+        celltype_expr_full = np.vstack([np.asarray(expr, dtype=np.float64) for expr in self.celltype_expressions_full])
+        print(f"\n   Celltype expressions (all genes): {celltype_expr_full.shape}, dtype={celltype_expr_full.dtype}")
+        
+        # 计算 marker 基因在全部基因中的索引
+        marker_gene_indices = [self.all_genes.index(g) for g in self.genes]
+        print(f"   Marker gene indices: {len(marker_gene_indices)} markers in {len(self.all_genes)} all genes")
+        
         self.loss_fn = SpatialDeconvolutionLoss(
             lambda_pearson=loss_lambda_pearson,
             lambda_mse=loss_lambda_mse,
@@ -315,7 +326,9 @@ class GATDeconvolution:
             lambda_sparse=loss_lambda_sparse,
             lambda_proportion=loss_lambda_proportion,
             sc_celltype_proportions=sc_celltype_proportions,
-            spot_total_counts=self.spot_total_counts  # ✅ Pass spot_total_counts to loss function
+            spot_total_counts=self.spot_total_counts,
+            celltype_expressions_full=celltype_expr_full,
+            marker_gene_indices=marker_gene_indices
         )
         
         gat_params = sum(p.numel() for p in self.gat_model.parameters())
@@ -699,14 +712,6 @@ class GATDeconvolution:
         print(f"   Saved cluster composition: {cluster_file}")
         
         # ============ Compute reconstruction quality (Cosine Similarity) ============
-        print("\nComputing reconstruction quality per spot...")
-        
-        # ✅ 重建质量评估应该只看 marker 基因（模型训练优化的目标）
-        # 不使用全基因集，因为：
-        # 1. GAT 模型训练时只优化 marker 基因的重建
-        # 2. Loss 函数（Pearson/MSE/Cosine）都是基于 marker 基因计算
-        # 3. 全基因重建只是用于生成完整表达矩阵，不代表模型真实性能
-        
         celltype_expr_marker = self.celltype_expressions.cpu().numpy()
         reconstructed_marker_expr = np.dot(deconv_weights, celltype_expr_marker)
         
@@ -994,16 +999,23 @@ def main():
     if 'spatial' not in st_adata.obsm:
         raise ValueError(f"ST data file {args.st_file} missing spatial coordinates! ST data must contain 'spatial' coordinates (adata.obsm['spatial']).")
     
-    # Extract ST marker genes
+    # ✅ 计算全部基因的 spot total counts (用于重建时的 scaling)
+    # 必须在全部基因上计算，因为 celltype_expressions_full 是在全部基因上 normalize 1e4 的
+    if trainer.all_genes is None:
+        raise ValueError("all_genes not found in Stage 1 checkpoint! Please retrain Stage 1.")
+    
+    # Filter ST to all_genes (used in Stage 1)
+    st_all_genes_subset = st_adata[:, [g for g in trainer.all_genes if g in st_adata.var_names]].copy()
+    st_all_genes_raw = st_all_genes_subset.X.toarray() if hasattr(st_all_genes_subset.X, 'toarray') else st_all_genes_subset.X
+    spot_total_counts = st_all_genes_raw.sum(axis=1)  # Shape: [n_spots] - sum over ALL genes
+    print(f"ST spot total counts (all {len(trainer.all_genes)} genes): min={spot_total_counts.min():.1f}, max={spot_total_counts.max():.1f}, mean={spot_total_counts.mean():.1f}")
+    
+    # Extract ST marker genes (for loss calculation)
     st_subset = st_adata[:, trainer.genes].copy()
-    print(f"ST matching genes: {len(trainer.genes)}/{len(trainer.genes)}")
+    print(f"ST matching marker genes: {len(trainer.genes)}/{len(trainer.genes)}")
     
-    # ✅ 保存原始 raw counts (用于计算 loss)
+    # ✅ 保存原始 raw counts (marker genes only, 用于计算 loss)
     st_X_raw = st_subset.X.toarray() if hasattr(st_subset.X, 'toarray') else st_subset.X
-    
-    # Calculate total counts per spot (for scaling in reconstruction)
-    spot_total_counts = st_X_raw.sum(axis=1)  # Shape: [n_spots]
-    print(f"ST spot total counts: min={spot_total_counts.min():.1f}, max={spot_total_counts.max():.1f}, mean={spot_total_counts.mean():.1f}")
     
     # ✅ Normalize ST data for VAE embedding (consistent with Stage 1 training: 1e4)
     sc.pp.normalize_total(st_subset, target_sum=1e4)

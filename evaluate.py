@@ -231,12 +231,48 @@ def evaluate_cell_communication(
     logging.info(f"   - 解释：modulated_score = 基础强度 × 模型学习的重要性因子")
 
 
-def plot_training_loss(train_losses: List[float], output_dir: str, epochs: int = None) -> None:
+def plot_dgi_loss(dgi_train_losses, dgi_val_losses=None, output_dir: str = None, epochs: int = None) -> None:
+    """
+    Plot and save DGI pretraining loss curve.
+
+    Args:
+        dgi_train_losses: List of DGI pretraining training losses for each epoch
+        dgi_val_losses: List of DGI pretraining validation losses for each epoch (optional)
+        output_dir: Output directory for the plot
+        epochs: Total number of epochs (optional, will use len(dgi_train_losses) if not provided)
+    """
+    # ✅ 使用实际训练的epoch数，而不是预设的epochs参数
+    actual_epochs = len(dgi_train_losses)
+    
+    plt.figure(figsize=(10, 6))
+    plt.plot(range(1, actual_epochs + 1), dgi_train_losses, label="DGI Train Loss", linewidth=2, marker='o', color='orange')
+    
+    if dgi_val_losses is not None and len(dgi_val_losses) > 0:
+        plt.plot(range(1, len(dgi_val_losses) + 1), dgi_val_losses, label="DGI Val Loss", linewidth=2, marker='s', color='red', linestyle='--')
+    
+    plt.xlabel("Epoch", fontsize=12)
+    plt.ylabel("Loss", fontsize=12)
+    plt.title(f"DGI Pretraining Loss Curve (Trained {actual_epochs} epochs)", fontsize=14)
+    plt.legend(fontsize=11)
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    
+    if output_dir is not None:
+        dgi_loss_curve_path = os.path.join(output_dir, "dgi_loss_curve.png")
+        plt.savefig(dgi_loss_curve_path, dpi=150)
+        plt.close()
+        logging.info(f"DGI预训练损失曲线已保存: {dgi_loss_curve_path}")
+    else:
+        plt.show()
+
+
+def plot_training_loss(train_losses: List[float], val_losses: List[float] = None, output_dir: str = None, epochs: int = None) -> None:
     """
     Plot and save training loss curve.
 
     Args:
         train_losses: List of training losses for each epoch
+        val_losses: List of validation losses for each epoch (optional)
         output_dir: Output directory for the plot
         epochs: Total number of epochs (optional, will use len(train_losses) if not provided)
     """
@@ -245,16 +281,22 @@ def plot_training_loss(train_losses: List[float], output_dir: str, epochs: int =
     
     plt.figure(figsize=(10, 6))
     plt.plot(range(1, actual_epochs + 1), train_losses, label="Training Loss", linewidth=2, marker='o')
+    if val_losses is not None and len(val_losses) > 0:
+        plt.plot(range(1, len(val_losses) + 1), val_losses, label="Validation Loss", linewidth=2, marker='s', linestyle='--', color='red')
     plt.xlabel("Epoch", fontsize=12)
     plt.ylabel("Loss", fontsize=12)
     plt.title(f"HeteroGAT Training Loss Curve (Trained {actual_epochs} epochs)", fontsize=14)
     plt.legend(fontsize=11)
     plt.grid(True, alpha=0.3)
     plt.tight_layout()
-    loss_curve_path = os.path.join(output_dir, "loss_curve.png")
-    plt.savefig(loss_curve_path, dpi=150)
-    plt.close()
-    logging.info(f"损失曲线已保存: {loss_curve_path}")
+    
+    if output_dir is not None:
+        loss_curve_path = os.path.join(output_dir, "loss_curve.png")
+        plt.savefig(loss_curve_path, dpi=150)
+        plt.close()
+        logging.info(f"损失曲线已保存: {loss_curve_path}")
+    else:
+        plt.show()
 
 
 if __name__ == '__main__':

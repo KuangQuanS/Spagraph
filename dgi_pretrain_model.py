@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 from typing import Tuple, Optional
 import math
+from hetero_model import EdgeAttentionNetwork
 
 
 class HeteroGATLayer(nn.Module):
@@ -53,25 +54,26 @@ class HeteroGATLayer(nn.Module):
         # 提取边
         src_idx = edge_index[0]
         dst_idx = edge_index[1]
-        n_edges = len(src_idx)
         
         # 获取边对应的特征
-        Q_dst = Q[dst_idx]
-        K_src = K[src_idx]
-        V_src = V[src_idx]
+        Q_dst = Q[dst_idx]  # [n_edges, num_heads, head_dim]
+        K_src = K[src_idx]  # [n_edges, num_heads, head_dim]
+        V_src = V[src_idx]  # [n_edges, num_heads, head_dim]
         
-        # 计算注意力权重
-        attn_logits = (Q_dst * K_src).sum(dim=-1) / self.scaling_factor
-        attn_weights = torch.sigmoid(attn_logits)
+        # 计算注意力权重 (向量化)
+        attn_logits = (Q_dst * K_src).sum(dim=-1) / self.scaling_factor  # [n_edges, num_heads]
+        attn_weights = torch.sigmoid(attn_logits)  # [n_edges, num_heads]
         
-        # 聚合
+        # 向量化聚合
         out = torch.zeros(n_nodes, self.num_heads, self.head_dim,
                          device=node_feat.device, dtype=node_feat.dtype)
         
-        for i in range(n_edges):
-            dst = dst_idx[i]
-            weight = attn_weights[i].unsqueeze(-1)
-            out[dst] += weight * V_src[i]
+        # 使用scatter_add进行高效聚合
+        attn_weights = attn_weights.unsqueeze(-1)  # [n_edges, num_heads, 1]
+        weighted_V = V_src * attn_weights  # [n_edges, num_heads, head_dim]
+        
+        # 聚合到目标节点
+        out.scatter_add_(0, dst_idx.unsqueeze(-1).unsqueeze(-1).expand(-1, self.num_heads, self.head_dim), weighted_V)
         
         # 重塑
         out = out.view(n_nodes, self.out_dim)
@@ -84,20 +86,21 @@ class HeteroGATLayer(nn.Module):
 
 
 class HeteroGATEncoder(nn.Module):
-    """多层异构图注意力编码器"""
+    """多层异构图注意力编码器 - 使用Edge Attention"""
     
     def __init__(self, input_dim: int, hidden_dims: list = [256, 256, 128],
-                 num_heads: int = 4, dropout: float = 0.1):
+                 num_heads: int = 4, dropout: float = 0.1, edge_dim: int = 1):
         super().__init__()
         
-        dims = [input_dim] + hidden_dims
+        # ✅ 使用EdgeAttentionNetwork替代传统GAT
+        self.edge_attention = EdgeAttentionNetwork(
+            edge_dim=edge_dim,
+            node_dim=input_dim,
+            hidden_dims=hidden_dims,
+            num_heads=num_heads,
+            dropout=dropout
+        )
         
-        self.layers = nn.ModuleList([
-            HeteroGATLayer(dims[i], dims[i+1], num_heads, dropout)
-            for i in range(len(dims) - 1)
-        ])
-        
-        self.activation = nn.ReLU()
         self.output_dim = hidden_dims[-1]
     
     def forward(self, node_feat: torch.Tensor, edge_index: torch.Tensor,
@@ -106,19 +109,19 @@ class HeteroGATEncoder(nn.Module):
         Args:
             node_feat: [n_nodes, input_dim]
             edge_index: [2, n_edges]
-            edge_attr: [n_edges]
+            edge_attr: [n_edges, edge_dim] - 边特征
         
         Returns:
             out: [n_nodes, hidden_dims[-1]]
         """
-        x = node_feat
+        # 确保edge_attr是2D张量
+        if edge_attr.dim() == 1:
+            edge_attr = edge_attr.unsqueeze(-1)
         
-        for i, layer in enumerate(self.layers):
-            x = layer(x, edge_index, edge_attr)
-            if i < len(self.layers) - 1:
-                x = self.activation(x)
+        # 使用Edge Attention网络
+        out, _ = self.edge_attention(edge_attr, edge_index, node_feat, return_attention=False)
         
-        return x
+        return out
 
 
 class Readout(nn.Module):
@@ -189,7 +192,8 @@ class DGIPretrainModel(nn.Module):
                  readout_mode: str = 'mean',
                  corruption_mode: str = 'feature_mask',
                  mask_ratio: float = 0.3,
-                 noise_std: float = 0.1):
+                 noise_std: float = 0.1,
+                 edge_dim: int = 1):
         """
         Args:
             vae_encoder: 预训练的VAE编码器
@@ -201,6 +205,7 @@ class DGIPretrainModel(nn.Module):
             corruption_mode: 腐蚀模式 ('feature_mask', 'gaussian_noise', 'shuffle')
             mask_ratio: 特征遮掩比例（用于feature_mask模式）
             noise_std: 高斯噪声标准差（用于gaussian_noise模式）
+            edge_dim: 边特征维度
         """
         super().__init__()
         
@@ -210,8 +215,8 @@ class DGIPretrainModel(nn.Module):
         self.mask_ratio = mask_ratio
         self.noise_std = noise_std
         
-        # GAT编码器（共享）
-        self.encoder = HeteroGATEncoder(vae_latent_dim, gat_hidden_dims, gat_heads, gat_dropout)
+        # ✅ Edge Attention编码器（共享）
+        self.encoder = HeteroGATEncoder(vae_latent_dim, gat_hidden_dims, gat_heads, gat_dropout, edge_dim)
         
         # Readout
         self.readout = Readout(gat_hidden_dims[-1], readout_mode)
@@ -287,15 +292,11 @@ class DGIPretrainModel(nn.Module):
         corrupted_embeddings = self.encoder(corrupted_features, edge_index, edge_attr)  # [n_nodes, hidden_dim]
         
         # ========== 判别 ==========
-        # 正样本：原始嵌入 + summary
-        pos_scores = torch.zeros(n_nodes, device=node_embeddings.device)
-        for i in range(n_nodes):
-            pos_scores[i] = self.discriminator(node_embeddings[i], summary)
+        # 正样本：原始嵌入 + summary (向量化)
+        pos_scores = torch.matmul(node_embeddings, torch.matmul(self.discriminator.weight, summary))
         
-        # 负样本：腐蚀嵌入 + summary
-        neg_scores = torch.zeros(n_nodes, device=node_embeddings.device)
-        for i in range(n_nodes):
-            neg_scores[i] = self.discriminator(corrupted_embeddings[i], summary)
+        # 负样本：腐蚀嵌入 + summary (向量化)
+        neg_scores = torch.matmul(corrupted_embeddings, torch.matmul(self.discriminator.weight, summary))
         
         return pos_scores, neg_scores, summary
     

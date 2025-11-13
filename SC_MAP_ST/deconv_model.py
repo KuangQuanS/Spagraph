@@ -681,7 +681,8 @@ class SpatialDeconvolutionLoss(nn.Module):
     
     def __init__(self, lambda_pearson=1.0, lambda_mse=1.0, lambda_cosine=1.0, 
                  lambda_reg=0.5, lambda_sparse=0.01,
-                 lambda_proportion=1.0, sc_celltype_proportions=None, spot_total_counts=None):
+                 lambda_proportion=1.0, sc_celltype_proportions=None, spot_total_counts=None,
+                 celltype_expressions_full=None, marker_gene_indices=None):
         super().__init__()
         self.lambda_pearson = lambda_pearson      # Pearson损失权重
         self.lambda_mse = lambda_mse              # MSE损失权重
@@ -690,12 +691,22 @@ class SpatialDeconvolutionLoss(nn.Module):
         self.lambda_sparse = lambda_sparse        # 稀疏性正则化权重
         self.lambda_proportion = lambda_proportion  # 细胞类型比例一致性权重
         
-        # ✅ 使用 spot_total_counts 代替 cells_per_spot
-        # spot_total_counts: 每个 spot 的总 UMI 数 [n_spots]
-        if spot_total_counts is not None:
-            self.register_buffer('spot_total_counts', torch.FloatTensor(spot_total_counts))
-        else:
-            self.spot_total_counts = None
+        # ✅ spot_total_counts: 每个 spot 在全部基因上的总 UMI 数 [n_spots]
+        if spot_total_counts is None:
+            raise ValueError("spot_total_counts is required for reconstruction!")
+        self.register_buffer('spot_total_counts', torch.FloatTensor(spot_total_counts))
+        
+        # ✅ celltype_expressions_full: 细胞类型在全部基因上的表达 [n_cell_types, n_all_genes]
+        # 用于重建完整的 spot 表达谱，然后只在 marker 基因上计算 loss
+        if celltype_expressions_full is None:
+            raise ValueError("celltype_expressions_full is required for full gene reconstruction!")
+        self.register_buffer('celltype_expressions_full', torch.FloatTensor(celltype_expressions_full))
+        
+        # ✅ marker_gene_indices: marker 基因在全部基因中的索引 [n_marker_genes]
+        # 用于从重建的全部基因表达中提取 marker 基因
+        if marker_gene_indices is None:
+            raise ValueError("marker_gene_indices is required to extract marker genes!")
+        self.register_buffer('marker_gene_indices', torch.LongTensor(marker_gene_indices))
         
         # 单细胞数据中各cluster的比例 [n_cell_types]
         # 例如: [0.10, 0.15, 0.20, ...] 表示cluster0占10%, cluster1占15%等
@@ -718,8 +729,8 @@ class SpatialDeconvolutionLoss(nn.Module):
         
         Args:
             attention_weights: 注意力权重 [n_spots, n_cell_types]（已softmax）
-            celltype_expression: 细胞类型表达 [n_cell_types, n_genes]
-            true_spot_expression: 真实spot表达 [n_spots, n_genes]
+            celltype_expression: 细胞类型表达 [n_cell_types, n_marker_genes] (未使用，已废弃)
+            true_spot_expression: 真实spot表达 [n_spots, n_marker_genes] (marker genes only)
             spot_embedding: spot embedding [n_spots, embedding_dim]（可选）
             celltype_embedding: 细胞类型embedding [n_cell_types, embedding_dim]（可选）
             edge_index: 图的边索引 [2, num_edges]（可选，用于计算空间异质性）
@@ -730,35 +741,35 @@ class SpatialDeconvolutionLoss(nn.Module):
         """
         n_spots = attention_weights.shape[0]
         
-        # ✅ 计算重建的spot表达: X̂_i = s_i × Σ(w_ic × R_c)
-        # attention_weights: [n_spots, n_cell_types] - 细胞类型比例 (和为1)
-        # celltype_expression: [n_cell_types, n_genes] - 来自Stage 1 (normalize 1e4)
-        # spot_total_counts: [n_spots] - 每个spot的总UMI数 (raw counts)
+        # ✅ 使用全部基因重建 spot 表达: X̂_i = s_i × Σ(w_ic × R_c^full)
+        # 步骤:
+        # 1. 使用 celltype_expressions_full [n_cell_types, n_all_genes] (normalize 1e4 on all genes)
+        # 2. 重建全部基因的 spot 表达
+        # 3. 提取 marker 基因用于计算 loss
         
-        # 将 celltype_expression 从 1e4 scale 转换为 sum=1
-        # 原因: Stage 1 用 normalize_total(1e4), 求 mean 后可能不完全是 1e4
-        celltype_expr_normalized = celltype_expression / 1e4  # 转换为 sum≈1 的比例
+        # 将 celltype_expressions_full 从 1e4 scale 转换为 sum=1 的比例
+        celltype_expr_full_normalized = self.celltype_expressions_full / 1e4  # [n_cell_types, n_all_genes]
         
-        # 先计算混合比例: Σ(w_ic × R_c)
-        mixed_proportions = torch.matmul(
-            attention_weights,           # [n_spots, n_cell_types]
-            celltype_expr_normalized     # [n_cell_types, n_genes], sum≈1
-        )  # [n_spots, n_genes] - 混合后的表达比例
+        # 计算混合比例 (全部基因): Σ(w_ic × R_c^full)
+        mixed_proportions_full = torch.matmul(
+            attention_weights,                  # [n_spots, n_cell_types]
+            celltype_expr_full_normalized       # [n_cell_types, n_all_genes]
+        )  # [n_spots, n_all_genes] - 混合后的全部基因表达比例
         
-        # 然后乘以每个spot的总counts: s_i × Σ(w_ic × R_c)
-        # ✅ 优先使用 batch_spot_total_counts (当前batch的)
+        # 乘以每个 spot 的总 counts (全部基因的 raw counts): s_i × Σ(w_ic × R_c^full)
         if batch_spot_total_counts is not None:
-            reconstructed_spot = mixed_proportions * batch_spot_total_counts.unsqueeze(-1)
-        elif self.spot_total_counts is not None:
-            reconstructed_spot = mixed_proportions * self.spot_total_counts[:n_spots].unsqueeze(-1)
+            spot_counts = batch_spot_total_counts.unsqueeze(-1)  # [batch_size, 1]
         else:
-            # Fallback: 如果没有spot_total_counts,使用原始比例
-            reconstructed_spot = mixed_proportions
-            print("⚠️  Warning: spot_total_counts not available, using proportions directly!")
+            spot_counts = self.spot_total_counts[:n_spots].unsqueeze(-1)  # [n_spots, 1]
+        
+        reconstructed_spot_full = mixed_proportions_full * spot_counts  # [n_spots, n_all_genes]
+        
+        # 提取 marker 基因: 只在 marker 基因上计算 loss
+        reconstructed_spot_marker = reconstructed_spot_full[:, self.marker_gene_indices]  # [n_spots, n_marker_genes]
         
         # ============ 1. Pearson Correlation Loss ============
         # 计算Pearson相关系数(基于基因表达的相关性)
-        # ✅ 先 normalize 到比例空间，再 log，消除文库大小差异
+        # ✅ 在 marker 基因上计算，先 normalize 到比例空间，再 log，消除文库大小差异
         def pearson_correlation(x, y):
             """计算Pearson相关系数"""
             x_centered = x - x.mean(dim=-1, keepdim=True)
@@ -770,8 +781,8 @@ class SpatialDeconvolutionLoss(nn.Module):
             corr = numerator / (denominator + 1e-8)
             return corr
         
-        # Normalize 到比例空间 (消除文库大小差异)
-        reconstructed_norm = reconstructed_spot / (reconstructed_spot.sum(dim=-1, keepdim=True) + 1e-8)
+        # Normalize 到比例空间 (消除文库大小差异) - 只在 marker 基因上
+        reconstructed_norm = reconstructed_spot_marker / (reconstructed_spot_marker.sum(dim=-1, keepdim=True) + 1e-8)
         true_norm = true_spot_expression / (true_spot_expression.sum(dim=-1, keepdim=True) + 1e-8)
         
         # Log-transform (避免高表达基因主导)
@@ -782,8 +793,8 @@ class SpatialDeconvolutionLoss(nn.Module):
         L_pearson = 1.0 - pearson_corr.mean()  # 1 - 相关系数,越小越好
         
         # ============ 2. MSE Loss (重建误差) ============
-        # MSE 在 count 空间计算（保持比例线性）
-        L_mse = F.mse_loss(reconstructed_spot, true_spot_expression)
+        # MSE 在 count 空间计算（保持比例线性） - 只在 marker 基因上
+        L_mse = F.mse_loss(reconstructed_spot_marker, true_spot_expression)
         
         # ============ 3. Cosine Similarity Loss ============
         # Cosine相似度在 log-normalized 空间计算（避免高表达基因主导）

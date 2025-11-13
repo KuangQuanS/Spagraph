@@ -50,16 +50,16 @@ def evaluate_cell_communication(
     logging.info(f"收集到 {len(all_cc_attention_scores)} 个batch的注意力得分")
 
     # 合并所有batch的注意力得分
-    all_scores = torch.cat(all_cc_attention_scores, dim=0)  # [total_edges, num_heads]
+    all_scores = torch.cat(all_cc_attention_scores, dim=0)  # [total_edges]
     all_edges = torch.cat(all_edge_index_cc, dim=1)  # [2, total_edges]
     all_attrs = torch.cat(all_edge_attr_cc, dim=0)  # [total_edges, 2] - [lr_score, lr_id]
     all_spots = torch.cat(all_spot_indices, dim=0)  # [total_edges] - center spot indices
 
     logging.info(f"合并后数据形状: all_scores={all_scores.shape}, all_edges={all_edges.shape}, all_attrs={all_attrs.shape}, all_spots={all_spots.shape}")
 
-    # 计算平均注意力得分（跨所有heads）
-    avg_scores = all_scores.mean(dim=1)  # [total_edges]
-    logging.info(f"平均注意力得分形状: {avg_scores.shape}")
+    # 注意：all_scores现在是1维的[total_edges]，直接使用即可
+    avg_scores = all_scores  # [total_edges] - 已经是平均后的注意力得分
+    logging.info(f"注意力得分形状: {avg_scores.shape}")
 
     # 加载LR对映射
     lr_mapping_path = os.path.join(output_dir, "lr_pair_mapping.txt")
@@ -184,7 +184,7 @@ def evaluate_cell_communication(
     # 生成三种得分的通讯结果文件
     model_based_comm_path = os.path.join(output_dir, "lr_communication_model_based.csv")
     with open(model_based_comm_path, 'w') as f:
-        f.write("center_spot,source_cell,target_cell,lr_pair,original_lr_score,attention_score,predicted_strength,modulated_score,score_type\n")
+        f.write("center_spot,source_cell,target_cell,lr_pair,original_lr_score,edge_logits,adjusted_score,score_type\n")
 
         # 遍历所有边，生成三种得分
         for i in range(all_edges.size(1)):
@@ -200,9 +200,9 @@ def evaluate_cell_communication(
                     # ✅ edge_attr_cc 是 2维: [lr_score, lr_id]
                     lr_score = all_attrs[i, 0].item()  # 第0列: LR得分
                     lr_id = int(all_attrs[i, 1].item())  # 第1列: LR ID
-                    attention_score = avg_scores[i].item()
-                    # ✅ 使用 attention_score 作为 predicted_strength（因为训练时attention就是模型学习的重要性）
-                    predicted_strength = attention_score
+                    edge_logits = avg_scores[i].item()
+                    # ✅ 使用 tanh(edge_logits) 作为 predicted_strength（因为训练时模型学习的是tanh映射）
+                    predicted_strength = torch.tanh(torch.tensor(edge_logits)).item()
 
                     src_cell = all_cell_names[src_cell_idx]
                     dst_cell = all_cell_names[dst_cell_idx]
@@ -213,22 +213,20 @@ def evaluate_cell_communication(
                     else:
                         lr_pair_name = f"lr_{lr_id}"
 
-                    # 计算调制后的得分（原始LR得分 × 模型预测强度）
-                    modulated_score = lr_score * predicted_strength
+                    # 计算调制后的得分（原始LR得分 × (1 + 模型预测强度)）
+                    modulated_score = lr_score * (1 + predicted_strength)
 
                     # 推荐使用modulated_score作为最终得分
-                    score_type = "modulated"
+                    score_type = "logits_adjusted"
 
                     f.write(f"{center_spot_idx},{src_cell},{dst_cell},{lr_pair_name},"
-                           f"{lr_score:.6f},{attention_score:.6f},{predicted_strength:.6f},"
-                           f"{modulated_score:.6f},{score_type}\n")
+                           f"{lr_score:.6f},{edge_logits:.6f},{modulated_score:.6f},{score_type}\n")
 
     logging.info(f"基于模型预测的通讯结果已保存: {model_based_comm_path}")
     logging.info(f"   - original_lr_score: 原始LR得分（表达 × 距离衰减）")
-    logging.info(f"   - attention_score: GAT注意力得分（图结构重要性）")
-    logging.info(f"   - predicted_strength: MLP预测的通讯强度 [0,1]")
-    logging.info(f"   - modulated_score: 原始LR得分 × 预测强度（推荐使用）⭐")
-    logging.info(f"   - 解释：modulated_score = 基础强度 × 模型学习的重要性因子")
+    logging.info(f"   - edge_logits: 模型预测的原始logits（未激活）")
+    logging.info(f"   - adjusted_score: 调制后的得分（推荐使用）⭐")
+    logging.info(f"   - 解释：adjusted_score = original_lr_score × (1 + tanh(edge_logits))")
 
 
 def plot_dgi_loss(dgi_train_losses, dgi_val_losses=None, output_dir: str = None, epochs: int = None) -> None:

@@ -36,6 +36,8 @@ def parse_args():
                        help='配体/受体活跃基因的平均表达阈值 (normalize_total 1e4后，default: 1.0)')
     parser.add_argument('--lr_comm_score_threshold', type=float, default=0.0, 
                        help='通讯得分过滤阈值，低于此值的通讯事件将被过滤 (default: 0.0，即不过滤)')
+    parser.add_argument('--min_comm_edges', type=int, default=1, 
+                       help='最小通讯边数阈值，少于此值的spot将被过滤 (default: 1)')
 
     # GAT参数
     parser.add_argument('--gat_layers', type=int, default=6, help='GAT层数')
@@ -705,6 +707,17 @@ def main():
     # 移除position参数避免Jupyter中重复显示，添加leave=True保持最终状态
     epoch_pbar = tqdm(range(args.epochs), desc="Training", leave=True, dynamic_ncols=True)
     
+    # 主训练早停参数
+    best_val_loss = float('inf')
+    patience_counter = 0
+    early_stop_patience = args.early_stop_patience
+    early_stop_min_delta = args.early_stop_min_delta
+    
+    if early_stop_patience > 0:
+        logging.info(f"主训练早停已启用: patience={early_stop_patience}, min_delta={early_stop_min_delta}")
+    else:
+        logging.info("主训练早停已禁用")
+    
     for epoch in epoch_pbar:
         # ========== 训练阶段 ==========
         model.train()
@@ -996,11 +1009,25 @@ def main():
         edge_losses.append(avg_supervised)  # 记录监督学习损失（MSE）
         comm_pred_losses.append(avg_self_supervised)  # 记录自监督学习损失（BCE）
         
+        # ========== 早停检查 ==========
+        if early_stop_patience > 0:
+            if avg_val_loss < best_val_loss - early_stop_min_delta:
+                best_val_loss = avg_val_loss
+                patience_counter = 0
+                logging.info(f"验证损失改善: {best_val_loss:.6f} (patience重置为0)")
+            else:
+                patience_counter += 1
+                logging.info(f"验证损失未改善: {avg_val_loss:.6f} vs {best_val_loss:.6f} (patience: {patience_counter}/{early_stop_patience})")
+                
+            if patience_counter >= early_stop_patience:
+                logging.info(f"早停触发: 验证损失在{early_stop_patience}个epoch内未改善")
+                break
+        
         # 更新epoch进度条（只在epoch结束时更新一次）
         alpha = args.supervised_weight
         epoch_pbar.set_postfix({
             'Train': f'{avg_train_loss:.4f}',
-            'Val': f'{avg_val_loss:.4f}',
+            'Val': f'{avg_val_loss:.6f}',
             'Sup': f'{avg_supervised:.4f}',  # 监督学习损失（MSE）
             'Self': f'{avg_self_supervised:.4f}',  # 自监督学习损失（BCE）
             'α': f'{alpha:.1f}'  # 监督权重
@@ -1025,9 +1052,6 @@ def main():
         all_edge_index_cc=all_edge_index_cc,
         all_edge_attr_cc=all_edge_attr_cc,
         all_spot_indices=all_spot_indices,
-        all_cell_node_mappings=all_cell_node_mappings,
-        all_batch_indices=all_batch_indices,
-        all_n_spots_sub=all_n_spots_sub,
         all_cell_names=all_cell_names,
         output_dir=args.output_dir,
         n_spots=n_spots,

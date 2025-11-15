@@ -757,39 +757,36 @@ class SpatialDeconvolutionLoss(nn.Module):
             print("⚠️  Warning: spot_total_counts not available, using proportions directly!")
         
         # ============ 1. Pearson Correlation Loss ============
-        # 计算Pearson相关系数(基于基因表达的相关性)
-        # ✅ 先 normalize 到比例空间，再 log，消除文库大小差异
-        def pearson_correlation(x, y):
-            """计算Pearson相关系数"""
+        def pearson_correlation(x, y, eps=1e-8):
+            """计算每个样本的 Pearson 相关系数，x/y 形状 assumed: (batch, genes)"""
             x_centered = x - x.mean(dim=-1, keepdim=True)
             y_centered = y - y.mean(dim=-1, keepdim=True)
-            
+
             numerator = (x_centered * y_centered).sum(dim=-1)
             denominator = torch.sqrt((x_centered ** 2).sum(dim=-1) * (y_centered ** 2).sum(dim=-1))
-            
-            corr = numerator / (denominator + 1e-8)
+            corr = numerator / (denominator + eps)
             return corr
-        
+        eps = 1e-8
         # Normalize 到比例空间 (消除文库大小差异)
-        reconstructed_norm = reconstructed_spot / (reconstructed_spot.sum(dim=-1, keepdim=True) + 1e-8)
-        true_norm = true_spot_expression / (true_spot_expression.sum(dim=-1, keepdim=True) + 1e-8)
-        
-        # Log-transform (避免高表达基因主导)
-        reconstructed_log = torch.log1p(reconstructed_norm * 1e4)  # 乘 1e4 使 log 值更稳定
-        true_log = torch.log1p(true_norm * 1e4)
-        
-        pearson_corr = pearson_correlation(reconstructed_log, true_log)
-        L_pearson = 1.0 - pearson_corr.mean()  # 1 - 相关系数,越小越好
-        
+        reconstructed_norm = reconstructed_spot / (reconstructed_spot.sum(dim=-1, keepdim=True) + eps)
+        true_norm = true_spot_expression / (true_spot_expression.sum(dim=-1, keepdim=True) + eps)
+
+        # Log-transform：使用 log(proportion + eps)
+        reconstructed_log = torch.log(reconstructed_norm + eps)
+        true_log = torch.log(true_norm + eps)
+
+        # Pearson（在 log 空间计算）
+        pearson_corr = pearson_correlation(reconstructed_log, true_log, eps=eps)
+        L_pearson = 1.0 - pearson_corr.mean()  # 越小越好
+
         # ============ 2. MSE Loss (重建误差) ============
-        # MSE 在 count 空间计算（保持比例线性）
-        L_mse = F.mse_loss(reconstructed_spot, true_spot_expression)
-        
+        # 在比例空间计算 MSE（保持线性与可比性）
+        L_mse = F.mse_loss(reconstructed_norm, true_norm)
+
         # ============ 3. Cosine Similarity Loss ============
-        # Cosine相似度在 log-normalized 空间计算（避免高表达基因主导）
+        # 在 log-normalized 空间计算 cosine 相似度（避免被高表达主导）
         cos_sim_rec = F.cosine_similarity(reconstructed_log, true_log, dim=-1)
         L_cosine = 1.0 - cos_sim_rec.mean()
-        
         # ============ 4. Weight Regularization Loss ============
         # 确保权重和为1(softmax已保证,但作为额外约束)
         weight_sum_loss = F.mse_loss(attention_weights.sum(dim=1), 

@@ -623,12 +623,8 @@ class GATDeconvolution:
             
             mixed_proportions_full = np.dot(deconv_weights, celltype_expr_full_normalized)  # [n_spots, n_all_genes]
             
-            if self.spot_total_counts is not None:
-                spot_total_full = self.spot_total_counts[:len(spot_barcodes)]
-                reconstructed_full_expr = mixed_proportions_full * spot_total_full[:, np.newaxis]
-            else:
-                reconstructed_full_expr = mixed_proportions_full
-                print("   ⚠️  Warning: spot_total_counts not available, using proportions")
+            spot_total_full = self.spot_total_counts[:len(spot_barcodes)]
+            reconstructed_full_expr = mixed_proportions_full * spot_total_full[:, np.newaxis]
             
             # Get full gene names
             if self.all_genes is not None:

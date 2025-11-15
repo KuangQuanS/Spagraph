@@ -6,15 +6,16 @@ import glob
 import pandas as pd
 import numpy as np
 import scanpy as sc
-from hetero_vae_data_utils import STHeteroSubgraphDataset, hetero_subgraph_collate_fn,setup_logging, set_seed, EarlyStopping
-from hetero_model import HeteroSTModel
-from evaluate import evaluate_cell_communication, plot_training_loss, plot_dgi_loss
-from calculate_lr_scores import calculate_lr_scores
 from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from tqdm import tqdm
+
 from SC_MAP_ST.deconv_model import DualDecoderVAE as FullVAE
 from dgi_pretrain_model import DGIPretrainModel, dgi_loss
+from hetero_model import HeteroSTModel
+from hetero_graph_builder import STHeteroSubgraphDataset, hetero_subgraph_collate_fn, setup_logging, set_seed
+from evaluate import evaluate_cell_communication, plot_training_loss, plot_dgi_loss
+from calculate_lr_scores import calculate_lr_scores
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Heterogeneous ST Communication Model Training')
@@ -28,7 +29,7 @@ def parse_args():
     parser.add_argument('--vae_hidden_dim', type=int, default=256, help='VAE隐层维度')
     
     # 图参数
-    parser.add_argument('--n_spot_neighbors', type=int, default=10, help='Spot邻近数')
+    parser.add_argument('--n_spot_neighbors', type=int, default=20, help='Spot邻近数')
     
     # LR通讯参数
     parser.add_argument('--lr_distance_sigma', type=float, default=50.0, help='LR通讯距离衰减参数sigma')
@@ -62,6 +63,16 @@ def parse_args():
                         help='监督学习权重alpha（0~1），自监督权重为1-alpha，默认0.5')
     parser.add_argument('--negative_sample_ratio', type=float, default=1.0,
                         help='负采样比例（相对于正边数量），默认1.0')
+    
+    # 双头边过滤参数
+    parser.add_argument('--lambda_exist', type=float, default=0.5,
+                        help='边存在性损失权重 (default: 0.5)')
+    parser.add_argument('--lambda_rate', type=float, default=0.4,
+                        help='边强度回归损失权重 (default: 0.4)')
+    parser.add_argument('--edge_topk', type=int, default=5,
+                        help='推理时每个源节点保留的最大边数 (default: 5)')
+    parser.add_argument('--edge_exist_threshold', type=float, default=0.5,
+                        help='边存在性概率阈值 (default: 0.5)')
     
     parser.add_argument('--dgi_epochs', type=int, default=30, help='DGI预训练epoch数')
     parser.add_argument('--dgi_lr', type=float, default=1e-4, help='DGI预训练学习率')
@@ -328,7 +339,8 @@ def main():
         lr_pairs=lr_pairs,
         adata=adata,
         cell_full_expr=spot_cell_expr_df,  # ✅ 传入实际的spot-cell全基因表达！
-        output_dir=args.output_dir
+        output_dir=args.output_dir,
+        n_neighbors=args.n_spot_neighbors
     )
     
     dataset = STHeteroSubgraphDataset(
@@ -552,9 +564,12 @@ def main():
                     if edge_attr_like.dim() == 1:
                         edge_attr_like = torch.cat([edge_attr_like.unsqueeze(-1), torch.full_like(edge_attr_like.unsqueeze(-1), -1)], dim=-1)
                     
+                    # ✅ DGI只需要前2列 [lr_score, lr_id]，去掉is_important标签
+                    edge_attr_cc_dgi = edge_attr_cc[:, :2] if edge_attr_cc.size(1) > 2 else edge_attr_cc
+                    
                     # 合并边（DGI使用完整的异构图）
                     edge_index = torch.cat([edge_index_like, edge_index_cc], dim=1)
-                    edge_attr = torch.cat([edge_attr_like, edge_attr_cc], dim=0)
+                    edge_attr = torch.cat([edge_attr_like, edge_attr_cc_dgi], dim=0)
                     
                     # DGI前向传播（内部会进行特征破坏和边丢弃）
                     pos_scores, neg_scores, summary = dgi_model(
@@ -595,9 +610,12 @@ def main():
                         if edge_attr_like.dim() == 1:
                             edge_attr_like = torch.cat([edge_attr_like.unsqueeze(-1), torch.full_like(edge_attr_like.unsqueeze(-1), -1)], dim=-1)
                         
+                        # ✅ DGI只需要前2列 [lr_score, lr_id]，去掉is_important标签
+                        edge_attr_cc_dgi = edge_attr_cc[:, :2] if edge_attr_cc.size(1) > 2 else edge_attr_cc
+                        
                         # 合并边（DGI使用完整的异构图）
                         edge_index = torch.cat([edge_index_like, edge_index_cc], dim=1)
-                        edge_attr = torch.cat([edge_attr_like, edge_attr_cc], dim=0)
+                        edge_attr = torch.cat([edge_attr_like, edge_attr_cc_dgi], dim=0)
                         
                         # DGI前向传播（验证阶段不进行特征破坏）
                         pos_scores, neg_scores, summary = dgi_model(
@@ -684,7 +702,7 @@ def main():
     # 用于收集cell-cell注意力得分和LR ID（只在训练集上收集）
     all_cc_attention_scores = []
     all_edge_index_cc = []
-    all_edge_attr_cc = []  # 收集边属性 [lr_score, lr_id]
+    all_edge_attr_cc = []  # 收集边属性 [lr_score, lr_id, is_important, exist_logits, rate_pred]
     all_spot_indices = []  # 收集对应的spot索引
     all_cell_node_mappings = []  # 收集细胞节点到细胞类型的映射
     all_batch_indices = []  # 收集每个边所属的批次索引
@@ -693,14 +711,14 @@ def main():
     
     # ========== 阶段4：训练循环 ==========
     logging.info("="*80)
-    logging.info("阶段4: 开始训练（混合训练：监督 + 自监督）")
+    logging.info("阶段4: 开始训练（双头边过滤：存在性判别 + 强度回归）")
     logging.info("="*80)
     logging.info(f"训练配置:")
-    logging.info(f"  - 监督学习权重（α）: {args.supervised_weight:.2f}")
-    logging.info(f"  - 自监督学习权重（1-α）: {1-args.supervised_weight:.2f}")
-    logging.info(f"  - 负采样比例: {args.negative_sample_ratio:.1f}")
-    logging.info(f"  - 监督损失: MSE(tanh(logits), 2*(lr_scores-0.5))")
-    logging.info(f"  - 自监督损失: BCE(sigmoid(logits), edge_labels)")
+    logging.info(f"  - 边存在性权重（λ_exist）: {args.lambda_exist:.2f}")
+    logging.info(f"  - 边强度回归权重（λ_rate）: {args.lambda_rate:.2f}")
+    logging.info(f"  - 存在性损失: BCE_with_logits(exist_logits, is_important)")
+    logging.info(f"  - 强度回归损失: SmoothL1(rate_pred, lr_scores) [仅is_important=1]")
+    logging.info(f"  - 推理过滤策略: Top-K={args.edge_topk} 或 p_exist>{args.edge_exist_threshold}")
     logging.info("="*80)
 
     # 使用外层tqdm跟踪epoch进度
@@ -750,25 +768,34 @@ def main():
                 edge_index_like = batch['edge_index_like'][b].to(device)  # [2, E_like]
                 edge_attr_like = batch['edge_attr_like'][b].to(device)    # [E_like]
                 edge_index_cc = batch['edge_index_cc'][b].to(device)      # [2, E_cc]
-                edge_attr_cc = batch['edge_attr_cc'][b].to(device)        # [E_cc]
+                edge_attr_cc = batch['edge_attr_cc'][b].to(device)        # [E_cc, 3] = [lr_score, lr_id, is_important]
+
+                # ✅ 模型只需要前2列 [lr_score, lr_id]，保留完整的edge_attr_cc用于损失计算
+                edge_attr_cc_input = torch.zeros(edge_attr_cc.size(0), 2, device=device)  # [E_cc, 2]
 
                 # ========== 前向传播 ==========
-                spot_repr, cell_repr, combined, spot_proj, cc_attention, predicted_masked_edges, edge_mask = model(
+                spot_repr, cell_repr, combined, spot_proj, cc_attention, predicted_masked_edges, edge_mask, exist_logits, rate_pred = model(
                     expr_raw=expr_raw,
                     cell_expr_raw=cell_expr_raw,
                     edge_index_like=edge_index_like,
                     edge_attr_like=edge_attr_like,
                     edge_index_cc=edge_index_cc,
-                    edge_attr_cc=torch.zeros_like(edge_attr_cc),  # 不输入真实强度，避免信息泄露
+                    edge_attr_cc=edge_attr_cc_input,  # 不输入真实强度，避免信息泄露
                     return_attention=True,
-                    edge_mask_ratio=0.15  # 15%的边被mask用于预测
+                    edge_mask_ratio=0.0  # 禁用边mask，使用双头监督
                 )
                 
-                # 收集cell-cell注意力得分（用于后续分析）
+                # 收集cell-cell注意力得分和双头预测（用于后续分析）
                 if cc_attention is not None:
                     all_cc_attention_scores.append(cc_attention.detach().cpu())
                     all_edge_index_cc.append(edge_index_cc.detach().cpu())
-                    all_edge_attr_cc.append(edge_attr_cc.detach().cpu())
+                    # ✅ 扩展edge_attr_cc: 添加exist_logits和rate_pred作为额外列
+                    edge_attr_extended = torch.cat([
+                        edge_attr_cc.detach().cpu(),
+                        exist_logits.detach().cpu().unsqueeze(-1),  # [n_edges, 1]
+                        rate_pred.detach().cpu().unsqueeze(-1)      # [n_edges, 1]
+                    ], dim=-1)  # [n_edges, 5] = [lr_score, lr_id, is_important, exist_logits, rate_pred]
+                    all_edge_attr_cc.append(edge_attr_extended)
                     # 收集对应的spot信息（center_spot_idx）
                     center_spot_idx = batch['center_spot_idx'][b]
                     spot_indices = torch.full((edge_index_cc.size(1),), center_spot_idx, dtype=torch.long)
@@ -787,112 +814,64 @@ def main():
                     n_spots_sub = batch['n_spots_sub'][b]
                     n_spots_sub_tensor = torch.full((edge_index_cc.size(1),), n_spots_sub, dtype=torch.long)
                     all_n_spots_sub.append(n_spots_sub_tensor)
+                    
+                    # 调试信息：记录数据收集情况
+                    if len(all_cc_attention_scores) <= 5:  # 只在前5个batch打印
+                        logging.info(f"收集到batch数据: cc_attention.shape={cc_attention.shape}, "
+                                   f"edge_index_cc.shape={edge_index_cc.shape}, "
+                                   f"edge_attr_cc.shape={edge_attr_cc.shape}")
+                else:
+                    # 调试信息：记录cc_attention为None的情况
+                    if batch_idx <= 3 and epoch == 0:  # 只在第一个epoch的前3个batch打印
+                        logging.warning(f"cc_attention为None: batch_idx={batch_idx}, epoch={epoch}, "
+                                      f"edge_index_cc.size(1)={edge_index_cc.size(1) if 'edge_index_cc' in locals() else 'N/A'}")
 
-                # ========== 混合训练：监督（MSE）+ 自监督（BCE）==========
-                # 注意：不再使用mask预测损失，所有监督学习都通过混合损失完成
-                supervised_loss = 0.0  # 监督学习：拟合LR得分
-                self_supervised_loss = 0.0  # 自监督学习：边存在性预测
+                # ========== 双头训练：边存在性判别（BCE）+ 边强度回归（MSE）==========
+                loss_exist = 0.0  # 边存在性判别损失
+                loss_rate = 0.0   # 边强度回归损失
                 
-                if cc_attention is not None and edge_attr_cc.size(0) > 0:
-                    edge_strength_logits = cc_attention  # [n_pos_edges]
-                    lr_scores = edge_attr_cc[:, 0]  # [n_pos_edges]
+                if exist_logits is not None and rate_pred is not None and edge_attr_cc.size(0) > 0:
+                    # 提取标签
+                    lr_scores = edge_attr_cc[:, 0]  # [n_edges] - 归一化的LR通讯得分
+                    exist_labels = edge_attr_cc[:, 2]  # [n_edges] - 二值标签 (0/1)
                     
-                    # ========== 1. 监督学习部分（MSE）==========
-                    # 使用tanh映射到[-1, 1]的调整系数
-                    adjustment_factor = torch.tanh(edge_strength_logits)
-                    target_factor = 2 * (lr_scores - 0.5)  # [0,1] -> [-1,1]
-                    
-                    # MSE损失：拟合已知的LR得分
-                    supervised_loss = torch.nn.functional.mse_loss(
-                        adjustment_factor,
-                        target_factor,
+                    # ========== 1. 边存在性判别损失（BCE with logits）==========
+                    # 使用BCE with logits自动处理sigmoid，数值更稳定
+                    loss_exist = torch.nn.functional.binary_cross_entropy_with_logits(
+                        exist_logits,
+                        exist_labels,
                         reduction='mean'
                     )
                     
-                    # ========== 2. 自监督学习部分（BCE）==========
-                    # 2.1 正边：真实存在的通讯边
-                    pos_edge_pred = torch.sigmoid(edge_strength_logits)  # [n_pos_edges]
-                    pos_labels = torch.ones_like(pos_edge_pred)  # 标签=1
-                    
-                    # 2.2 负采样：不存在的边
-                    n_pos = len(edge_strength_logits)
-                    n_neg = int(n_pos * args.negative_sample_ratio)
-                    
-                    if n_neg > 0:
-                        # 随机采样负边（不同细胞类型的随机配对）
-                        n_cells = cell_repr.size(0)
-                        neg_src = torch.randint(0, n_cells, (n_neg,), device=device)
-                        neg_dst = torch.randint(0, n_cells, (n_neg,), device=device)
-                        
-                        # 避免自环和重复正边
-                        mask = neg_src != neg_dst
-                        neg_src = neg_src[mask]
-                        neg_dst = neg_dst[mask]
-                        
-                        if len(neg_src) > 0:
-                            # 构造负边索引
-                            neg_edge_index = torch.stack([neg_src, neg_dst], dim=0)
-                            
-                            # 构造负边特征（使用零向量）
-                            neg_edge_attr = torch.zeros(len(neg_src), edge_attr_cc.size(1), device=device)
-                            
-                            # 前向传播获取负边logits
-                            with torch.no_grad():
-                                # 使用模型的edge_attn_comm预测负边
-                                # 构造负边的特征（cell embeddings）
-                                neg_src_feat = cell_repr[neg_src]
-                                neg_dst_feat = cell_repr[neg_dst]
-                                neg_edge_feat = torch.cat([
-                                    neg_src_feat, neg_dst_feat, 
-                                    neg_edge_attr
-                                ], dim=-1)
-                                
-                                # 简单的线性预测（使用edge_attn_comm的第一层）
-                                # 这里简化处理，直接用随机低分作为负样本
-                                neg_edge_logits = torch.randn(len(neg_src), device=device) - 2.0  # 偏向负值
-                            
-                            neg_edge_pred = torch.sigmoid(neg_edge_logits)
-                            neg_labels = torch.zeros_like(neg_edge_pred)  # 标签=0
-                            
-                            # 合并正负边的BCE损失
-                            all_preds = torch.cat([pos_edge_pred, neg_edge_pred])
-                            all_labels = torch.cat([pos_labels, neg_labels])
-                            
-                            self_supervised_loss = torch.nn.functional.binary_cross_entropy(
-                                all_preds,
-                                all_labels,
-                                reduction='mean'
-                            )
-                        else:
-                            # 只用正边的BCE
-                            self_supervised_loss = torch.nn.functional.binary_cross_entropy(
-                                pos_edge_pred,
-                                pos_labels,
-                                reduction='mean'
-                            )
-                    else:
-                        # 不做负采样，只用正边BCE
-                        self_supervised_loss = torch.nn.functional.binary_cross_entropy(
-                            pos_edge_pred,
-                            pos_labels,
+                    # ========== 2. 边强度回归损失（MSE，只在is_important=1的边上计算）==========
+                    # 只对真边（is_important=1）计算回归损失
+                    mask_important = (exist_labels == 1)
+                    if mask_important.sum() > 0:
+                        # 使用Huber Loss（比MSE更鲁棒，对异常值不敏感）
+                        loss_rate = torch.nn.functional.smooth_l1_loss(
+                            rate_pred[mask_important],
+                            lr_scores[mask_important],
                             reduction='mean'
                         )
+                    else:
+                        loss_rate = torch.tensor(0.0, device=device)
                     
                     # ========== 3. 混合损失 ==========
-                    alpha = args.supervised_weight
-                    edge_strength_loss = alpha * supervised_loss + (1 - alpha) * self_supervised_loss
+                    lambda_exist = args.lambda_exist  # 边存在性权重（default: 0.5）
+                    lambda_rate = args.lambda_rate   # 边强度回归权重（default: 0.4）
+                    
+                    total_loss = lambda_exist * loss_exist + lambda_rate * loss_rate
                 else:
-                    edge_strength_loss = 0.0
-                    supervised_loss = 0.0
-                    self_supervised_loss = 0.0
+                    total_loss = torch.tensor(0.0, device=device)
+                    loss_exist = torch.tensor(0.0, device=device)
+                    loss_rate = torch.tensor(0.0, device=device)
                 
-                # 总损失 = 混合边强度损失（监督MSE + 自监督BCE）
-                loss = edge_strength_loss
-
+                # 累积批次损失
+                loss = total_loss
                 batch_loss += loss
-                batch_supervised += supervised_loss.item() if isinstance(supervised_loss, torch.Tensor) else 0.0
-                batch_self_supervised += self_supervised_loss.item() if isinstance(self_supervised_loss, torch.Tensor) else 0.0
-                batch_edge += edge_strength_loss.item() if isinstance(edge_strength_loss, torch.Tensor) else 0.0
+                batch_supervised += loss_rate.item() if isinstance(loss_rate, torch.Tensor) else 0.0
+                batch_self_supervised += loss_exist.item() if isinstance(loss_exist, torch.Tensor) else 0.0
+                batch_edge += total_loss.item() if isinstance(total_loss, torch.Tensor) else 0.0
 
             # 对整个batch求平均损失，然后反向传播
             avg_batch_loss = batch_loss / batch_size
@@ -927,73 +906,50 @@ def main():
                     edge_index_like = batch['edge_index_like'][b].to(device)
                     edge_attr_like = batch['edge_attr_like'][b].to(device)
                     edge_index_cc = batch['edge_index_cc'][b].to(device)
-                    edge_attr_cc = batch['edge_attr_cc'][b].to(device)
+                    edge_attr_cc = batch['edge_attr_cc'][b].to(device)  # [E_cc, 3] = [lr_score, lr_id, is_important]
+
+                    # ✅ 模型只需要前2列 [lr_score, lr_id]
+                    edge_attr_cc_input = torch.zeros(edge_attr_cc.size(0), 2, device=device)  # [E_cc, 2]
 
                     # 前向传播（验证阶段不进行边mask）
-                    spot_repr, cell_repr, combined, spot_proj, cc_attention, _, _ = model(
+                    spot_repr, cell_repr, combined, spot_proj, cc_attention, _, _, exist_logits, rate_pred = model(
                         expr_raw=expr_raw,
                         cell_expr_raw=cell_expr_raw,
                         edge_index_like=edge_index_like,
                         edge_attr_like=edge_attr_like,
                         edge_index_cc=edge_index_cc,
-                        edge_attr_cc=torch.zeros_like(edge_attr_cc),
+                        edge_attr_cc=edge_attr_cc_input,  # 不输入真实强度
                         return_attention=True,
                         edge_mask_ratio=0.0  # 验证阶段不mask
                     )
 
-                    # 计算验证损失
-                    if cc_attention is not None and edge_attr_cc.size(0) > 0:
-                        edge_strength_logits = cc_attention
+                    # 计算验证损失（与训练损失一致）
+                    if exist_logits is not None and rate_pred is not None and edge_attr_cc.size(0) > 0:
                         lr_scores = edge_attr_cc[:, 0]
+                        exist_labels = edge_attr_cc[:, 2]
                         
-                        # 监督学习部分
-                        adjustment_factor = torch.tanh(edge_strength_logits)
-                        target_factor = 2 * (lr_scores - 0.5)
-                        supervised_loss = torch.nn.functional.mse_loss(
-                            adjustment_factor, target_factor, reduction='mean'
+                        # 边存在性损失
+                        loss_exist = torch.nn.functional.binary_cross_entropy_with_logits(
+                            exist_logits, exist_labels, reduction='mean'
                         )
                         
-                        # 自监督学习部分
-                        pos_edge_pred = torch.sigmoid(edge_strength_logits)
-                        pos_labels = torch.ones_like(pos_edge_pred)
-                        
-                        n_pos = len(edge_strength_logits)
-                        n_neg = int(n_pos * args.negative_sample_ratio)
-                        
-                        if n_neg > 0:
-                            n_cells = cell_repr.size(0)
-                            neg_src = torch.randint(0, n_cells, (n_neg,), device=device)
-                            neg_dst = torch.randint(0, n_cells, (n_neg,), device=device)
-                            mask = neg_src != neg_dst
-                            neg_src = neg_src[mask]
-                            neg_dst = neg_dst[mask]
-                            
-                            if len(neg_src) > 0:
-                                neg_edge_logits = torch.randn(len(neg_src), device=device) - 2.0
-                                neg_edge_pred = torch.sigmoid(neg_edge_logits)
-                                neg_labels = torch.zeros_like(neg_edge_pred)
-                                
-                                all_preds = torch.cat([pos_edge_pred, neg_edge_pred])
-                                all_labels = torch.cat([pos_labels, neg_labels])
-                                
-                                self_supervised_loss = torch.nn.functional.binary_cross_entropy(
-                                    all_preds, all_labels, reduction='mean'
-                                )
-                            else:
-                                self_supervised_loss = torch.nn.functional.binary_cross_entropy(
-                                    pos_edge_pred, pos_labels, reduction='mean'
-                                )
-                        else:
-                            self_supervised_loss = torch.nn.functional.binary_cross_entropy(
-                                pos_edge_pred, pos_labels, reduction='mean'
+                        # 边强度回归损失（只在is_important=1的边上）
+                        mask_important = (exist_labels == 1)
+                        if mask_important.sum() > 0:
+                            loss_rate = torch.nn.functional.smooth_l1_loss(
+                                rate_pred[mask_important],
+                                lr_scores[mask_important],
+                                reduction='mean'
                             )
+                        else:
+                            loss_rate = torch.tensor(0.0, device=device)
                         
-                        alpha = args.supervised_weight
-                        edge_strength_loss = alpha * supervised_loss + (1 - alpha) * self_supervised_loss
+                        # 总损失
+                        val_loss = args.lambda_exist * loss_exist + args.lambda_rate * loss_rate
                     else:
-                        edge_strength_loss = 0.0
+                        val_loss = torch.tensor(0.0, device=device)
                     
-                    batch_loss += edge_strength_loss
+                    batch_loss += val_loss
                 
                 avg_batch_loss = batch_loss / batch_size
                 total_val_loss += avg_batch_loss.item()
@@ -1024,13 +980,13 @@ def main():
                 break
         
         # 更新epoch进度条（只在epoch结束时更新一次）
-        alpha = args.supervised_weight
         epoch_pbar.set_postfix({
             'Train': f'{avg_train_loss:.4f}',
             'Val': f'{avg_val_loss:.6f}',
-            'Sup': f'{avg_supervised:.4f}',  # 监督学习损失（MSE）
-            'Self': f'{avg_self_supervised:.4f}',  # 自监督学习损失（BCE）
-            'α': f'{alpha:.1f}'  # 监督权重
+            'Exist': f'{avg_self_supervised:.4f}',  # 边存在性判别损失（BCE）
+            'Rate': f'{avg_supervised:.4f}',  # 边强度回归损失（SmoothL1）
+            'λ_E': f'{args.lambda_exist:.1f}',  # 存在性权重
+            'λ_R': f'{args.lambda_rate:.1f}'  # 回归权重
         })
         
         # 保存检查点
@@ -1047,11 +1003,18 @@ def main():
     logging.info(f"最终模型已保存: {final_model_path}")
     
     # ========== 阶段5：统计cell-cell边重要性 ==========
+    logging.info(f"\\n开始评估阶段，检查收集的数据:")
+    logging.info(f"  - all_cc_attention_scores: {len(all_cc_attention_scores)} 个batch")
+    logging.info(f"  - all_edge_index_cc: {len(all_edge_index_cc)} 个batch")
+    logging.info(f"  - all_edge_attr_cc: {len(all_edge_attr_cc)} 个batch")
+    logging.info(f"  - all_spot_indices: {len(all_spot_indices)} 个batch")
+    
     evaluate_cell_communication(
         all_cc_attention_scores=all_cc_attention_scores,
         all_edge_index_cc=all_edge_index_cc,
         all_edge_attr_cc=all_edge_attr_cc,
         all_spot_indices=all_spot_indices,
+        all_n_spots_sub=all_n_spots_sub,
         all_cell_names=all_cell_names,
         output_dir=args.output_dir,
         n_spots=n_spots,

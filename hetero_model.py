@@ -307,6 +307,23 @@ class HeteroSTModel(nn.Module):
             nn.Linear(gat_hidden_dims[-1], 1)
         )
         
+        # ✅ 双头架构：边存在性判别器 + 边强度回归器
+        # 边存在性判别器（用于识别假阳性边）
+        self.edge_exist_head = nn.Sequential(
+            nn.Linear(gat_hidden_dims[-1] * 2, gat_hidden_dims[-1]),
+            nn.ReLU(),
+            nn.Dropout(gat_dropout),
+            nn.Linear(gat_hidden_dims[-1], 1)
+        )
+        
+        # 边强度回归器（预测真实的通讯强度）
+        self.edge_rate_head = nn.Sequential(
+            nn.Linear(gat_hidden_dims[-1] * 2, gat_hidden_dims[-1]),
+            nn.ReLU(),
+            nn.Dropout(gat_dropout),
+            nn.Linear(gat_hidden_dims[-1], 1)
+        )
+        
         # 可学习的相似度边权重调节因子
         # α_ss: spot-spot边权重调节因子
         # α_sc: spot-cell边权重调节因子
@@ -325,7 +342,7 @@ class HeteroSTModel(nn.Module):
             edge_index_like: [2, n_edges_like] 相似度边 (spot-spot + spot-celltype)
             edge_attr_like: [n_edges_like, 2] 相似度边特征 [weight, -1]
             edge_index_cc: [2, n_edges_cc] celltype-celltype边
-            edge_attr_cc: [n_edges_cc, 2] cell-cell边特征 [lr_score, lr_id]
+            edge_attr_cc: [n_edges_cc, 3] cell-cell边特征 [lr_score, lr_id, is_important]
             return_attention: 是否返回cell-cell边的注意力得分
             edge_mask_ratio: 边mask比例 (0.1-0.2)
 
@@ -334,9 +351,11 @@ class HeteroSTModel(nn.Module):
             cell_repr: [n_cells, output_dim] cell表示
             combined: [k+1+n_celltypes, output_dim] 组合表示
             spot_proj: [k+1, output_dim] spot投影（用于对比学习）
-            cc_attention: [n_edges_cc, num_heads] cell-cell注意力得分（如果return_attention=True）
+            cc_attention: [n_edges_cc] cell-cell注意力得分/边强度logits（如果return_attention=True）
             predicted_masked_edges: 被mask边的预测值（用于训练）
             edge_mask: 边mask信息
+            exist_logits: [n_edges_cc] 边存在性logits（用于BCE损失）
+            rate_pred: [n_edges_cc] 边强度预测值（回归目标）
         """
         # VAE编码（使用预训练VAE编码器）
         mu, log_var = self.vae_encoder(expr_raw)
@@ -440,6 +459,23 @@ class HeteroSTModel(nn.Module):
             comm_repr = self.fallback_proj(all_feat)
             cc_attention = None
 
+        # ✅ 双头预测：边存在性判别 + 边强度回归
+        exist_logits = None
+        rate_pred = None
+        if edge_index_cc.size(1) > 0:
+            # 获取边表示：源节点和目标节点的表示
+            src_repr = comm_repr[edge_index_cc[0]]  # [n_edges, hidden_dim]
+            dst_repr = comm_repr[edge_index_cc[1]]  # [n_edges, hidden_dim]
+            edge_repr = torch.cat([src_repr, dst_repr], dim=-1)  # [n_edges, hidden_dim*2]
+            
+            # 边存在性判别器（输出logits，BCE with logits会自动处理sigmoid）
+            exist_logits = self.edge_exist_head(edge_repr).squeeze(-1)  # [n_edges]
+            
+            # 边强度回归器（使用softplus确保非负）
+            rate_pred = torch.nn.functional.softplus(
+                self.edge_rate_head(edge_repr).squeeze(-1)
+            )  # [n_edges]
+
         # ✅ 融合空间表示和通讯表示
         combined_feat = torch.cat([spatial_repr, comm_repr], dim=-1)  # [n_nodes, hidden_dim*2]
         combined = self.fusion_layer(combined_feat)  # [n_nodes, hidden_dim]
@@ -454,8 +490,8 @@ class HeteroSTModel(nn.Module):
         # 对比学习投影
         spot_proj = self.projection_head(spot_repr_out)  # [n_spots, output_dim]
 
-        # 返回结果
+        # ✅ 返回结果（添加exist_logits和rate_pred）
         if return_attention:
-            return spot_repr_out, cell_repr_out, combined, spot_proj, cc_attention, predicted_masked_edges, edge_mask
+            return spot_repr_out, cell_repr_out, combined, spot_proj, cc_attention, predicted_masked_edges, edge_mask, exist_logits, rate_pred
         else:
-            return spot_repr_out, cell_repr_out, combined, spot_proj, None, predicted_masked_edges, edge_mask
+            return spot_repr_out, cell_repr_out, combined, spot_proj, None, predicted_masked_edges, edge_mask, exist_logits, rate_pred

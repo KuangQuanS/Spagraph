@@ -52,20 +52,10 @@ def calculate_lr_scores(
     # 获取spots数量
     n_spots = spot_coords.shape[0]
 
-    # 构建KNN邻域（用于空间图构建）
+    # 构建KNN邻域（用于空间图构建，不限制距离）
     logging.info(f"构建KNN图: {n_spots} spots, {n_neighbors} neighbors")
     knn = kneighbors_graph(spot_coords, n_neighbors=n_neighbors, mode="connectivity", include_self=False)
     knn_mask = knn.toarray()  # [n_spots, n_spots] - 用于空间图构建
-    
-    # 添加物理距离限制
-    distance_threshold = 200.0  # 200μm
-    for i in range(n_spots):
-        for j in range(n_spots):
-            if knn_mask[i, j] == 1:
-                dist = np.sqrt((spot_coords[i, 0] - spot_coords[j, 0])**2 +
-                              (spot_coords[i, 1] - spot_coords[j, 1])**2)
-                if dist > distance_threshold:
-                    knn_mask[i, j] = 0
     
     # ✅ 构建LR通信邻域mask（允许更大范围的通信）
     # 使用更大的距离阈值，允许细胞间通信在更远距离发生
@@ -79,18 +69,6 @@ def calculate_lr_scores(
                               (spot_coords[i, 1] - spot_coords[j, 1])**2)
                 if dist <= lr_comm_distance_threshold:
                     lr_comm_mask[i, j] = True
-
-    logging.info(f"应用距离过滤: 最大 {distance_threshold}μm")
-
-    # ✅ 使用 output_dir 保存 KNN mask
-    knn_npz_path = os.path.join(output_dir, "knn_mask.npz")
-    os.makedirs(output_dir, exist_ok=True)
-    np.savez_compressed(
-        knn_npz_path,
-        knn_mask=knn_mask
-    )
-
-    logging.info(f"KNN邻接矩阵已保存到: {knn_npz_path}")
 
     # ✅ 计算并保存LR通讯得分矩阵（使用 output_dir）
     logging.info("开始计算LR通讯得分...")
@@ -219,13 +197,13 @@ def calculate_lr_scores(
     comm_event_records = []
 
     # ========== 优化3：使用进度条和批量处理 ==========
-    logging.info("   - 开始遍历LR通信邻居对...")
+    logging.info("   - 开始遍历LR通信邻居对（基于KNN空间邻居）...")
     total_pairs = 0
     spots_with_cells = 0
     spots_without_cells = 0
     same_celltype_skipped = 0  # 统计跳过的同类型细胞对
 
-    # 遍历所有潜在的LR通信邻居对（使用lr_comm_mask）
+    # 遍历所有潜在的LR通信邻居对（使用knn_mask限制为空间邻居）
     for i in range(n_spots):
         spot_i_barcode = spot_names[i]
 
@@ -240,7 +218,7 @@ def calculate_lr_scores(
         spots_with_cells += 1
 
         for j in range(n_spots):
-            if lr_comm_mask[i, j] == 0:  # 不在LR通信距离内，跳过
+            if knn_mask[i, j] == 0:  # 只在KNN邻居之间计算LR通讯
                 continue
 
             total_pairs += 1
@@ -346,7 +324,7 @@ def calculate_lr_scores(
     # ========== 基于得分百分位数和距离设置 is_important ==========
     # 策略：计算所有LR通信的得分分布，取top 25%作为真边
     # 同时，距离超过阈值的边标记为假边（让模型学习距离的重要性）
-    logging.info(f"\n应用伪标签生成策略: 全局LR通信 + 得分 top 25% + 距离过滤")
+    logging.info(f"\n应用伪标签生成策略: KNN邻居 + 得分 top 25% + 距离过滤(100μm)")
     
     # 1. 统计所有LR通信事件
     logging.info(f"   - 总LR通信事件: {len(df)}")
@@ -354,7 +332,7 @@ def calculate_lr_scores(
     # 2. 计算所有LR通信得分的75th百分位数（top 25%）
     if len(df) > 0:
         score_threshold = df['comm_score'].quantile(0.75)
-        distance_threshold = 200.0  # 距离阈值，与KNN一致
+        distance_threshold = 200.0  # 距离阈值：200μm内算真边
         
         logging.info(f"   - LR通信得分75th百分位数: {score_threshold:.4f}")
         logging.info(f"   - 距离阈值: {distance_threshold}μm")

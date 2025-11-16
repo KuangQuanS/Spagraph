@@ -29,16 +29,18 @@ def parse_args():
     parser.add_argument('--vae_hidden_dim', type=int, default=256, help='VAE隐层维度')
     
     # 图参数
-    parser.add_argument('--n_spot_neighbors', type=int, default=20, help='Spot邻近数')
+    parser.add_argument('--n_spot_neighbors', type=int, default=10, help='Spot邻近数')
     
     # LR通讯参数
     parser.add_argument('--lr_distance_sigma', type=float, default=50.0, help='LR通讯距离衰减参数sigma')
-    parser.add_argument('--mean_expr_threshold', type=float, default=1.0, 
+    parser.add_argument('--mean_expr_threshold', type=float, default=5.0, 
                        help='配体/受体活跃基因的平均表达阈值 (normalize_total 1e4后，default: 1.0)')
-    parser.add_argument('--lr_comm_score_threshold', type=float, default=0.0, 
+    parser.add_argument('--lr_comm_score_threshold', type=float, default=5.0, 
                        help='通讯得分过滤阈值，低于此值的通讯事件将被过滤 (default: 0.0，即不过滤)')
     parser.add_argument('--min_comm_edges', type=int, default=1, 
                        help='最小通讯边数阈值，少于此值的spot将被过滤 (default: 1)')
+    parser.add_argument('--spot_cell_expr_csv', type=str, default=None,
+                       help='预计算的spot-cell全基因表达CSV文件路径，如果提供则跳过构建步骤')
 
     # GAT参数
     parser.add_argument('--gat_layers', type=int, default=6, help='GAT层数')
@@ -249,54 +251,69 @@ def main():
     spot_total_counts = np.array(adata.X.sum(axis=1)).flatten()
     logging.info(f"Spot总数: {len(spot_names)}, 平均counts={spot_total_counts.mean():.1f}")
     
-    # 统一cluster名称格式
+    # 统一cluster名称格式（在if-else之前定义，因为后面需要）
     cluster_names = [f"Cluster_{c}" if not c.startswith('Cluster_') else c 
                      for c in cluster_composition.columns]
     
-    # 构建每个spot-cell的全基因表达
-    spot_cell_full_expr = {}
-    for spot_idx, spot_name in enumerate(spot_names):
-        spot_total_count = spot_total_counts[spot_idx]
+    # 检查是否提供了预计算的CSV文件
+    if args.spot_cell_expr_csv is not None and os.path.exists(args.spot_cell_expr_csv):
+        logging.info(f"检测到预计算的spot-cell表达文件: {args.spot_cell_expr_csv}")
+        logging.info("跳过构建步骤，直接加载...")
         
-        for cell_name, celltype in cluster_to_celltype.items():
-            cluster_key = f"Cluster_{cell_name}"
-            if cluster_key not in cluster_full_expr.index:
-                continue
+        # 直接加载预计算的CSV文件
+        spot_cell_expr_df = pd.read_csv(args.spot_cell_expr_csv, index_col=0)
+        logging.info(f"已加载预计算的spot-cell全基因表达: {spot_cell_expr_df.shape}")
+        
+        # 验证数据格式
+        if spot_cell_expr_df.index.name != 'spot_cell':
+            logging.warning("警告: CSV文件index名称不是'spot_cell'，可能存在格式问题")
+        
+    else:
+        # 正常构建流程
+        # 构建每个spot-cell的全基因表达
+        spot_cell_full_expr = {}
+        for spot_idx, spot_name in enumerate(spot_names):
+            spot_total_count = spot_total_counts[spot_idx]
             
-            # 获取cluster在该spot的权重
-            if cluster_key in cluster_names:
-                cluster_idx = cluster_names.index(cluster_key)
-                cluster_weight = cluster_composition.iloc[spot_idx, cluster_idx]
-            else:
-                cluster_weight = 0.0
-            
-            if cluster_weight < 1e-6:
-                continue
-            
-            # 计算: (cluster_full_expr / 1e4) × cluster_weight × spot_total_count
-            cluster_expr_normalized = cluster_full_expr.loc[cluster_key].values / 1e4
-            spot_cell_expr = cluster_expr_normalized * cluster_weight * spot_total_count
-            
-            # 累加到该spot的celltype表达
-            key = f"{spot_name}_{celltype}"
-            if key in spot_cell_full_expr:
-                spot_cell_full_expr[key] += spot_cell_expr
-            else:
-                spot_cell_full_expr[key] = spot_cell_expr.copy()
-    
-    # 转为DataFrame
-    spot_cell_expr_df = pd.DataFrame.from_dict(
-        spot_cell_full_expr, orient='index', columns=cluster_full_expr.columns
-    )
-    spot_cell_expr_df.index.name = 'spot_cell'
-    
-    # 删除全为0的spot-cell（直接过滤，不需要额外的稀有细胞类型过滤）
-    row_sums = spot_cell_expr_df.sum(axis=1)
-    spot_cell_expr_df = spot_cell_expr_df[row_sums > 0]
+            for cell_name, celltype in cluster_to_celltype.items():
+                cluster_key = f"Cluster_{cell_name}"
+                if cluster_key not in cluster_full_expr.index:
+                    continue
+                
+                # 获取cluster在该spot的权重
+                if cluster_key in cluster_names:
+                    cluster_idx = cluster_names.index(cluster_key)
+                    cluster_weight = cluster_composition.iloc[spot_idx, cluster_idx]
+                else:
+                    cluster_weight = 0.0
+                
+                if cluster_weight < 1e-6:
+                    continue
+                
+                # 计算: (cluster_full_expr / 1e4) × cluster_weight × spot_total_count
+                cluster_expr_normalized = cluster_full_expr.loc[cluster_key].values / 1e4
+                spot_cell_expr = cluster_expr_normalized * cluster_weight * spot_total_count
+                
+                # 累加到该spot的celltype表达
+                key = f"{spot_name}_{celltype}"
+                if key in spot_cell_full_expr:
+                    spot_cell_full_expr[key] += spot_cell_expr
+                else:
+                    spot_cell_full_expr[key] = spot_cell_expr.copy()
+        
+        # 转为DataFrame
+        spot_cell_expr_df = pd.DataFrame.from_dict(
+            spot_cell_full_expr, orient='index', columns=cluster_full_expr.columns
+        )
+        spot_cell_expr_df.index.name = 'spot_cell'
+        
+        # 删除全为0的spot-cell（直接过滤，不需要额外的稀有细胞类型过滤）
+        row_sums = spot_cell_expr_df.sum(axis=1)
+        spot_cell_expr_df = spot_cell_expr_df[row_sums > 0]
 
-    csv_path = os.path.join(args.output_dir, 'spot_cell_full_expr.csv')
-    spot_cell_expr_df.to_csv(csv_path)
-    logging.info(f"已保存spot-cell全基因表达: {csv_path}, 形状={spot_cell_expr_df.shape}")
+        csv_path = os.path.join(args.output_dir, 'spot_cell_full_expr.csv')
+        spot_cell_expr_df.to_csv(csv_path)
+        logging.info(f"已保存spot-cell全基因表达: {csv_path}, 形状={spot_cell_expr_df.shape}")
     
     # 提取实际存在的celltype（从spot_cell_expr_df的index中解析）
     cell_names = sorted(set([idx.split('_', 1)[1] for idx in spot_cell_expr_df.index]))
@@ -699,16 +716,6 @@ def main():
     edge_losses = []  # 新增：边强度预测损失历史
     comm_pred_losses = []  # 新增：通讯预测损失历史
     
-    # 用于收集cell-cell注意力得分和LR ID（只在训练集上收集）
-    all_cc_attention_scores = []
-    all_edge_index_cc = []
-    all_edge_attr_cc = []  # 收集边属性 [lr_score, lr_id, is_important, exist_logits, rate_pred]
-    all_spot_indices = []  # 收集对应的spot索引
-    all_cell_node_mappings = []  # 收集细胞节点到细胞类型的映射
-    all_batch_indices = []  # 收集每个边所属的批次索引
-    all_n_spots_sub = []  # 收集每个批次的子图spot数量
-    all_cell_names = list(cell_expr.index)
-    
     # ========== 阶段4：训练循环 ==========
     logging.info("="*80)
     logging.info("阶段4: 开始训练（双头边过滤：存在性判别 + 强度回归）")
@@ -784,47 +791,6 @@ def main():
                     return_attention=True,
                     edge_mask_ratio=0.0  # 禁用边mask，使用双头监督
                 )
-                
-                # 收集cell-cell注意力得分和双头预测（用于后续分析）
-                if cc_attention is not None:
-                    all_cc_attention_scores.append(cc_attention.detach().cpu())
-                    all_edge_index_cc.append(edge_index_cc.detach().cpu())
-                    # ✅ 扩展edge_attr_cc: 添加exist_logits和rate_pred作为额外列
-                    edge_attr_extended = torch.cat([
-                        edge_attr_cc.detach().cpu(),
-                        exist_logits.detach().cpu().unsqueeze(-1),  # [n_edges, 1]
-                        rate_pred.detach().cpu().unsqueeze(-1)      # [n_edges, 1]
-                    ], dim=-1)  # [n_edges, 5] = [lr_score, lr_id, is_important, exist_logits, rate_pred]
-                    all_edge_attr_cc.append(edge_attr_extended)
-                    # 收集对应的spot信息（center_spot_idx）
-                    center_spot_idx = batch['center_spot_idx'][b]
-                    spot_indices = torch.full((edge_index_cc.size(1),), center_spot_idx, dtype=torch.long)
-                    all_spot_indices.append(spot_indices)
-                    # 收集细胞节点映射信息
-                    spot_cell_mapping = batch['spot_cell_mapping'][b]
-                    # 创建细胞节点局部索引到细胞类型ID的映射
-                    cell_node_to_cell_type = {}
-                    for (spot_local_idx, cell_type_id), cell_node_local_idx in spot_cell_mapping.items():
-                        cell_node_to_cell_type[cell_node_local_idx] = cell_type_id
-                    all_cell_node_mappings.append(cell_node_to_cell_type)
-                    # 收集批次索引
-                    batch_indices = torch.full((edge_index_cc.size(1),), len(all_cc_attention_scores) - 1, dtype=torch.long)
-                    all_batch_indices.append(batch_indices)
-                    # 收集子图spot数量
-                    n_spots_sub = batch['n_spots_sub'][b]
-                    n_spots_sub_tensor = torch.full((edge_index_cc.size(1),), n_spots_sub, dtype=torch.long)
-                    all_n_spots_sub.append(n_spots_sub_tensor)
-                    
-                    # 调试信息：记录数据收集情况
-                    if len(all_cc_attention_scores) <= 5:  # 只在前5个batch打印
-                        logging.info(f"收集到batch数据: cc_attention.shape={cc_attention.shape}, "
-                                   f"edge_index_cc.shape={edge_index_cc.shape}, "
-                                   f"edge_attr_cc.shape={edge_attr_cc.shape}")
-                else:
-                    # 调试信息：记录cc_attention为None的情况
-                    if batch_idx <= 3 and epoch == 0:  # 只在第一个epoch的前3个batch打印
-                        logging.warning(f"cc_attention为None: batch_idx={batch_idx}, epoch={epoch}, "
-                                      f"edge_index_cc.size(1)={edge_index_cc.size(1) if 'edge_index_cc' in locals() else 'N/A'}")
 
                 # ========== 双头训练：边存在性判别（BCE）+ 边强度回归（MSE）==========
                 loss_exist = 0.0  # 边存在性判别损失
@@ -970,10 +936,10 @@ def main():
             if avg_val_loss < best_val_loss - early_stop_min_delta:
                 best_val_loss = avg_val_loss
                 patience_counter = 0
-                logging.info(f"验证损失改善: {best_val_loss:.6f} (patience重置为0)")
+                #logging.info(f"验证损失改善: {best_val_loss:.6f} (patience重置为0)")
             else:
                 patience_counter += 1
-                logging.info(f"验证损失未改善: {avg_val_loss:.6f} vs {best_val_loss:.6f} (patience: {patience_counter}/{early_stop_patience})")
+                #logging.info(f"验证损失未改善: {avg_val_loss:.6f} vs {best_val_loss:.6f} (patience: {patience_counter}/{early_stop_patience})")
                 
             if patience_counter >= early_stop_patience:
                 logging.info(f"早停触发: 验证损失在{early_stop_patience}个epoch内未改善")
@@ -1003,11 +969,94 @@ def main():
     logging.info(f"最终模型已保存: {final_model_path}")
     
     # ========== 阶段5：统计cell-cell边重要性 ==========
-    logging.info(f"\\n开始评估阶段，检查收集的数据:")
-    logging.info(f"  - all_cc_attention_scores: {len(all_cc_attention_scores)} 个batch")
-    logging.info(f"  - all_edge_index_cc: {len(all_edge_index_cc)} 个batch")
-    logging.info(f"  - all_edge_attr_cc: {len(all_edge_attr_cc)} 个batch")
-    logging.info(f"  - all_spot_indices: {len(all_spot_indices)} 个batch")
+    logging.info("="*80)
+    logging.info("阶段5: 统计cell-cell边重要性")
+    logging.info("="*80)
+    
+    # ✅ 创建一个不打乱顺序的评估数据加载器（使用完整的训练+验证数据集）
+    logging.info("创建评估数据加载器（不打乱顺序，使用完整数据集）...")
+    eval_dataloader = DataLoader(
+        dataset,  # 使用完整的dataset，不是train_dataset
+        batch_size=args.batch_size,
+        shuffle=False,  # ⚠️ 不打乱顺序！
+        num_workers=0,
+        collate_fn=hetero_subgraph_collate_fn
+    )
+    logging.info(f"   - 评估数据集大小: {len(dataset)} spots")
+    logging.info(f"   - 评估batch数量: {len(eval_dataloader)} batches")
+    
+    # 在训练结束后，用训练好的模型对完整数据集进行一次评估，收集注意力得分
+    logging.info("使用训练好的模型对完整数据集进行评估，收集cell-cell注意力得分...")
+    
+    model.eval()
+    all_cc_attention_scores = []
+    all_edge_index_cc = []
+    all_edge_attr_cc = []
+    all_spot_indices = []
+    all_cell_node_mappings = []
+    all_batch_indices = []
+    all_n_spots_sub = []
+    
+    # ✅ 定义细胞类型名称列表
+    all_cell_names = cell_names
+    
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(tqdm(eval_dataloader, desc="Evaluating", leave=True)):
+            batch_size = batch['batch_size']
+            
+            for b in range(batch_size):
+                expr_raw = batch['expr_raw'][b].to(device)
+                cell_expr_raw = batch['cell_expr_raw'][b].to(device)
+                edge_index_like = batch['edge_index_like'][b].to(device)
+                edge_attr_like = batch['edge_attr_like'][b].to(device)
+                edge_index_cc = batch['edge_index_cc'][b].to(device)
+                edge_attr_cc = batch['edge_attr_cc'][b].to(device)
+                
+                # 模型前向传播
+                edge_attr_cc_input = torch.zeros(edge_attr_cc.size(0), 2, device=device)
+                spot_repr, cell_repr, combined, spot_proj, cc_attention, _, _, exist_logits, rate_pred = model(
+                    expr_raw=expr_raw,
+                    cell_expr_raw=cell_expr_raw,
+                    edge_index_like=edge_index_like,
+                    edge_attr_like=edge_attr_like,
+                    edge_index_cc=edge_index_cc,
+                    edge_attr_cc=edge_attr_cc_input,
+                    return_attention=True,
+                    edge_mask_ratio=0.0
+                )
+                
+                if cc_attention is not None:
+                    all_cc_attention_scores.append(cc_attention.detach().cpu())
+                    all_edge_index_cc.append(edge_index_cc.detach().cpu())
+                    edge_attr_extended = torch.cat([
+                        edge_attr_cc.detach().cpu(),
+                        exist_logits.detach().cpu().unsqueeze(-1),
+                        rate_pred.detach().cpu().unsqueeze(-1)
+                    ], dim=-1)
+                    all_edge_attr_cc.append(edge_attr_extended)
+                    
+                    center_spot_idx = batch['center_spot_idx'][b]
+                    spot_indices = torch.full((edge_index_cc.size(1),), center_spot_idx, dtype=torch.long)
+                    all_spot_indices.append(spot_indices)
+                    
+                    spot_cell_mapping = batch['spot_cell_mapping'][b]
+                    cell_node_to_cell_type = {}
+                    for (spot_local_idx, cell_type_id), cell_node_local_idx in spot_cell_mapping.items():
+                        cell_node_to_cell_type[cell_node_local_idx] = cell_type_id
+                    all_cell_node_mappings.append(cell_node_to_cell_type)
+                    
+                    batch_indices = torch.full((edge_index_cc.size(1),), batch_idx, dtype=torch.long)
+                    all_batch_indices.append(batch_indices)
+                    
+                    n_spots_sub = batch['n_spots_sub'][b]
+                    n_spots_sub_tensor = torch.full((edge_index_cc.size(1),), n_spots_sub, dtype=torch.long)
+                    all_n_spots_sub.append(n_spots_sub_tensor)
+    
+    logging.info(f"评估完成，收集到 {len(all_cc_attention_scores)} 个spots的注意力得分")
+    total_edges_collected = sum(scores.shape[0] for scores in all_cc_attention_scores)
+    logging.info(f"   - 子图内边数（模型实际使用）: {total_edges_collected} 条")
+    logging.info(f"   - 平均每个spot子图: {total_edges_collected/len(all_cc_attention_scores):.1f} 条边")
+    logging.info(f"   - 注意：这是子图内的边数，不包含spot间的跨子图通讯")
     
     evaluate_cell_communication(
         all_cc_attention_scores=all_cc_attention_scores,

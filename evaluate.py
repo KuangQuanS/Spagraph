@@ -53,7 +53,7 @@ def evaluate_cell_communication(
         logging.warning(f"all_spot_indices长度: {len(all_spot_indices)}")
         return
 
-    logging.info(f"收集到 {len(all_cc_attention_scores)} 个batch的注意力得分")
+    logging.info(f"收集到 {len(all_cc_attention_scores)} 个spots的注意力得分")
 
     # 合并所有batch的注意力得分
     all_scores = torch.cat(all_cc_attention_scores, dim=0)  # [total_edges]
@@ -63,7 +63,9 @@ def evaluate_cell_communication(
     all_n_spots_sub_batch = torch.cat(all_n_spots_sub, dim=0)  # [total_edges] - n_spots_sub for each edge
 
     logging.info(f"合并后数据形状: all_scores={all_scores.shape}, all_edges={all_edges.shape}, all_attrs={all_attrs.shape}, all_spots={all_spots.shape}")
-    logging.info(f"数据统计: 总边数={all_scores.shape[0]}, 唯一源节点数={torch.unique(all_edges[0]).shape[0]}, 唯一目标节点数={torch.unique(all_edges[1]).shape[0]}")
+    n_unique_spots = len(torch.unique(all_spots))
+    logging.info(f"数据统计: 总边数={all_scores.shape[0]}, 唯一spot数={n_unique_spots}, 平均每spot边数={all_scores.shape[0]/n_unique_spots:.1f}")
+    logging.info(f"   - 唯一源细胞类型数={torch.unique(all_edges[0]).shape[0]}, 唯一目标细胞类型数={torch.unique(all_edges[1]).shape[0]}")
 
     # 注意：all_scores现在是1维的[total_edges]，直接使用即可
     avg_scores = all_scores  # [total_edges] - 已经是平均后的注意力得分
@@ -279,13 +281,7 @@ def evaluate_cell_communication(
     logging.info("生成基于模型预测的通讯结果")
     logging.info("="*60)
 
-    # ✅ 使用过滤前的完整数据生成通讯结果（包含所有边）
-    logging.info("使用完整注意力得分（过滤前）作为通讯强度的代理指标...")
     all_pred_strengths = all_scores_full  # [total_edges] - 使用完整的 GAT 注意力得分
-
-    logging.info(f"   注意：由于 DataLoader shuffle，无法准确重建 predicted_comm_strength")
-    logging.info(f"   使用 attention_score 作为模型学习到的重要性指标")
-    logging.info(f"   这在实际效果上是合理的：attention 本身就反映了模型认为的边重要性")
 
     # 生成三种得分的通讯结果文件
     model_based_comm_path = os.path.join(output_dir, "lr_communication_model_based.csv")
@@ -344,11 +340,6 @@ def evaluate_cell_communication(
 
     logging.info(f"基于模型预测的通讯结果已保存: {model_based_comm_path}")
     logging.info(f"   - 总边数: {all_edges_full.size(1)}")
-    logging.info(f"   - original_lr_score: 原始LR得分（表达 × 距离衰减）")
-    logging.info(f"   - edge_logits: 模型预测的原始logits（未激活）")
-    logging.info(f"   - adjusted_score: 调制后的得分（推荐使用）⭐")
-    logging.info(f"   - 解释：adjusted_score = original_lr_score × (1 + tanh(edge_logits))")
-
 
 def plot_dgi_loss(dgi_train_losses, dgi_val_losses=None, output_dir: str = None, epochs: int = None) -> None:
     """

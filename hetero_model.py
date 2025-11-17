@@ -133,9 +133,13 @@ class EdgeAttentionLayer(nn.Module):
         out = self.output_projection(out)
         out = self.output_dropout(out)
 
-        # 返回边强度logits（用于监督学习和评估）
+        # 计算每条边跨头的平均注意力 (attn_avg)
+        attn_avg = attention_weights.mean(dim=-1)  # [n_edges]
+
+        # 返回边强度logits（用于监督学习和评估）以及实际用于聚合的归一化注意力
         if return_attention:
-            return out, edge_strength_logits  # 返回raw logits，不是sigmoid后的
+            # 返回 (attn_avg, edge_strength_logits) 作为元组，便于上游使用真实attention用于报告和sigmoid/logits用于监督
+            return out, (attn_avg, edge_strength_logits)
         else:
             return out, None
     
@@ -207,7 +211,7 @@ class EdgeAttentionNetwork(nn.Module):
 
         for i, layer in enumerate(self.layers):
             if i == len(self.layers) - 1 and return_attention:
-                # 最后一层返回注意力得分
+                # 最后一层返回注意力得分 (可能是元组)
                 x, attn_scores = layer(edge_attr, edge_index, x, return_attention=True)
             else:
                 x, _ = layer(edge_attr, edge_index, x, return_attention=False)
@@ -215,46 +219,61 @@ class EdgeAttentionNetwork(nn.Module):
                 x = self.activation(x)
 
         return x, attn_scores if return_attention else None
-class FusionModule(nn.Module):
-    """融合模态特征"""
+class MLPEncoder(nn.Module):
+    """MLP编码器 - 替代VAE的简单多层感知机"""
     
-    def __init__(self, image_dim: int, expr_dim: int, fusion_dim: int = 256):
+    def __init__(self, input_dim: int, hidden_dims: list = [256, 128], latent_dim: int = 64, dropout: float = 0.1):
         super().__init__()
         
-        self.image_proj = nn.Linear(image_dim, fusion_dim)
-        self.expr_proj = nn.Linear(expr_dim, fusion_dim)
+        self.input_dim = input_dim
+        self.latent_dim = latent_dim
         
-        self.fusion = nn.Sequential(
-            nn.Linear(fusion_dim * 2, fusion_dim),
-            nn.ReLU(),
-            nn.Linear(fusion_dim, fusion_dim)
-        )
+        # 构建MLP层
+        layers = []
+        current_dim = input_dim
+        
+        for hidden_dim in hidden_dims:
+            layers.extend([
+                nn.Linear(current_dim, hidden_dim),
+                nn.BatchNorm1d(hidden_dim),
+                nn.ReLU(),
+                nn.Dropout(dropout)
+            ])
+            current_dim = hidden_dim
+        
+        # 输出层
+        layers.append(nn.Linear(current_dim, latent_dim))
+        
+        self.encoder = nn.Sequential(*layers)
+        
+        # 初始化权重
+        self.apply(self._init_weights)
     
-    def forward(self, image_feat: torch.Tensor, expr_feat: torch.Tensor) -> torch.Tensor:
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            nn.init.xavier_uniform_(module.weight)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            image_feat: [B, image_dim]
-            expr_feat: [B, expr_dim]
-        
+            x: [batch_size, input_dim] 输入特征
+            
         Returns:
-            fused: [B, fusion_dim]
+            latent: [batch_size, latent_dim] 编码后的特征
         """
-        img_proj = self.image_proj(image_feat)
-        expr_proj = self.expr_proj(expr_feat)
-        
-        fused = self.fusion(torch.cat([img_proj, expr_proj], dim=1))
-        
-        return fused
+        return self.encoder(x)
 
 
 class HeteroSTModel(nn.Module):
-    """异构ST通讯模型 - 简化版（仅使用基因表达）"""
+    """异构ST通讯模型 - 使用MLP编码器"""
     
-    def __init__(self, n_genes: int = None, vae_latent_dim: int = 64, vae_hidden_dim: int = 256,
+    def __init__(self, n_genes: int = None, mlp_latent_dim: int = 64, mlp_hidden_dims: list = [256, 128],
                  image_dim: int = None, fusion_dim: int = 256, 
                  gat_layers: int = 3, gat_hidden_dims: list = None,
                  gat_heads: int = 4, gat_dropout: float = 0.1,
-                 output_dim: int = 64, n_celltypes: int = None, vae_encoder = None,
+                 output_dim: int = 64, n_celltypes: int = None,
                  temperature: float = 1.0):
         super().__init__()
         
@@ -262,24 +281,27 @@ class HeteroSTModel(nn.Module):
             gat_hidden_dims = [256, 256, 128]
         
         self.n_genes = n_genes
-        self.vae_latent_dim = vae_latent_dim
+        self.mlp_latent_dim = mlp_latent_dim
         self.output_dim = output_dim
         self.gat_hidden_dims = gat_hidden_dims
         
-        # VAE编码器（必需）
-        if vae_encoder is None:
-            raise ValueError("必须提供预训练的VAE编码器 (vae_encoder)")
-        self.vae_encoder = vae_encoder
+        # MLP编码器替代VAE
+        self.mlp_encoder = MLPEncoder(
+            input_dim=n_genes,
+            hidden_dims=mlp_hidden_dims,
+            latent_dim=mlp_latent_dim,
+            dropout=gat_dropout
+        )
         
         # ✅ Edge Attention网络 - 基于边特征的注意力
         # 注意：统一使用edge_dim=2，所有边都包含[score, id]
         # 对于相似度边：[weight, -1]（-1表示非通讯边）
         # 对于通讯边：[lr_score, lr_id]
-        self.edge_attn_spatial = EdgeAttentionNetwork(edge_dim=2, node_dim=vae_latent_dim, hidden_dims=gat_hidden_dims, num_heads=gat_heads, dropout=gat_dropout, temperature=temperature)  # 空间相似度图
-        self.edge_attn_comm = EdgeAttentionNetwork(edge_dim=2, node_dim=vae_latent_dim, hidden_dims=gat_hidden_dims, num_heads=gat_heads, dropout=gat_dropout, temperature=temperature)     # 通讯图
+        self.edge_attn_spatial = EdgeAttentionNetwork(edge_dim=2, node_dim=mlp_latent_dim, hidden_dims=gat_hidden_dims, num_heads=gat_heads, dropout=gat_dropout, temperature=temperature)  # 空间相似度图
+        self.edge_attn_comm = EdgeAttentionNetwork(edge_dim=2, node_dim=mlp_latent_dim, hidden_dims=gat_hidden_dims, num_heads=gat_heads, dropout=gat_dropout, temperature=temperature)     # 通讯图
         
-        # ✅ 备用投影层：当没有边时，将 VAE latent 投影到 GAT 输出维度
-        self.fallback_proj = nn.Linear(vae_latent_dim, gat_hidden_dims[-1])
+        # ✅ 备用投影层：当没有边时，将 MLP latent 投影到 GAT 输出维度
+        self.fallback_proj = nn.Linear(mlp_latent_dim, gat_hidden_dims[-1])
         
         # ✅ 融合层：融合空间表示和通讯表示
         self.fusion_layer = nn.Sequential(
@@ -357,12 +379,13 @@ class HeteroSTModel(nn.Module):
             exist_logits: [n_edges_cc] 边存在性logits（用于BCE损失）
             rate_pred: [n_edges_cc] 边强度预测值（回归目标）
         """
-        # VAE编码（使用预训练VAE编码器）
-        mu, log_var = self.vae_encoder(expr_raw)
-        spot_latent = mu  # [k+1, vae_latent_dim]
-
-        mu_cell, log_var_cell = self.vae_encoder(cell_expr_raw)
-        cell_latent = mu_cell  # [(k+1)*n_cells, vae_latent_dim]
+        # MLP编码（使用log1p预处理）
+        # 对基因表达进行log1p预处理
+        expr_raw_log = torch.log1p(expr_raw)  # [k+1, n_genes]
+        cell_expr_raw_log = torch.log1p(cell_expr_raw)  # [(k+1)*n_cells, n_genes]
+        
+        spot_latent = self.mlp_encoder(expr_raw_log)  # [k+1, mlp_latent_dim]
+        cell_latent = self.mlp_encoder(cell_expr_raw_log)  # [(k+1)*n_cells, mlp_latent_dim]
 
         n_spots = spot_latent.size(0)
         n_cells_total = cell_latent.size(0)
@@ -429,9 +452,18 @@ class HeteroSTModel(nn.Module):
 
         # ✅ 通讯边 - 使用Edge Attention
         if edge_index_cc.size(1) > 0:
-            comm_repr, cc_attention = self.edge_attn_comm(
+            comm_repr, cc_attention_tuple = self.edge_attn_comm(
                 masked_edge_attr_cc, edge_index_cc, all_feat, return_attention=return_attention
             )
+
+            # cc_attention_tuple: (attn_avg, edge_strength_logits) or None
+            if cc_attention_tuple is not None:
+                attn_avg, edge_strength_logits = cc_attention_tuple
+                # cc_attention (external) => normalized per-edge attention used by GAT
+                cc_attention = attn_avg
+            else:
+                attn_avg, edge_strength_logits = None, None
+                cc_attention = None
 
             # 如果有mask，预测被mask的边
             if edge_mask is not None and edge_mask.any():
@@ -445,7 +477,8 @@ class HeteroSTModel(nn.Module):
                 masked_dst_repr = comm_repr[masked_dst_idx]  # [n_masked, hidden_dim]
 
                 # 获取对应的边强度logits（已经是1维的）
-                masked_attention = cc_attention[edge_mask]  # [n_masked] - edge_strength_logits
+                # masked_attention用于mask预测器，应使用edge_strength_logits（raw logits）
+                masked_attention = edge_strength_logits[edge_mask]  # [n_masked] - edge_strength_logits
 
                 # 组合特征进行预测
                 masked_edge_features = torch.cat([

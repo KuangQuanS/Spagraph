@@ -184,9 +184,9 @@ class Discriminator(nn.Module):
 
 
 class DGIPretrainModel(nn.Module):
-    """DGI风格的自监督预训练模型"""
+    """DGI风格的自监督预训练模型（通用特征编码器支持，已移除VAE专用接口）"""
     
-    def __init__(self, vae_encoder, vae_latent_dim: int = 64,
+    def __init__(self, feature_encoder, feature_dim: int = 64,
                  gat_hidden_dims: list = [256, 256, 128],
                  gat_heads: int = 4, gat_dropout: float = 0.1,
                  readout_mode: str = 'mean',
@@ -196,8 +196,8 @@ class DGIPretrainModel(nn.Module):
                  edge_dim: int = 1):
         """
         Args:
-            vae_encoder: 预训练的VAE编码器
-            vae_latent_dim: VAE潜在空间维度
+            feature_encoder: 编码器（例如MLPEncoder），接收log1p后的原始表达并返回embedding [n, feature_dim]
+            feature_dim: 编码器输出的特征维度
             gat_hidden_dims: GAT隐藏层维度列表
             gat_heads: 注意力头数
             gat_dropout: Dropout概率
@@ -209,14 +209,15 @@ class DGIPretrainModel(nn.Module):
         """
         super().__init__()
         
-        self.vae_encoder = vae_encoder
-        self.vae_latent_dim = vae_latent_dim
+        # feature_encoder: any encoder returning [n_nodes, feature_dim]
+        self.feature_encoder = feature_encoder
+        self.feature_dim = feature_dim
         self.corruption_mode = corruption_mode
         self.mask_ratio = mask_ratio
         self.noise_std = noise_std
         
         # ✅ Edge Attention编码器（共享）
-        self.encoder = HeteroGATEncoder(vae_latent_dim, gat_hidden_dims, gat_heads, gat_dropout, edge_dim)
+        self.encoder = HeteroGATEncoder(feature_dim, gat_hidden_dims, gat_heads, gat_dropout, edge_dim)
         
         # Readout
         self.readout = Readout(gat_hidden_dims[-1], readout_mode)
@@ -271,12 +272,13 @@ class DGIPretrainModel(nn.Module):
             summary: [hidden_dim] - 图summary向量
         """
         # ========== 编码特征 ==========
-        # VAE编码
-        mu_spot, _ = self.vae_encoder(expr_raw)
-        mu_cell, _ = self.vae_encoder(cell_expr_raw)
+        # 使用通用特征编码器（例如MLP encoder）对原始表达进行编码
+        # 统一先做log1p预处理（MLP在model.forward中也做过log1p，这里与主流程保持一致）
+        feat_spot = self.feature_encoder(torch.log1p(expr_raw))
+        feat_cell = self.feature_encoder(torch.log1p(cell_expr_raw))
         
         # 拼接所有节点特征
-        all_features = torch.cat([mu_spot, mu_cell], dim=0)  # [n_nodes, vae_latent_dim]
+        all_features = torch.cat([feat_spot, feat_cell], dim=0)  # [n_nodes, feature_dim]
         n_nodes = all_features.size(0)
         
         # ========== 原始图编码 ==========
@@ -314,12 +316,12 @@ class DGIPretrainModel(nn.Module):
         Returns:
             embeddings: [n_nodes, hidden_dim]
         """
-        # VAE编码
-        mu_spot, _ = self.vae_encoder(expr_raw)
-        mu_cell, _ = self.vae_encoder(cell_expr_raw)
+        # 使用通用特征编码器（这里也做log1p预处理）
+        feat_spot = self.feature_encoder(torch.log1p(expr_raw))
+        feat_cell = self.feature_encoder(torch.log1p(cell_expr_raw))
         
         # 拼接所有节点特征
-        all_features = torch.cat([mu_spot, mu_cell], dim=0)
+        all_features = torch.cat([feat_spot, feat_cell], dim=0)
         
         # 编码
         embeddings = self.encoder(all_features, edge_index, edge_attr)

@@ -523,7 +523,13 @@ class STHeteroSubgraphDataset:
         
         # 获取ST中与cluster表达量匹配的基因
         self.genes = cluster_expr.columns.tolist()
-        self.st_X = self.adata[:, self.genes].X
+        # 对于激活基因，我们需要从adata中提取对应的表达
+        if len(self.genes) != self.adata.n_vars:
+            # 如果基因数量不匹配，说明使用的是激活基因子集
+            self.st_X = self.adata[:, self.genes].X
+        else:
+            self.st_X = self.adata.X
+            
         if hasattr(self.st_X, 'toarray'):
             self.st_X = self.st_X.toarray()
         
@@ -590,8 +596,8 @@ class STHeteroSubgraphDataset:
             else:
                 # 如果cell marker基因不在cluster基因中，用-1表示缺失
                 self.spot_gene_order_to_cell.append(-1)
-        print(f"[Optimized] Pre-computed gene index mapping for {len(self.marker_gene_to_idx)} marker genes")
-        print(f"[Aligned] Spot and cell gene orders aligned to {len(self.spot_gene_order_to_cell)} marker genes")
+        print(f"[Optimized] Pre-computed gene index mapping for {len(self.marker_gene_to_idx)} activated genes")
+        print(f"[Aligned] Spot and cell gene orders aligned to {len(self.spot_gene_order_to_cell)} activated genes")
     
 
     def _load_lr_scores_from_csv(self, csv_path: str):

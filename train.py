@@ -6,11 +6,11 @@ import glob
 import pandas as pd
 import numpy as np
 import scanpy as sc
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, RandomSampler
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from tqdm import tqdm
 
-from SC_MAP_ST.deconv_model import DualDecoderVAE as FullVAE
+# VAE已移除：使用MLPEncoder作为编码器，不再引用DualDecoderVAE
 from dgi_pretrain_model import DGIPretrainModel, dgi_loss
 from hetero_model import HeteroSTModel
 from hetero_graph_builder import STHeteroSubgraphDataset, hetero_subgraph_collate_fn, setup_logging, set_seed
@@ -24,9 +24,9 @@ def parse_args():
     parser.add_argument('--st_h5ad', type=str, required=True, help='空间转录组h5ad文件路径')
     parser.add_argument('--output_dir', type=str, required=True, help='输出目录路径')
     
-    # VAE参数
-    parser.add_argument('--vae_latent_dim', type=int, default=64, help='VAE隐空间维度')
-    parser.add_argument('--vae_hidden_dim', type=int, default=256, help='VAE隐层维度')
+    # MLP参数
+    parser.add_argument('--mlp_latent_dim', type=int, default=64, help='MLP隐空间维度')
+    parser.add_argument('--mlp_hidden_dims', type=str, default='256,128', help='MLP隐层维度')
     
     # 图参数
     parser.add_argument('--n_spot_neighbors', type=int, default=10, help='Spot邻近数')
@@ -34,7 +34,7 @@ def parse_args():
     # LR通讯参数
     parser.add_argument('--lr_distance_sigma', type=float, default=50.0, help='LR通讯距离衰减参数sigma')
     parser.add_argument('--mean_expr_threshold', type=float, default=5.0, 
-                       help='配体/受体活跃基因的平均表达阈值 (normalize_total 1e4后，default: 1.0)')
+                       help='激活基因选择和LR通讯的平均表达阈值 (normalize_total 1e4后，default: 5.0)')
     parser.add_argument('--lr_comm_score_threshold', type=float, default=5.0, 
                        help='通讯得分过滤阈值，低于此值的通讯事件将被过滤 (default: 0.0，即不过滤)')
     parser.add_argument('--min_comm_edges', type=int, default=1, 
@@ -123,9 +123,9 @@ def main():
     device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
     logging.info(f'使用设备: {device}')
     
-    # ========== 阶段1：加载数据和VAE编码器 ==========
+    # ========== 阶段1：加载数据和构建激活基因特征 ==========
     logging.info("="*80)
-    logging.info("阶段1: 加载数据和VAE编码器")
+    logging.info("阶段1: 加载数据和构建激活基因特征")
     logging.info("="*80)
     
     # ✅ 使用 deconv_dir 构建所有路径
@@ -133,67 +133,45 @@ def main():
     vae_weight_path = os.path.join(deconv_dir, 'final_vae.pth')
     vae_npz_path = os.path.join(deconv_dir, 'final_vae_cluster_data.npz')
     
-    # 1. 尝试从 stage1 的 npz 文件加载 cluster 表达
-    cluster_expr = None
-    cluster_full_expr = None
+    # 1. 尝试从 stage1 的 npz 文件加载 cluster 信息（用于细胞类型映射）
     cluster_to_celltype = {}
     
     if os.path.exists(vae_npz_path):
         cluster_data = np.load(vae_npz_path, allow_pickle=True)
         
         cluster_ids = cluster_data['cluster_ids']
-        expressions_array = cluster_data['cluster_expressions']  # marker genes
-        expressions_full_array = cluster_data['cluster_expressions_full']  # all genes
-        
         celltype_mapping_array = cluster_data['cluster_to_celltype']
         cluster_to_celltype = {str(row['cluster_id']): str(row['celltype']) 
                                 for row in celltype_mapping_array}
         
-        # 将 VAE 权重中的 genes 列表加载出来
+        # 加载全基因表达用于构建spot-cell表达
+        expressions_full_array = cluster_data['cluster_expressions_full']  # all genes
         checkpoint_temp = torch.load(vae_weight_path, map_location='cpu', weights_only=False)
-        marker_genes = checkpoint_temp.get('genes', None)
         all_genes = checkpoint_temp.get('all_genes', None)
         
-        if marker_genes is None:
-            raise ValueError("VAE checkpoint 中找不到 genes 列表")
         if all_genes is None:
             raise ValueError("VAE checkpoint 中找不到 all_genes 列表")
         
         cluster_index_names = [f"Cluster_{cid}" for cid in cluster_ids]
-        cluster_expr = pd.DataFrame(
-            expressions_array,
-            index=cluster_index_names,
-            columns=marker_genes
-        )
-        logging.info(f"已从 NPZ 加载 cluster marker 表达: {cluster_expr.shape}")
-
-        # 构建 DataFrame (all genes)
         cluster_full_expr = pd.DataFrame(
             expressions_full_array,
             index=cluster_index_names,
             columns=all_genes
         )
-
         logging.info(f"已从 NPZ 加载 cluster 全基因表达: {cluster_full_expr.shape}")
         
     else:
         # NPZ 文件不存在，无法继续
-        raise FileNotFoundError(
-            f"找不到 Stage 1 NPZ 文件: {vae_npz_path}\n"
-        )
+        raise FileNotFoundError(f"找不到 Stage 1 NPZ 文件: {vae_npz_path}\n")
 
-    cluster_to_cell = {}
-    for cluster_id, celltype_name in cluster_to_celltype.items():
-        cluster_name = f"Cluster_{cluster_id}"
-        cluster_to_cell[cluster_name] = celltype_name
-    logging.info(f"已构建cluster-cell映射: {len(cluster_to_cell)} 个cluster映射到 {len(set(cluster_to_cell.values()))} 个cell类型")
+    # 2. 构建激活基因特征（用于MLP输入）
+    logging.info("构建激活基因特征...")
+    # 激活基因将在基于重构表达数据后计算
     
-    # 4. 加载CellChat配体-受体数据库
+    # 4. CellChat数据库（用于LR通讯计算）
+    logging.info("加载CellChat LR数据库用于通讯计算...")
     cellchat_file = 'cellchat_human.csv'
-    
-
     lr_db = pd.read_csv(cellchat_file)
-    # 转换为LR对元组列表 [(ligand, receptor), ...]
     lr_pairs = []
     for _, row in lr_db.iterrows():
         lig = str(row['ligand']).strip()
@@ -224,23 +202,22 @@ def main():
     n_clusters = cluster_composition.shape[1]
     logging.info(f"cluster数量: {n_clusters}")
     
-    # 8. 初始化和加载VAE编码器
-    checkpoint = torch.load(vae_weight_path, map_location=device, weights_only=False)
+    # ========== 阶段1：加载VAE编码器（仅用于获取细胞类型映射） ==========
+    logging.info("="*80)
+    logging.info("阶段1: 加载 deconv checkpoint（仅用于获取基因列表与cluster映射）")
+    logging.info("="*80)
     
-    # 从checkpoint中提取配置
-    input_dim = checkpoint.get('input_dim', cluster_expr.shape[1])
-    latent_dim = checkpoint.get('latent_dim', args.vae_latent_dim)
-    output_type = checkpoint.get('output_type', 'mse')
+    # 仅加载VAE checkpoint以获取基因列表和细胞类型映射
+    if os.path.exists(vae_weight_path):
+        checkpoint = torch.load(vae_weight_path, map_location=device, weights_only=False)
+        all_genes = checkpoint.get('all_genes', None)
+        if all_genes is None:
+            raise ValueError("VAE checkpoint 中找不到 all_genes 列表")
+    else:
+        raise FileNotFoundError(f"找不到VAE权重文件: {vae_weight_path}")
     
-    full_vae = FullVAE(
-        input_dim=input_dim,
-        latent_dim=latent_dim,
-        output_type=output_type
-    ).to(device)
-    
-
-    full_vae.load_state_dict(checkpoint['vae_state_dict'])
-    vae_encoder = full_vae.encoder
+    # 使用MLP编码器，不再需要VAE
+    logging.info("使用MLP编码器替代VAE，直接使用激活基因特征")
 
     # ========== 阶段2：构建spot-cell全基因表达 ==========
     logging.info("="*80)
@@ -315,15 +292,62 @@ def main():
         spot_cell_expr_df.to_csv(csv_path)
         logging.info(f"已保存spot-cell全基因表达: {csv_path}, 形状={spot_cell_expr_df.shape}")
     
+    # ========== 基于重构表达数据计算激活基因 ==========
+    logging.info("基于重构表达数据计算激活基因...")
+    
+    # 使用阈值方法选择激活基因：每个cell中表达值 > threshold 的基因
+    mean_expr_threshold = args.mean_expr_threshold
+    logging.info(f"激活基因选择阈值: normalize_total(1e4) > {mean_expr_threshold}")
+    
+    activated_genes_set = set()
+    for spot_cell_name in spot_cell_expr_df.index:
+        expr = spot_cell_expr_df.loc[spot_cell_name].values
+        
+        # 对单个cell进行normalize_total
+        total_count = expr.sum()
+        if total_count > 0:
+            expr_normalized = expr / total_count * 1e4  # [n_genes]
+        else:
+            expr_normalized = expr  # 表达全为0的情况
+        
+        # 筛选表达值 > threshold 的基因
+        active_mask = expr_normalized > mean_expr_threshold
+        active_gene_names = spot_cell_expr_df.columns[active_mask].tolist()
+        activated_genes_set.update(active_gene_names)
+    
+    activated_genes = sorted(list(activated_genes_set))
+    logging.info(f"激活基因数量: {len(activated_genes)} (基于重构表达数据从{len(spot_cell_expr_df)}个cell中选择)")
+    
+    # 检查激活基因是否在cluster表达中可用
+    available_activated_genes = [g for g in activated_genes if g in cluster_full_expr.columns]
+    logging.info(f"激活基因在cluster表达中的可用性: {len(available_activated_genes)}/{len(activated_genes)}")
+    
+    # 为MLP创建输入特征：使用激活基因的cluster表达
+    activated_cluster_expr = cluster_full_expr[available_activated_genes].copy()
+    logging.info(f"MLP输入特征形状: {activated_cluster_expr.shape} (clusters x activated genes)")
+    
+    # 为Dataset接口创建占位符（实际不会使用）
+    cluster_expr = pd.DataFrame(
+        np.zeros((len(cluster_to_celltype), len(available_activated_genes)), dtype=np.float32),
+        index=[f"Cluster_{cid}" for cid in cluster_to_celltype.keys()],
+        columns=available_activated_genes
+    )
+
+    cluster_to_cell = {}
+    for cluster_id, celltype_name in cluster_to_celltype.items():
+        cluster_name = f"Cluster_{cluster_id}"
+        cluster_to_cell[cluster_name] = celltype_name
+    logging.info(f"已构建cluster-cell映射: {len(cluster_to_cell)} 个cluster映射到 {len(set(cluster_to_cell.values()))} 个cell类型")
+    
     # 提取实际存在的celltype（从spot_cell_expr_df的index中解析）
     cell_names = sorted(set([idx.split('_', 1)[1] for idx in spot_cell_expr_df.index]))
     logging.info(f"实际存在的细胞类型数: {len(cell_names)}")
     
     # ✅ 构建marker基因的占位符DataFrame（仅用于Dataset接口兼容）
     cell_expr = pd.DataFrame(
-        np.zeros((len(cell_names), cluster_expr.shape[1]), dtype=np.float32),
+        np.zeros((len(cell_names), len(available_activated_genes)), dtype=np.float32),
         index=cell_names,
-        columns=cluster_expr.columns
+        columns=available_activated_genes
     )
     
     # ✅ 构建全基因的占位符DataFrame（仅用于Dataset接口兼容，实际LR计算用spot_cell_expr_df）
@@ -362,7 +386,7 @@ def main():
     
     dataset = STHeteroSubgraphDataset(
         st_h5ad_path=args.st_h5ad,
-        cluster_expr=cluster_expr,
+        cluster_expr=activated_cluster_expr,  # 使用激活基因特征
         cell_expr=cell_expr,
         cell_full_expr=cell_full_expr,
         graph_data=graph_data,
@@ -400,7 +424,6 @@ def main():
     
     # 创建训练和验证数据加载器
     if args.sample_rate < 1.0:
-        from torch.utils.data import RandomSampler
         num_samples = int(len(train_dataset) * args.sample_rate)
         sampler = RandomSampler(train_dataset, num_samples=num_samples, replacement=False)
         logging.info(f"⚡ 采样训练模式: 每个epoch采样 {args.sample_rate*100:.1f}% 训练数据 ({num_samples}/{len(train_dataset)} spots)")
@@ -438,54 +461,19 @@ def main():
     n_cells = cell_expr.shape[0]
     
     model = HeteroSTModel(
-        n_genes=n_genes,
-        vae_latent_dim=latent_dim,  # 使用从checkpoint读取的latent_dim
-        vae_hidden_dim=args.vae_hidden_dim,
+        n_genes=len(available_activated_genes),  # 使用激活基因数量
+        mlp_latent_dim=args.mlp_latent_dim,
+        mlp_hidden_dims=[int(x) for x in args.mlp_hidden_dims.split(',')],
         gat_layers=args.gat_layers,
         gat_hidden_dims=gat_hidden_dims,
         gat_heads=args.gat_heads,
         gat_dropout=args.gat_dropout,
         output_dim=args.output_dim,
         n_celltypes=n_cells,
-        vae_encoder=vae_encoder,
         temperature=args.temperature
     ).to(device)
     
-    # 加载DGI预训练的编码器(如果提供)
-    if args.pretrained_encoder is not None and os.path.exists(args.pretrained_encoder):
-        logging.info(f"加载DGI预训练的编码器: {args.pretrained_encoder}")
-        pretrained_checkpoint = torch.load(args.pretrained_encoder, map_location=device)
-        
-        # 加载编码器权重到edge_attn_spatial(edge_dim兼容)
-        encoder_state_dict = pretrained_checkpoint['encoder_state_dict']
-        
-        # 过滤掉node_proj相关权重(延迟初始化,维度不确定)
-        filtered_state_dict = {k: v for k, v in encoder_state_dict.items() if 'node_proj' not in k}
-        
-        # ✅ 只加载到edge_attn_spatial(edge_dim=1,与DGI一致)
-        try:
-            model.edge_attn_spatial.load_state_dict(filtered_state_dict, strict=False)
-            logging.info("   - edge_attn_spatial编码器权重加载成功(跳过node_proj)")
-        except Exception as e:
-            raise RuntimeError(f"edge_attn_spatial编码器权重加载失败: {e}")
-        
-        # ⚠️ edge_attn_comm的edge_dim=2，与DGI的edge_dim=1不兼容，跳过加载
-        logging.info("   - edge_attn_comm从头开始训练（edge_dim不匹配，跳过DGI权重加载）")
-        
-        # 是否冻结编码器
-        freeze_encoder = args.freeze_encoder.lower() == 'true'
-        if freeze_encoder:
-            logging.info("   - 冻结edge_attn_spatial权重（已加载预训练）")
-            for param in model.edge_attn_spatial.parameters():
-                param.requires_grad = False
-            # ⚠️ edge_attn_comm不冻结，因为没有预训练权重
-            logging.info("   - edge_attn_comm保持可训练（无预训练权重）")
-        else:
-            logging.info("   - 微调整个模型（包括预训练的edge_attn_spatial）")
-    else:
-        if args.pretrained_encoder is not None:
-            raise FileNotFoundError(f"找不到预训练编码器文件: {args.pretrained_encoder}")
-        logging.info("从头开始训练模型（无预训练）")
+    logging.info("从头开始训练模型（MLP编码器直接训练，无预训练）")
     
     optimizer = torch.optim.Adam(
         model.parameters(),
@@ -521,8 +509,8 @@ def main():
         
         # 构建DGI模型（共享编码器）
         dgi_model = DGIPretrainModel(
-            vae_encoder=vae_encoder,
-            vae_latent_dim=latent_dim,
+            feature_encoder=model.mlp_encoder,
+            feature_dim=args.mlp_latent_dim,
             gat_hidden_dims=gat_hidden_dims,
             gat_heads=args.gat_heads,
             gat_dropout=args.gat_dropout,
@@ -709,6 +697,15 @@ def main():
         
         del dgi_model, dgi_optimizer, dgi_scheduler
         torch.cuda.empty_cache()
+        # 如果用户希望冻结预训练的编码器（例如只训练预测头），则在主模型中冻结MLP编码器
+        if args.freeze_encoder.lower() == 'true':
+            logging.info("冻结MLP编码器参数: 用户选择freeze_encoder=true")
+            for p in model.mlp_encoder.parameters():
+                p.requires_grad = False
+        else:
+            logging.info("微调MLP编码器参数: 用户选择freeze_encoder=false")
+    else:
+        logging.info("DGI预训练已禁用")
     
     # 训练循环
     train_losses = []

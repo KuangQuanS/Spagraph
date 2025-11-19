@@ -193,6 +193,7 @@ class DGIPretrainModel(nn.Module):
                  corruption_mode: str = 'feature_mask',
                  mask_ratio: float = 0.3,
                  noise_std: float = 0.1,
+                 edge_drop_rate: float = 0.0,
                  edge_dim: int = 1):
         """
         Args:
@@ -215,6 +216,7 @@ class DGIPretrainModel(nn.Module):
         self.corruption_mode = corruption_mode
         self.mask_ratio = mask_ratio
         self.noise_std = noise_std
+        self.edge_drop_rate = edge_drop_rate
         
         # ✅ Edge Attention编码器（共享）
         self.encoder = HeteroGATEncoder(feature_dim, gat_hidden_dims, gat_heads, gat_dropout, edge_dim)
@@ -291,7 +293,20 @@ class DGIPretrainModel(nn.Module):
         corrupted_features = self.corrupt_features(all_features)
         
         # ========== 腐蚀图编码 ==========
-        corrupted_embeddings = self.encoder(corrupted_features, edge_index, edge_attr)  # [n_nodes, hidden_dim]
+        # 如果设置了边丢弃率，则在这里随机丢弃一些边来增强图结构扰动
+        corrupted_edge_index = edge_index
+        corrupted_edge_attr = edge_attr
+        if self.edge_drop_rate is not None and self.edge_drop_rate > 0.0:
+            n_edges_total = edge_index.size(1)
+            keep_mask = (torch.rand(n_edges_total, device=edge_index.device) > self.edge_drop_rate)
+            if keep_mask.sum() == 0:
+                # 至少保留一条边
+                idx = torch.randint(0, n_edges_total, (1,), device=edge_index.device)
+                keep_mask[idx] = True
+            corrupted_edge_index = edge_index[:, keep_mask]
+            corrupted_edge_attr = edge_attr[keep_mask]
+
+        corrupted_embeddings = self.encoder(corrupted_features, corrupted_edge_index, corrupted_edge_attr)  # [n_nodes, hidden_dim]
         
         # ========== 判别 ==========
         # 正样本：原始嵌入 + summary (向量化)

@@ -1,4 +1,4 @@
-# 两阶段训练流程：DGI预训练 + 通讯预测微调
+# 两阶段训练流程：DGI预训练 + 通讯预测微调（注：已支持单阶段DGI作为主训练）
 
 ## 📋 概述
 
@@ -15,7 +15,7 @@
 
 ---
 
-## 🔵 阶段1：DGI自监督预训练
+## 🔵 阶段1：DGI自监督预训练（可选）
 
 ### 目标
 无监督学习图中节点（spot和cell）的良好表示
@@ -40,7 +40,7 @@ L_DGI = -1/N * Σ[log σ(D(h_i, s)) + log(1 - σ(D(h'_i, s)))]
 3. **高斯噪声**：对特征添加高斯噪声（std=0.1）
 4. **特征置换**：打乱节点间的特征
 
-### 使用方法
+### 使用方法（如果你仍想运行独立的预训练）
 
 ```bash
 python dgi_pretrain.py \
@@ -76,7 +76,7 @@ python dgi_pretrain.py \
 | `--epochs` | 预训练轮数 | 50-100 |
 | `--early_stop_patience` | 早停patience | 10 |
 
-### 输出文件
+### 输出文件（预训练）
 
 - `dgi_pretrain_final.pth`：最终预训练模型（包含encoder权重）
 - `dgi_pretrain_epoch*.pth`：定期保存的检查点
@@ -85,7 +85,7 @@ python dgi_pretrain.py \
 
 ---
 
-## 🔴 阶段2：通讯得分预测微调
+## 🔴 阶段2：通讯得分预测微调（或单阶段DGI-as-main训练）
 
 ### 目标
 利用预训练的表示进行有监督的通讯强度预测
@@ -144,7 +144,7 @@ python train.py \
 
 | 参数 | 说明 | 推荐值 |
 |------|------|--------|
-| `--pretrained_encoder` | DGI预训练权重路径 | `./results/.../dgi_pretrain_final.pth` |
+| `--pretrained_encoder` | DGI预训练权重路径（可选，若没有则从头训练/可启用 `--use_dgi_as_main`） | `./results/.../dgi_pretrain_final.pth` |
 | `--freeze_encoder` | 是否冻结编码器 | `false`（微调） / `true`（冻结） |
 | `--epochs` | 微调轮数 | 20-30（比预训练少） |
 | `--learning_rate` | 学习率 | 5e-4（微调） / 1e-3（冻结） |
@@ -311,7 +311,9 @@ python train.py --freeze_encoder false --epochs 30 --early_stop_patience 10
 
 ### Q1: 必须先运行DGI预训练吗？
 
-**A**: 不是必须的，但**强烈推荐**。不使用预训练也可以直接运行`train.py`，但收敛速度更慢，效果可能较差。
+**A**: 不是必须的。两种方案均受支持：
+- **两阶段训练**（先预训练dgi，再微调）：仍可使用 `dgi_pretrain.py` 与 `train.py --pretrained_encoder ...`。
+- **单阶段训练（推荐简化）**：直接使用 `train.py --use_dgi_as_main` 将 DGI loss 作为主训练信号（无需独立预训练）。
 
 ### Q2: 预训练需要多长时间？
 

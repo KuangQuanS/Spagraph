@@ -11,7 +11,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from tqdm import tqdm
 
 # VAE已移除：使用MLPEncoder作为编码器，不再引用DualDecoderVAE
-from dgi_pretrain_model import DGIPretrainModel, dgi_loss
+# 已经将DGI集成到HeteroSTModel (compute_dgi_loss)，不再需要独立的 DGIPretrainModel
 from hetero_model import HeteroSTModel
 from hetero_graph_builder import STHeteroSubgraphDataset, hetero_subgraph_collate_fn, setup_logging, set_seed
 from evaluate import evaluate_cell_communication, plot_training_loss, plot_dgi_loss
@@ -35,8 +35,6 @@ def parse_args():
     parser.add_argument('--lr_distance_sigma', type=float, default=50.0, help='LR通讯距离衰减参数sigma')
     parser.add_argument('--mean_expr_threshold', type=float, default=5.0, 
                        help='激活基因选择和LR通讯的平均表达阈值 (normalize_total 1e4后，default: 5.0)')
-    parser.add_argument('--lr_comm_score_threshold', type=float, default=5.0, 
-                       help='通讯得分过滤阈值，低于此值的通讯事件将被过滤 (default: 0.0，即不过滤)')
     parser.add_argument('--min_comm_edges', type=int, default=1, 
                        help='最小通讯边数阈值，少于此值的spot将被过滤 (default: 1)')
     parser.add_argument('--spot_cell_expr_csv', type=str, default=None,
@@ -52,13 +50,10 @@ def parse_args():
     # 模型参数
     parser.add_argument('--output_dim', type=int, default=120, help='输出维度')
     
-    # DGI自监督预训练参数
-    parser.add_argument('--use_dgi_pretrain', action='store_true', help='是否使用DGI自监督预训练')
-    parser.add_argument('--pretrained_encoder', type=str, default=None, 
-                       help='DGI预训练的编码器权重路径')
+    # DGI 模块参数 (用于主训练的自监督目标)
     parser.add_argument('--freeze_encoder', type=str, default='false',
                        choices=['true', 'false'],
-                       help='是否冻结预训练的编码器（true=只训练预测头，false=微调整个模型）')
+                       help='是否冻结编码器（true=只训练预测头，false=微调整个模型）')
     
     # 混合训练参数（监督 + 自监督）
     parser.add_argument('--supervised_weight', type=float, default=0.5,
@@ -76,19 +71,24 @@ def parse_args():
     parser.add_argument('--edge_exist_threshold', type=float, default=0.5,
                         help='边存在性概率阈值 (default: 0.5)')
     
-    parser.add_argument('--dgi_epochs', type=int, default=30, help='DGI预训练epoch数')
-    parser.add_argument('--dgi_lr', type=float, default=1e-4, help='DGI预训练学习率')
+    # DGI训练参数，用于在主训练阶段的DGI损失计算（不再用于独立预训练）
+    parser.add_argument('--dgi_epochs', type=int, default=30, help='DGI训练的epoch数（仅作为监控使用）')
+    parser.add_argument('--dgi_lr', type=float, default=1e-4, help='DGI子模块中可能使用的学习率（不作为主训练的单独优化器）')
     parser.add_argument('--corruption_mode', type=str, default='feature_mask', 
                        choices=['feature_mask', 'gaussian_noise', 'shuffle'],
                        help='DGI特征破坏模式')
     parser.add_argument('--mask_ratio', type=float, default=0.5, help='特征mask比例 (建议0.4-0.6，增强对比学习难度)')
     parser.add_argument('--noise_std', type=float, default=0.2, help='高斯噪声标准差 (建议0.1-0.3)')
     parser.add_argument('--edge_drop_rate', type=float, default=0.3, help='边丢弃比例 (建议0.2-0.4，增强图结构扰动)')
+    parser.add_argument('--edge_drop_mode', type=str, default='edge_drop_random', choices=['edge_drop_random','edge_drop_weighted','edge_drop_high','edge_drop_low','edge_drop_anneal'], help='边丢弃策略')
+    parser.add_argument('--use_dgi_as_main', action='store_true', help='在主训练中使用DGI损失作为主要训练信号')
+    parser.add_argument('--lambda_dgi', type=float, default=1.0, help='主训练中DGI loss的权重 (default: 1.0)')
     parser.add_argument('--readout_mode', type=str, default='mean', 
                        choices=['mean', 'sum', 'gated'],
                        help='图readout模式')
-    parser.add_argument('--dgi_early_stop_patience', type=int, default=5, help='DGI早停patience，0表示不使用早停 (default: 10)')
-    parser.add_argument('--dgi_early_stop_min_delta', type=float, default=1e-2, help='DGI早停最小改善阈值 (default: 1e-6)')
+    # 早停参数用于主训练（保留作为通用参数）
+    parser.add_argument('--dgi_early_stop_patience', type=int, default=5, help='早停patience，0表示不使用早停 (default: 5)')
+    parser.add_argument('--dgi_early_stop_min_delta', type=float, default=1e-2, help='早停最小改善阈值 (default: 1e-2)')
     
 
     # 训练参数
@@ -99,9 +99,9 @@ def parse_args():
     parser.add_argument('--seed', type=int, default=42, help='随机种子')
     parser.add_argument('--device', type=str, default='cuda', help='设备')
     parser.add_argument('--checkpoint_interval', type=int, default=50, help='检查点间隔')
-    parser.add_argument('--sample_rate', type=float, default=1.0, help='每个epoch采样比例 (default: 1.0, 即全部数据; 0.3表示采样30%)')
+    parser.add_argument('--sample_rate', type=float, default=1.0, help='每个epoch采样比例 (default: 1.0, 即全部数据; 0.3表示采样30%%)')
     parser.add_argument('--val_split', type=float, default=0.1, 
-                       help='验证集比例 (default: 0.1，即10%作为验证集)')
+                       help='验证集比例 (default: 0.1，即10%%作为验证集)')
     parser.add_argument('--early_stop_patience', type=int, default=20, help='早停patience，0表示不使用早停 (default: 0)')
     parser.add_argument('--early_stop_min_delta', type=float, default=0.0001, help='早停最小改善阈值 (default: 0.0001)')
     
@@ -343,21 +343,18 @@ def main():
     cell_names = sorted(set([idx.split('_', 1)[1] for idx in spot_cell_expr_df.index]))
     logging.info(f"实际存在的细胞类型数: {len(cell_names)}")
     
-    # ✅ 构建marker基因的占位符DataFrame（仅用于Dataset接口兼容）
     cell_expr = pd.DataFrame(
         np.zeros((len(cell_names), len(available_activated_genes)), dtype=np.float32),
         index=cell_names,
         columns=available_activated_genes
     )
     
-    # ✅ 构建全基因的占位符DataFrame（仅用于Dataset接口兼容，实际LR计算用spot_cell_expr_df）
     cell_full_expr = pd.DataFrame(
         np.zeros((len(cell_names), cluster_full_expr.shape[1]), dtype=np.float32),
         index=cell_names,
         columns=cluster_full_expr.columns
     )
-    
-    # ✅ 构建celltype-level的composition矩阵
+
     composition = pd.DataFrame(0.0, index=cluster_composition.index, columns=cell_names)
     for spot_idx in range(len(cluster_composition)):
         for cluster_idx, cluster_name in enumerate(cluster_names):
@@ -372,14 +369,13 @@ def main():
     logging.info("阶段3.5: 预计算KNN邻域和LR通讯得分")
     logging.info("="*80)
     
-    # ✅ 直接传入spot-cell全基因表达DataFrame（实际数据，不是占位符！）
     knn_mask, csv_path, graph_data = calculate_lr_scores(
         spot_coords=spot_coords,
         composition=composition,
         args=args,
         lr_pairs=lr_pairs,
         adata=adata,
-        cell_full_expr=spot_cell_expr_df,  # ✅ 传入实际的spot-cell全基因表达！
+        cell_full_expr=spot_cell_expr_df,  
         output_dir=args.output_dir,
         n_neighbors=args.n_spot_neighbors
     )
@@ -487,242 +483,22 @@ def main():
     logging.info(f"   - 总参数数: {total_params:,}")
     logging.info(f"   - 可训练参数数: {trainable_params:,}")
     
-    # ========== 阶段3.5: 自监督预训练（可选）==========
-    if args.use_dgi_pretrain:
-        logging.info("="*80)
-        logging.info("阶段3.5: DGI自监督预训练")
-        logging.info("="*80)
-        
-        # 检查是否已经加载了预训练权重
-        if args.pretrained_encoder is not None and os.path.exists(args.pretrained_encoder):
-            logging.info("⚠️ 检测到已加载预训练权重，将在此基础上继续DGI预训练")
-            logging.info("   - 这将进一步优化已加载的预训练权重")
-        else:
-            logging.info("从头开始进行DGI预训练")
-        
-        logging.info(f"DGI预训练配置:")
-        logging.info(f"   - Epochs: {args.dgi_epochs}")
-        logging.info(f"   - Learning rate: {args.dgi_lr}")
-        logging.info(f"   - Corruption mode: {args.corruption_mode}")
-        logging.info(f"   - Edge drop rate: {args.edge_drop_rate}")
-        logging.info(f"   - Readout mode: {args.readout_mode}")
-        
-        # 构建DGI模型（共享编码器）
-        dgi_model = DGIPretrainModel(
-            feature_encoder=model.mlp_encoder,
-            feature_dim=args.mlp_latent_dim,
-            gat_hidden_dims=gat_hidden_dims,
-            gat_heads=args.gat_heads,
-            gat_dropout=args.gat_dropout,
-            readout_mode=args.readout_mode,
-            corruption_mode=args.corruption_mode,
-            mask_ratio=args.mask_ratio,
-            noise_std=args.noise_std,
-            edge_dim=2  # ✅ 统一使用edge_dim=2，所有边都包含[score, id]
-        ).to(device)
-        
-        # 将主模型的编码器权重复制到DGI模型
-        # ✅ 注意：DGI的encoder包含edge_attention子模块
-        dgi_model.encoder.edge_attention.load_state_dict(model.edge_attn_spatial.state_dict())
-        
-        dgi_optimizer = torch.optim.Adam(dgi_model.parameters(), lr=args.dgi_lr)
-        dgi_scheduler = CosineAnnealingLR(dgi_optimizer, T_max=args.dgi_epochs, eta_min=1e-6)
-        
-        logging.info("开始DGI预训练...")
-        dgi_train_losses = []
-        dgi_val_losses = []
-        dgi_pbar = tqdm(range(args.dgi_epochs), desc="DGI Pretrain", leave=True, position=0)
-        
-        # DGI早停参数
-        dgi_best_loss = float('inf')
-        dgi_patience = args.dgi_early_stop_patience  # 使用命令行参数
-        dgi_patience_counter = 0
-        dgi_min_delta = args.dgi_early_stop_min_delta  # 使用命令行参数
-        
-        if dgi_patience > 0:
-            logging.info(f"DGI早停已启用: patience={dgi_patience}, min_delta={dgi_min_delta}")
-        else:
-            logging.info("DGI早停已禁用")
-        
-        for epoch in dgi_pbar:
-            # ========== 训练阶段 ==========
-            dgi_model.train()
-            epoch_dgi_train_loss = 0.0
-            
-            for batch_idx, batch in enumerate(train_dataloader):
-                batch_size = batch['batch_size']
-                # === 打印DGI图结构信息 (仅第1个epoch的前1个batch) ===
-                if batch_idx < 1 and epoch == 0:
-                    pass  # 移除调试信息
-                
-                batch_loss = 0.0
-                
-                for b in range(batch_size):
-                    expr_raw = batch['expr_raw'][b].to(device)
-                    cell_expr_raw = batch['cell_expr_raw'][b].to(device)
-                    edge_index_like = batch['edge_index_like'][b].to(device)
-                    edge_attr_like = batch['edge_attr_like'][b].to(device)
-                    edge_index_cc = batch['edge_index_cc'][b].to(device)
-                    edge_attr_cc = batch['edge_attr_cc'][b].to(device)
-                    
-                    # ✅ 扩展相似度边属性为2D格式 [weight, -1]
-                    if edge_attr_like.dim() == 1:
-                        edge_attr_like = torch.cat([edge_attr_like.unsqueeze(-1), torch.full_like(edge_attr_like.unsqueeze(-1), -1)], dim=-1)
-                    
-                    # ✅ DGI只需要前2列 [lr_score, lr_id]，去掉is_important标签
-                    edge_attr_cc_dgi = edge_attr_cc[:, :2] if edge_attr_cc.size(1) > 2 else edge_attr_cc
-                    
-                    # 合并边（DGI使用完整的异构图）
-                    edge_index = torch.cat([edge_index_like, edge_index_cc], dim=1)
-                    edge_attr = torch.cat([edge_attr_like, edge_attr_cc_dgi], dim=0)
-                    
-                    # DGI前向传播（内部会进行特征破坏和边丢弃）
-                    pos_scores, neg_scores, summary = dgi_model(
-                        expr_raw, cell_expr_raw, edge_index, edge_attr
-                    )
-                    
-                    # 计算DGI损失
-                    loss = dgi_loss(pos_scores, neg_scores)
-                    
-                    batch_loss += loss
-                
-                avg_loss = batch_loss / batch_size
-                dgi_optimizer.zero_grad()
-                avg_loss.backward()
-                torch.nn.utils.clip_grad_norm_(dgi_model.parameters(), 1.0)
-                dgi_optimizer.step()
-                
-                epoch_dgi_train_loss += avg_loss.item()
-            
-            # ========== 验证阶段 ==========
-            dgi_model.eval()
-            epoch_dgi_val_loss = 0.0
-            
-            with torch.no_grad():
-                for batch_idx, batch in enumerate(val_dataloader):
-                    batch_size = batch['batch_size']
-                    batch_loss = 0.0
-                    
-                    for b in range(batch_size):
-                        expr_raw = batch['expr_raw'][b].to(device)
-                        cell_expr_raw = batch['cell_expr_raw'][b].to(device)
-                        edge_index_like = batch['edge_index_like'][b].to(device)
-                        edge_attr_like = batch['edge_attr_like'][b].to(device)
-                        edge_index_cc = batch['edge_index_cc'][b].to(device)
-                        edge_attr_cc = batch['edge_attr_cc'][b].to(device)
-                        
-                        # ✅ 扩展相似度边属性为2D格式 [weight, -1]
-                        if edge_attr_like.dim() == 1:
-                            edge_attr_like = torch.cat([edge_attr_like.unsqueeze(-1), torch.full_like(edge_attr_like.unsqueeze(-1), -1)], dim=-1)
-                        
-                        # ✅ DGI只需要前2列 [lr_score, lr_id]，去掉is_important标签
-                        edge_attr_cc_dgi = edge_attr_cc[:, :2] if edge_attr_cc.size(1) > 2 else edge_attr_cc
-                        
-                        # 合并边（DGI使用完整的异构图）
-                        edge_index = torch.cat([edge_index_like, edge_index_cc], dim=1)
-                        edge_attr = torch.cat([edge_attr_like, edge_attr_cc_dgi], dim=0)
-                        
-                        # DGI前向传播（验证阶段不进行特征破坏）
-                        pos_scores, neg_scores, summary = dgi_model(
-                            expr_raw, cell_expr_raw, edge_index, edge_attr
-                        )
-                        
-                        # 计算DGI损失
-                        loss = dgi_loss(pos_scores, neg_scores)
-                        
-                        batch_loss += loss
-                    
-                    avg_loss = batch_loss / batch_size
-                    epoch_dgi_val_loss += avg_loss.item()
-            
-            dgi_scheduler.step()
-            avg_train_loss = epoch_dgi_train_loss / len(train_dataloader)
-            avg_val_loss = epoch_dgi_val_loss / len(val_dataloader)
-            
-            dgi_train_losses.append(avg_train_loss)
-            dgi_val_losses.append(avg_val_loss)
-            
-            dgi_pbar.set_postfix({
-                'Train': f'{avg_train_loss:.4f}', 
-                'Val': f'{avg_val_loss:.4f}'
-            })
-            dgi_pbar.update(1)
-            
-            # DGI早停检查（使用验证损失）
-            if dgi_patience > 0:
-                if avg_val_loss < dgi_best_loss - dgi_min_delta:
-                    dgi_best_loss = avg_val_loss
-                    dgi_patience_counter = 0
-                else:
-                    dgi_patience_counter += 1
-                
-                if dgi_patience_counter >= dgi_patience:
-                    logging.info(f"DGI早停触发！在epoch {epoch+1}停止预训练")
-                    logging.info(f"DGI最佳验证损失: {dgi_best_loss:.6f} (epoch {epoch+1-dgi_patience})")
-                    break
-        
-        dgi_pbar.close()
-        
-        # 将预训练的编码器权重迁移到主模型
-        # ✅ 现在两个网络都是edge_dim=2，可以都加载DGI预训练权重
-        
-        # 过滤掉node_proj相关权重(延迟初始化,维度不确定)和输出层权重(维度可能不匹配)
-        dgi_state_dict = dgi_model.encoder.edge_attention.state_dict()
-        filtered_state_dict = {k: v for k, v in dgi_state_dict.items() 
-                             if 'node_proj' not in k and 'output_projection' not in k}
-        
-        model.edge_attn_spatial.load_state_dict(filtered_state_dict, strict=False)
-        model.edge_attn_comm.load_state_dict(filtered_state_dict, strict=False)
-        logging.info("   - edge_attn_spatial已加载DGI预训练权重(跳过node_proj和output_projection)")
-        logging.info("   - edge_attn_comm已加载DGI预训练权重(跳过node_proj和output_projection)")
-        
-        # 保存DGI预训练权重
-        dgi_checkpoint_path = os.path.join(args.output_dir, "dgi_pretrained_encoder.pth")
-        torch.save({
-            'encoder_state_dict': dgi_model.encoder.edge_attention.state_dict(),  # ✅ 保存edge_attention子模块
-            'dgi_train_losses': dgi_train_losses,
-            'dgi_val_losses': dgi_val_losses,
-            'config': {
-                'corruption_mode': args.corruption_mode,
-                'readout_mode': args.readout_mode,
-                'mask_ratio': args.mask_ratio,
-                'edge_drop_rate': args.edge_drop_rate
-            }
-        }, dgi_checkpoint_path)
-        logging.info(f"DGI预训练权重已保存: {dgi_checkpoint_path}")
-        logging.info(f"DGI预训练完成！最终训练损失: {dgi_train_losses[-1]:.4f}, 验证损失: {dgi_val_losses[-1]:.4f}")
-        
-        # 绘制DGI预训练损失曲线（包含训练和验证损失）
-        plot_dgi_loss(dgi_train_losses, dgi_val_losses, args.output_dir, args.dgi_epochs)
-        
-        del dgi_model, dgi_optimizer, dgi_scheduler
-        torch.cuda.empty_cache()
-        # 如果用户希望冻结预训练的编码器（例如只训练预测头），则在主模型中冻结MLP编码器
-        if args.freeze_encoder.lower() == 'true':
-            logging.info("冻结MLP编码器参数: 用户选择freeze_encoder=true")
-            for p in model.mlp_encoder.parameters():
-                p.requires_grad = False
-        else:
-            logging.info("微调MLP编码器参数: 用户选择freeze_encoder=false")
-    else:
-        logging.info("DGI预训练已禁用")
+    # 当使用 DGI loss 作为主训练目标时，确认 encoder/edge attention 已准备好并共享
+    logging.info("在主训练中将使用 DGI loss，edge_attn_comm 已与 edge_attn_spatial 共享（单一 DGI encoder 实例）")
+    model.edge_attn_comm = model.edge_attn_spatial
     
     # 训练循环
     train_losses = []
     val_losses = []
-    edge_losses = []  # 新增：边强度预测损失历史
-    comm_pred_losses = []  # 新增：通讯预测损失历史
     
     # ========== 阶段4：训练循环 ==========
     logging.info("="*80)
-    logging.info("阶段4: 开始训练（双头边过滤：存在性判别 + 强度回归）")
+    logging.info("阶段4: 开始训练（DGI作为主要训练目标）")
     logging.info("="*80)
     logging.info(f"训练配置:")
-    logging.info(f"  - 边存在性权重（λ_exist）: {args.lambda_exist:.2f}")
-    logging.info(f"  - 边强度回归权重（λ_rate）: {args.lambda_rate:.2f}")
-    logging.info(f"  - 存在性损失: BCE_with_logits(exist_logits, is_important)")
-    logging.info(f"  - 强度回归损失: SmoothL1(rate_pred, lr_scores) [仅is_important=1]")
-    logging.info(f"  - 推理过滤策略: Top-K={args.edge_topk} 或 p_exist>{args.edge_exist_threshold}")
+    logging.info(f"  - 使用DGI loss作为主要训练信号 (lambda_dgi={args.lambda_dgi})")
+    logging.info(f"  - 边腐败模式: {args.corruption_mode}, mask_ratio={args.mask_ratio}")
+    logging.info(f"  - 边丢弃模式: {args.edge_drop_mode}, drop_rate={args.edge_drop_rate}")
     logging.info("="*80)
 
     # 使用外层tqdm跟踪epoch进度
@@ -740,13 +516,19 @@ def main():
     else:
         logging.info("主训练早停已禁用")
     
+    # 评估 dataloader（对整个数据集进行评估）
+    eval_dataloader = DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=0,
+        collate_fn=hetero_subgraph_collate_fn
+    )
+
     for epoch in epoch_pbar:
         # ========== 训练阶段 ==========
         model.train()
         total_train_loss = 0.0
-        total_supervised_loss = 0.0  # 监督学习损失
-        total_self_supervised_loss = 0.0  # 自监督学习损失
-        total_edge_loss = 0.0  # 混合边强度损失
         
         for batch_idx, batch in enumerate(train_dataloader, 1):
             batch_size = batch['batch_size']
@@ -759,9 +541,6 @@ def main():
 
             # 累积批次损失
             batch_loss = 0.0
-            batch_supervised = 0.0  # 监督学习损失
-            batch_self_supervised = 0.0  # 自监督学习损失
-            batch_edge = 0.0  # 混合边强度损失
 
             # 处理每个subgraph
             for b in range(batch_size):
@@ -789,58 +568,36 @@ def main():
                     edge_mask_ratio=0.0  # 禁用边mask，使用双头监督
                 )
 
-                # ========== 双头训练：边存在性判别（BCE）+ 边强度回归（MSE）==========
-                loss_exist = 0.0  # 边存在性判别损失
-                loss_rate = 0.0   # 边强度回归损失
-                
-                if exist_logits is not None and rate_pred is not None and edge_attr_cc.size(0) > 0:
-                    # 提取标签
-                    lr_scores = edge_attr_cc[:, 0]  # [n_edges] - 归一化的LR通讯得分
-                    exist_labels = edge_attr_cc[:, 2]  # [n_edges] - 二值标签 (0/1)
-                    
-                    # ========== 1. 边存在性判别损失（BCE with logits）==========
-                    # 使用BCE with logits自动处理sigmoid，数值更稳定
-                    loss_exist = torch.nn.functional.binary_cross_entropy_with_logits(
-                        exist_logits,
-                        exist_labels,
-                        reduction='mean'
-                    )
-                    
-                    # ========== 2. 边强度回归损失（MSE，只在is_important=1的边上计算）==========
-                    # 只对真边（is_important=1）计算回归损失
-                    mask_important = (exist_labels == 1)
-                    if mask_important.sum() > 0:
-                        # 使用Huber Loss（比MSE更鲁棒，对异常值不敏感）
-                        loss_rate = torch.nn.functional.smooth_l1_loss(
-                            rate_pred[mask_important],
-                            lr_scores[mask_important],
-                            reduction='mean'
-                        )
-                    else:
-                        loss_rate = torch.tensor(0.0, device=device)
-                    
-                    # ========== 3. 混合损失 ==========
-                    lambda_exist = args.lambda_exist  # 边存在性权重（default: 0.5）
-                    lambda_rate = args.lambda_rate   # 边强度回归权重（default: 0.4）
-                    
-                    total_loss = lambda_exist * loss_exist + lambda_rate * loss_rate
+                # ========== DGI训练：使用对比学习损失 ==========
+                # DGI需要完整的图边和edge_attr (前2列)
+                if edge_attr_like.dim() == 1:
+                    edge_attr_like_ext = torch.cat([edge_attr_like.unsqueeze(-1), torch.full_like(edge_attr_like.unsqueeze(-1), -1)], dim=-1)
                 else:
-                    total_loss = torch.tensor(0.0, device=device)
-                    loss_exist = torch.tensor(0.0, device=device)
-                    loss_rate = torch.tensor(0.0, device=device)
+                    edge_attr_like_ext = edge_attr_like
+                edge_attr_cc_dgi = edge_attr_cc[:, :2] if edge_attr_cc.dim() > 1 and edge_attr_cc.size(1) > 2 else edge_attr_cc
+                edge_index_combined = torch.cat([edge_index_like, edge_index_cc], dim=1)
+                edge_attr_combined = torch.cat([edge_attr_like_ext, edge_attr_cc_dgi], dim=0)
+                # 调用模型内置的 compute_dgi_loss（encoder 已与主模型共享），计算DGI损失
+                dgi_loss_val = model.compute_dgi_loss(
+                    expr_raw,
+                    cell_expr_raw,
+                    edge_index_combined,
+                    edge_attr_combined,
+                    corruption_mode=args.corruption_mode,
+                    mask_ratio=args.mask_ratio,
+                    edge_drop_mode=args.edge_drop_mode,
+                    edge_drop_rate=args.edge_drop_rate,
+                    epoch=epoch,
+                    total_epochs=args.epochs
+                )
+                total_loss = args.lambda_dgi * dgi_loss_val
                 
                 # 累积批次损失
                 loss = total_loss
                 batch_loss += loss
-                batch_supervised += loss_rate.item() if isinstance(loss_rate, torch.Tensor) else 0.0
-                batch_self_supervised += loss_exist.item() if isinstance(loss_exist, torch.Tensor) else 0.0
-                batch_edge += total_loss.item() if isinstance(total_loss, torch.Tensor) else 0.0
 
             # 对整个batch求平均损失，然后反向传播
             avg_batch_loss = batch_loss / batch_size
-            avg_batch_supervised = batch_supervised / batch_size if batch_supervised > 0 else 0.0
-            avg_batch_self_supervised = batch_self_supervised / batch_size if batch_self_supervised > 0 else 0.0
-            avg_batch_edge = batch_edge / batch_size if batch_edge > 0 else 0.0
 
             # 反向传播
             optimizer.zero_grad()
@@ -850,9 +607,6 @@ def main():
             scheduler.step()
 
             total_train_loss += avg_batch_loss.item()
-            total_supervised_loss += avg_batch_supervised
-            total_self_supervised_loss += avg_batch_self_supervised
-            total_edge_loss += avg_batch_edge
         
         # ========== 验证阶段 ==========
         model.eval()
@@ -886,31 +640,26 @@ def main():
                         edge_mask_ratio=0.0  # 验证阶段不mask
                     )
 
-                    # 计算验证损失（与训练损失一致）
-                    if exist_logits is not None and rate_pred is not None and edge_attr_cc.size(0) > 0:
-                        lr_scores = edge_attr_cc[:, 0]
-                        exist_labels = edge_attr_cc[:, 2]
-                        
-                        # 边存在性损失
-                        loss_exist = torch.nn.functional.binary_cross_entropy_with_logits(
-                            exist_logits, exist_labels, reduction='mean'
-                        )
-                        
-                        # 边强度回归损失（只在is_important=1的边上）
-                        mask_important = (exist_labels == 1)
-                        if mask_important.sum() > 0:
-                            loss_rate = torch.nn.functional.smooth_l1_loss(
-                                rate_pred[mask_important],
-                                lr_scores[mask_important],
-                                reduction='mean'
-                            )
-                        else:
-                            loss_rate = torch.tensor(0.0, device=device)
-                        
-                        # 总损失
-                        val_loss = args.lambda_exist * loss_exist + args.lambda_rate * loss_rate
+                    # 计算验证损失（DGI损失）
+                    if edge_attr_like.dim() == 1:
+                        edge_attr_like_ext = torch.cat([edge_attr_like.unsqueeze(-1), torch.full_like(edge_attr_like.unsqueeze(-1), -1)], dim=-1)
                     else:
-                        val_loss = torch.tensor(0.0, device=device)
+                        edge_attr_like_ext = edge_attr_like
+                    edge_attr_cc_dgi = edge_attr_cc[:, :2] if edge_attr_cc.dim() > 1 and edge_attr_cc.size(1) > 2 else edge_attr_cc
+                    edge_index_combined = torch.cat([edge_index_like, edge_index_cc], dim=1)
+                    edge_attr_combined = torch.cat([edge_attr_like_ext, edge_attr_cc_dgi], dim=0)
+                    val_loss = model.compute_dgi_loss(
+                        expr_raw,
+                        cell_expr_raw,
+                        edge_index_combined,
+                        edge_attr_combined,
+                        corruption_mode=args.corruption_mode,
+                        mask_ratio=args.mask_ratio,
+                        edge_drop_mode=args.edge_drop_mode,
+                        edge_drop_rate=args.edge_drop_rate,
+                        epoch=epoch,
+                        total_epochs=args.epochs
+                    ) * args.lambda_dgi
                     
                     batch_loss += val_loss
                 
@@ -920,13 +669,9 @@ def main():
         # 计算epoch平均损失
         avg_train_loss = total_train_loss / len(train_dataloader) if len(train_dataloader) > 0 else 0
         avg_val_loss = total_val_loss / len(val_dataloader) if len(val_dataloader) > 0 else 0
-        avg_supervised = total_supervised_loss / len(train_dataloader) if len(train_dataloader) > 0 else 0
-        avg_self_supervised = total_self_supervised_loss / len(train_dataloader) if len(train_dataloader) > 0 else 0
         
         train_losses.append(avg_train_loss)
         val_losses.append(avg_val_loss)
-        edge_losses.append(avg_supervised)  # 记录监督学习损失（MSE）
-        comm_pred_losses.append(avg_self_supervised)  # 记录自监督学习损失（BCE）
         
         # ========== 早停检查 ==========
         if early_stop_patience > 0:
@@ -945,40 +690,10 @@ def main():
         # 更新epoch进度条（只在epoch结束时更新一次）
         epoch_pbar.set_postfix({
             'Train': f'{avg_train_loss:.4f}',
-            'Val': f'{avg_val_loss:.6f}',
-            'Exist': f'{avg_self_supervised:.4f}',  # 边存在性判别损失（BCE）
-            'Rate': f'{avg_supervised:.4f}',  # 边强度回归损失（SmoothL1）
-            'λ_E': f'{args.lambda_exist:.1f}',  # 存在性权重
-            'λ_R': f'{args.lambda_rate:.1f}'  # 回归权重
+            'Val': f'{avg_val_loss:.4f}',
+            'DGI': f'{avg_train_loss:.4f}',  # DGI损失
+            'λ_DGI': f'{args.lambda_dgi:.1f}'  # DGI权重
         })
-        
-        # 保存检查点
-        if (epoch + 1) % args.checkpoint_interval == 0:
-            checkpoint_path = os.path.join(args.output_dir, f"hetero_model_epoch{epoch+1}.pth")
-            torch.save(model.state_dict(), checkpoint_path)
-    
-    # 关闭tqdm进度条
-    epoch_pbar.close()
-    
-    # 保存最终模型
-    final_model_path = os.path.join(args.output_dir, "hetero_model_final.pth")
-    torch.save(model.state_dict(), final_model_path)
-    logging.info(f"最终模型已保存: {final_model_path}")
-    
-    # ========== 阶段5：统计cell-cell边重要性 ==========
-    logging.info("="*80)
-    logging.info("阶段5: 统计cell-cell边重要性")
-    logging.info("="*80)
-    
-    # ✅ 创建一个不打乱顺序的评估数据加载器（使用完整的训练+验证数据集）
-    logging.info("创建评估数据加载器（不打乱顺序，使用完整数据集）...")
-    eval_dataloader = DataLoader(
-        dataset,  # 使用完整的dataset，不是train_dataset
-        batch_size=args.batch_size,
-        shuffle=False,  # ⚠️ 不打乱顺序！
-        num_workers=0,
-        collate_fn=hetero_subgraph_collate_fn
-    )
     logging.info(f"   - 评估数据集大小: {len(dataset)} spots")
     logging.info(f"   - 评估batch数量: {len(eval_dataloader)} batches")
     
@@ -993,6 +708,8 @@ def main():
     all_cell_node_mappings = []
     all_batch_indices = []
     all_n_spots_sub = []
+    all_src_barcodes = []  # 新增：发送方barcode
+    all_dst_barcodes = []  # 新增：接收方barcode
     
     # ✅ 定义细胞类型名称列表
     all_cell_names = cell_names
@@ -1025,11 +742,8 @@ def main():
                 if cc_attention is not None:
                     all_cc_attention_scores.append(cc_attention.detach().cpu())
                     all_edge_index_cc.append(edge_index_cc.detach().cpu())
-                    edge_attr_extended = torch.cat([
-                        edge_attr_cc.detach().cpu(),
-                        exist_logits.detach().cpu().unsqueeze(-1),
-                        rate_pred.detach().cpu().unsqueeze(-1)
-                    ], dim=-1)
+
+                    edge_attr_extended = edge_attr_cc.detach().cpu() 
                     all_edge_attr_cc.append(edge_attr_extended)
                     
                     center_spot_idx = batch['center_spot_idx'][b]
@@ -1048,6 +762,33 @@ def main():
                     n_spots_sub = batch['n_spots_sub'][b]
                     n_spots_sub_tensor = torch.full((edge_index_cc.size(1),), n_spots_sub, dtype=torch.long)
                     all_n_spots_sub.append(n_spots_sub_tensor)
+                    
+                    # 新增：收集发送方和接收方barcode
+                    spot_barcodes_full = batch['spot_barcodes'][b]  # 子图中所有spot的barcode
+                    cell_node_to_spot_cell = {cell_node: (spot_local, cell_type) for (spot_local, cell_type), cell_node in spot_cell_mapping.items()}
+                    
+                    src_barcodes = []
+                    dst_barcodes = []
+                    
+                    for e in range(edge_index_cc.size(1)):
+                        src_global = edge_index_cc[0, e].item()
+                        dst_global = edge_index_cc[1, e].item()
+                        
+                        # 转换全局节点索引到局部细胞节点索引
+                        src_local = src_global - n_spots_sub
+                        dst_local = dst_global - n_spots_sub
+                        
+                        src_spot_local, _ = cell_node_to_spot_cell[src_local]
+                        dst_spot_local, _ = cell_node_to_spot_cell[dst_local]
+                        
+                        src_barcode = spot_barcodes_full[src_spot_local]
+                        dst_barcode = spot_barcodes_full[dst_spot_local]
+                        
+                        src_barcodes.append(src_barcode)
+                        dst_barcodes.append(dst_barcode)
+                    
+                    all_src_barcodes.append(src_barcodes)  # 列表 of strings
+                    all_dst_barcodes.append(dst_barcodes)  # 列表 of strings
     
     logging.info(f"评估完成，收集到 {len(all_cc_attention_scores)} 个spots的注意力得分")
     total_edges_collected = sum(scores.shape[0] for scores in all_cc_attention_scores)
@@ -1064,7 +805,10 @@ def main():
         all_cell_names=all_cell_names,
         output_dir=args.output_dir,
         n_spots=n_spots,
-        n_cells=n_cells
+        n_cells=n_cells,
+        spot_names=spot_names,
+        all_src_barcodes=all_src_barcodes,
+        all_dst_barcodes=all_dst_barcodes
     )
     
     # 绘制损失曲线

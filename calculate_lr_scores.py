@@ -73,7 +73,7 @@ def calculate_lr_scores(
     # ✅ 计算并保存LR通讯得分矩阵（使用 output_dir）
     logging.info("开始计算LR通讯得分...")
     logging.info(f"   - 活跃基因筛选: normalize_total(1e4) > {args.mean_expr_threshold}")
-    logging.info(f"   - 通讯得分过滤阈值: {args.lr_comm_score_threshold}")
+    logging.info(f"   - 通讯得分过滤阈值: {args.mean_expr_threshold} (与活跃基因阈值一致)")
     logging.info(f"   - 通讯得分计算: 配体×受体表达相乘（无距离衰减）")
 
     # ✅ 调试：检查KNN mask状态
@@ -280,12 +280,18 @@ def calculate_lr_scores(
                         # 计算受体乘积（联合受体取乘积）
                         rec_product = np.prod(rec_vals)
 
-                        # 计算通讯得分：只用表达相乘，不加距离衰减惩罚
-                        # 让模型自己学习距离的重要性
-                        score = np.sqrt(lig_val * rec_product)
+                        # ✅ 计算归一化通讯得分（基于各细胞的总表达量标准化）
+                        total_i = cell_i_expr.sum()
+                        total_j = cell_j_expr.sum()
+                        if total_i > 0 and total_j > 0:
+                            # 归一化因子：1e4 / sqrt(total_i * total_j)
+                            normalization_factor = 1e4 / np.sqrt(total_i * total_j)
+                            score = np.sqrt(lig_val * rec_product) * normalization_factor
+                        else:
+                            score = 0
 
                         # ✅ 过滤低于阈值的通讯事件
-                        if score >= args.lr_comm_score_threshold:
+                        if score >= args.mean_expr_threshold:
                             # ✅ 计算距离，用于后续伪标签生成
                             distance = np.sqrt((spot_coords[i, 0] - spot_coords[j, 0])**2 +
                                               (spot_coords[i, 1] - spot_coords[j, 1])**2)
@@ -310,8 +316,8 @@ def calculate_lr_scores(
     logging.info(f"   - 跳过同类型细胞对: {same_celltype_skipped}")
 
     # ✅ 如果设置了阈值，输出过滤统计
-    if args.lr_comm_score_threshold > 0:
-        logging.info(f"   - 通讯得分阈值过滤: score >= {args.lr_comm_score_threshold}")
+    if args.mean_expr_threshold > 0:
+        logging.info(f"   - 通讯得分阈值过滤: score >= {args.mean_expr_threshold}")
 
     # ✅ 使用 output_dir 保存 LR 通讯得分
     csv_path = os.path.join(output_dir, "lr_scores.csv")

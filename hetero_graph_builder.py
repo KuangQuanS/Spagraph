@@ -578,8 +578,7 @@ class STHeteroSubgraphDataset:
         else:
             raise ValueError("必须提供load_lr_scores_csv")
         
-        # 过滤有效spot
-        self._filter_valid_spots(self.min_comm_edges)
+        # DGI训练不需要过滤spot，直接使用所有spot
         
         # ========== 预计算基因索引映射，避免每次都查找 ==========
         self.marker_gene_to_idx = {}
@@ -663,67 +662,14 @@ class STHeteroSubgraphDataset:
         print(f"[Loaded] Total LR score entries: {len(self.lr_scores_dict)}")
         print(f"[Loaded] Unique LR pairs: {len(self.lr_pair_to_id)}")
     
-    def _filter_valid_spots(self, min_comm_edges: int):
-        """预过滤掉没有通讯边或通讯边太少的spot"""
-        print(f"\n[Filtering] 检查每个spot的通讯边数量...")
-        valid_spots = []
-        spot_comm_counts = []
-        
-        for spot_idx in range(self.n_spots):
-            # 统计该spot作为中心点的通讯边数
-            comm_edge_count = 0
-            
-            # 获取邻居
-            neighbor_indices = self.knn_indices[spot_idx]
-            
-            # 获取中心spot的cell composition
-            composition_center = self.composition.iloc[spot_idx].values
-            cells_in_center = np.where(composition_center > 1e-6)[0]
-            
-            if len(cells_in_center) == 0:
-                spot_comm_counts.append(0)
-                continue
-            
-            # 检查与每个邻居的通讯
-            for neighbor_idx in neighbor_indices:
-                if self.knn_mask is not None and not self.knn_mask[spot_idx, neighbor_idx]:
-                    continue
-                
-                composition_neighbor = self.composition.iloc[neighbor_idx].values
-                cells_in_neighbor = np.where(composition_neighbor > 1e-6)[0]
-                
-                if len(cells_in_neighbor) == 0:
-                    continue
-                
-                # 检查cell-cell通讯
-                for cell_i in cells_in_center:
-                    for cell_j in cells_in_neighbor:
-                        pair_key = (spot_idx, neighbor_idx, cell_i, cell_j)
-                        if pair_key in self.lr_keys_by_spot_pair:
-                            comm_edge_count += len(self.lr_keys_by_spot_pair[pair_key])
-            
-            spot_comm_counts.append(comm_edge_count)
-            if comm_edge_count >= min_comm_edges:
-                valid_spots.append(spot_idx)
-        
-        self.valid_spot_indices = np.array(valid_spots)
-        self.spot_comm_counts = np.array(spot_comm_counts)
-    
     def __len__(self):
-        # 返回有效spot数量，如果没有过滤则返回全部spot数量
-        if hasattr(self, 'valid_spot_indices'):
-            return len(self.valid_spot_indices)
-        else:
-            return self.n_spots
+        # 返回所有spot数量（DGI训练不需要过滤）
+        return self.n_spots
     
     def __getitem__(self, idx):
         """获取单个子图样本"""
-        # ========== Step 1: 获取邻域spot（从有效spot列表中映射）==========
-        # idx是有效spot列表中的索引，需要映射到原始spot索引
-        if hasattr(self, 'valid_spot_indices'):
-            center_idx = self.valid_spot_indices[idx]
-        else:
-            center_idx = idx
+        # ========== Step 1: 获取邻域spot（DGI训练使用所有spot）==========
+        center_idx = idx  # 直接使用idx作为center spot索引
         neighbor_indices = self.knn_indices[center_idx]
         subgraph_spot_indices = np.concatenate([[center_idx], neighbor_indices])
         n_spots_sub = len(subgraph_spot_indices)
@@ -924,9 +870,14 @@ class STHeteroSubgraphDataset:
         coords_subgraph = torch.tensor(coords_sub, dtype=torch.float32)
         composition_subgraph = torch.tensor(composition_subgraph_full, dtype=torch.float32)
         
+        # 获取子图中所有spot的barcode
+        spot_names = self.adata.obs_names.tolist()
+        subgraph_spot_barcodes = [spot_names[idx] for idx in subgraph_spot_indices]
+        
         return {
             'center_spot_idx': center_idx,
-            'subgraph_spot_indices': subgraph_spot_indices,
+            'subgraph_spot_indices': subgraph_spot_indices,  # 保留索引用于内部计算
+            'subgraph_spot_barcodes': subgraph_spot_barcodes,  # 新增：子图spot的barcode列表
             'n_spots_sub': n_spots_sub,
             'n_cells': n_actual_cells,  # ✅ 实际创建的 cell 节点数（动态）
             'n_cell_types': n_cell_types,  # 所有 cell 类型数（用于 composition 矩阵维度）
@@ -940,7 +891,6 @@ class STHeteroSubgraphDataset:
             'coords_subgraph': coords_subgraph,
             'composition_subgraph': composition_subgraph,  # [k+1, n_cell_types]
         }
-
 
 def hetero_subgraph_collate_fn(batch):
     """自定义collate_fn处理异构子图批次"""
@@ -969,6 +919,8 @@ def hetero_subgraph_collate_fn(batch):
         'n_spots_sub': n_spots_sub_list,  # ✅ 改为列表，每个样本可能不同
         'n_cells': n_cells_list,  # ✅ 改为列表，每个样本可能不同
         'center_spot_idx': [sample['center_spot_idx'] for sample in batch],
+        'spot_indices': [sample['subgraph_spot_indices'] for sample in batch],  # 保留索引用于内部计算
+        'spot_barcodes': [sample['subgraph_spot_barcodes'] for sample in batch],  # 新增：子图spot的barcode列表
         'spot_cell_mapping': [sample['spot_cell_mapping'] for sample in batch],  # ✅ 添加spot_cell_mapping
         'expr_raw': expr_raw_list,  # ✅ list of [n_spots_i, n_marker_genes]
         'cell_expr_raw': cell_expr_raw_list,  # ✅ list of [n_cells_i, n_marker_genes]

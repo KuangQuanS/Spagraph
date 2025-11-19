@@ -25,7 +25,11 @@ def evaluate_cell_communication(
     all_cell_names: List[str],
     output_dir: str,
     n_spots: int,
-    n_cells: int
+    n_cells: int,
+    spot_names: List[str] = None,
+    all_src_barcodes: List[List[str]] = None,
+    all_dst_barcodes: List[List[str]] = None,
+    export_unified: bool = True
 ) -> None:
     """
     Evaluate cell-cell communication from trained model attention scores.
@@ -61,6 +65,14 @@ def evaluate_cell_communication(
     all_attrs = torch.cat(all_edge_attr_cc, dim=0)  # [total_edges, 5] - [lr_score, lr_id, is_important, exist_logits, rate_pred]
     all_spots = torch.cat(all_spot_indices, dim=0)  # [total_edges] - center spot indices
     all_n_spots_sub_batch = torch.cat(all_n_spots_sub, dim=0)  # [total_edges] - n_spots_sub for each edge
+    
+    # 合并barcode列表
+    if all_src_barcodes is not None and all_dst_barcodes is not None:
+        all_src_barcodes_flat = [barcode for batch_barcodes in all_src_barcodes for barcode in batch_barcodes]
+        all_dst_barcodes_flat = [barcode for batch_barcodes in all_dst_barcodes for barcode in batch_barcodes]
+    else:
+        all_src_barcodes_flat = None
+        all_dst_barcodes_flat = None
 
     logging.info(f"合并后数据形状: all_scores={all_scores.shape}, all_edges={all_edges.shape}, all_attrs={all_attrs.shape}, all_spots={all_spots.shape}")
     n_unique_spots = len(torch.unique(all_spots))
@@ -71,8 +83,10 @@ def evaluate_cell_communication(
     avg_scores = all_scores  # [total_edges] - 已经是平均后的注意力得分
     
     # ✅ 提取双头预测结果
-    exist_logits = all_attrs[:, 3]  # [total_edges] - 边存在性logits
-    rate_pred = all_attrs[:, 4]  # [total_edges] - 边强度预测
+    # exist_logits = all_attrs[:, 3]  # [total_edges] - 边存在性logits
+    # rate_pred = all_attrs[:, 4]  # [total_edges] - 边强度预测
+    exist_logits = torch.zeros(all_attrs.size(0), device=all_attrs.device)  # 去掉dual-head，用0填充
+    rate_pred = torch.zeros(all_attrs.size(0), device=all_attrs.device)  # 去掉dual-head，用0填充
     p_exist = torch.sigmoid(exist_logits)  # [total_edges] - 边存在概率
     
     logging.info(f"注意力得分形状: {avg_scores.shape}")
@@ -222,49 +236,6 @@ def evaluate_cell_communication(
     logging.info(f"LR对统计结果已保存: {lr_stats_path}")
     logging.info(f"   - 总共发现 {len(lr_pair_summary)} 个不同的LR对")
     
-    # ========== 保存清洁图边结果（带p_exist和rate_pred）==========
-    cleaned_edges_path = os.path.join(output_dir, "lr_communication_edge_attention.csv")
-    with open(cleaned_edges_path, 'w') as f:
-        f.write("center_spot,source_cell,target_cell,lr_pair,lr_id,lr_score,is_important_label,p_exist,rate_pred,attention_score\n")
-        
-        for i in range(all_edges.size(1)):
-            src_idx = all_edges[0, i].item()
-            dst_idx = all_edges[1, i].item()
-            center_spot_idx = all_spots[i].item()
-            
-            # ✅ 修复：将全局节点ID转换为细胞类型索引
-            # 在子图中，细胞节点的索引是从 n_spots_sub 开始的
-            # 但我们需要知道每个边的 n_spots_sub 值
-            n_spots_sub = all_n_spots_sub_full[i].item()  # 从完整数据中获取
-            
-            if src_idx >= n_spots_sub and dst_idx >= n_spots_sub:
-                src_cell_idx = src_idx - n_spots_sub
-                dst_cell_idx = dst_idx - n_spots_sub
-                
-                if src_cell_idx >= 0 and dst_cell_idx >= 0 and src_cell_idx < n_cells and dst_cell_idx < n_cells:
-                    lr_score = all_attrs[i, 0].item()
-                    lr_id = int(all_attrs[i, 1].item())
-                    is_important = int(all_attrs[i, 2].item())
-                    p_exist_val = filtered_p_exist[i].item()
-                    rate_pred_val = filtered_rate_pred[i].item()
-                    attention_score = avg_scores[i].item()
-                    
-                    src_cell = all_cell_names[src_cell_idx]
-                    dst_cell = all_cell_names[dst_cell_idx]
-                    
-                    if lr_id in lr_id_to_pair:
-                        ligand, receptor = lr_id_to_pair[lr_id]
-                        lr_pair_name = f"{ligand}_{receptor}"
-                    else:
-                        lr_pair_name = f"lr_{lr_id}"
-                    
-                    f.write(f"{center_spot_idx},{src_cell},{dst_cell},{lr_pair_name},{lr_id},"
-                           f"{lr_score:.6f},{is_important},{p_exist_val:.6f},{rate_pred_val:.6f},{attention_score:.6f}\n")
-    
-    logging.info(f"清洁图边结果已保存: {cleaned_edges_path}")
-    logging.info(f"   - 保留边数: {all_edges.size(1)}")
-    logging.info(f"   - 包含列: lr_score, is_important_label, p_exist, rate_pred, attention_score")
-    
     logging.info(f"\n   - Top 10 最常出现的LR对:")
     for i, item in enumerate(sorted(lr_pair_summary, key=lambda x: x['occurrence_count'], reverse=True)[:10]):
         logging.info(f"     {i+1}. {item['lr_pair']}: 出现{item['occurrence_count']}次, "
@@ -276,70 +247,129 @@ def evaluate_cell_communication(
         logging.info(f"     {i+1}. {item['lr_pair']}: 平均注意力={item['avg_attention_score']:.4f}, "
                     f"出现{item['occurrence_count']}次")
 
-    # ========== 新增: 用模型预测得分生成最终通讯结果 ==========
+    # ========== 生成统一的通讯结果 ==========
     logging.info("\n" + "="*60)
-    logging.info("生成基于模型预测的通讯结果")
+    logging.info("生成统一的细胞通讯结果")
     logging.info("="*60)
 
-    all_pred_strengths = all_scores_full  # [total_edges] - 使用完整的 GAT 注意力得分
+    # 生成单一CSV文件，包含所有需要的列
+    unified_comm_path = os.path.join(output_dir, "lr_communication.csv")
+    if export_unified:
+        with open(unified_comm_path, 'w') as f:
+            f.write("src_spot_barcode,dst_spot_barcode,source_cell,target_cell,lr_pair,original_lr_score,edge_logits,adjusted_score\n")
 
-    # 生成三种得分的通讯结果文件
-    model_based_comm_path = os.path.join(output_dir, "lr_communication_model_based.csv")
-    with open(model_based_comm_path, 'w') as f:
-        f.write("center_spot,source_cell,target_cell,lr_pair,original_lr_score,edge_logits,adjusted_score,score_type\n")
+            # 使用完整数据，先计算哪些边是真正的cell-cell边
+            src_nodes_full = all_edges_full[0]
+            dst_nodes_full = all_edges_full[1]
+            n_spots_sub_arr = all_n_spots_sub_full
 
-        # 遍历所有边（使用完整数据），生成三种得分
-        generated_rows = 0
-        for i in range(all_edges_full.size(1)):
-            src_idx = all_edges_full[0, i].item()
-            dst_idx = all_edges_full[1, i].item()
-            center_spot_idx = all_spots_full[i].item()
-            n_spots_sub = all_n_spots_sub_full[i].item()
+            # mask where both src and dst are cell nodes (their node indices >= n_spots_sub for that edge)
+            cell_cell_mask = (src_nodes_full >= n_spots_sub_arr) & (dst_nodes_full >= n_spots_sub_arr)
+            total_cell_cell_edges = int(cell_cell_mask.sum().item())
+            logging.info(f"完整数据中 cell-cell 边数: {total_cell_cell_edges} / {all_edges_full.size(1)}")
 
-            # ✅ 修复：在子图中，细胞节点的索引是从 n_spots_sub 开始的
-            if src_idx >= n_spots_sub and dst_idx >= n_spots_sub:
+            generated_rows = 0
+
+            # Show examples for debugging if nothing gets generated
+            first_bad_examples = 0
+
+            # If there are no edges matching the per-edge n_spots_sub rule (rare), try a fallback strategy
+            if total_cell_cell_edges == 0:
+                try:
+                    min_n_spots_sub = int(n_spots_sub_arr.min().item())
+                    logging.warning(f"未找到基于每边n_spots_sub的cell-cell边。尝试回退: 使用全局最小 n_spots_sub={min_n_spots_sub} 来区分节点类型")
+                    cell_cell_mask = (src_nodes_full >= min_n_spots_sub) & (dst_nodes_full >= min_n_spots_sub)
+                    total_cell_cell_edges = int(cell_cell_mask.sum().item())
+                    logging.warning(f"回退后检测到 cell-cell 边数: {total_cell_cell_edges} / {all_edges_full.size(1)}")
+                except Exception:
+                    logging.exception("尝试回退策略失败")
+
+            # If still zero, perform a permissive mapping where we try both subtraction and non-subtraction
+            if total_cell_cell_edges == 0:
+                logging.warning("未检测到cell-cell边，尝试宽松匹配（尝试减去n_spots_sub或不减）。")
+                candidate_indices = []
+                for idx in range(all_edges_full.size(1)):
+                    src_idx = int(src_nodes_full[idx].item())
+                    dst_idx = int(dst_nodes_full[idx].item())
+                    n_sp = int(n_spots_sub_arr[idx].item())
+                    # Try both schemes
+                    for subtract in (True, False):
+                        s_idx = src_idx - n_sp if subtract else src_idx
+                        d_idx = dst_idx - n_sp if subtract else dst_idx
+                        if 0 <= s_idx < n_cells and 0 <= d_idx < n_cells:
+                            candidate_indices.append(idx)
+                            break
+
+                cell_cell_mask = torch.zeros_like(src_nodes_full, dtype=torch.bool)
+                if candidate_indices:
+                    cell_cell_mask[candidate_indices] = True
+                    total_cell_cell_edges = int(len(candidate_indices))
+                    logging.warning(f"宽松匹配后检测到可用的cell-cell边数: {total_cell_cell_edges} / {all_edges_full.size(1)}")
+            cell_cell_indices = torch.where(cell_cell_mask)[0].tolist()
+            # Log first few mapped examples
+            for idx_example in cell_cell_indices[:10]:
+                idx0_src = int(src_nodes_full[idx_example].item())
+                idx0_dst = int(dst_nodes_full[idx_example].item())
+                n_s0 = int(n_spots_sub_arr[idx_example].item())
+                c0 = int(all_spots_full[idx_example].item())
+                logging.debug(f"示例边 idx={idx_example}: src={idx0_src}, dst={idx0_dst}, n_spots_sub={n_s0}, center_spot={c0}")
+
+            for idx in cell_cell_indices:
+                src_idx = int(src_nodes_full[idx].item())
+                dst_idx = int(dst_nodes_full[idx].item())
+                center_spot_idx = int(all_spots_full[idx].item())
+                n_spots_sub = int(n_spots_sub_arr[idx].item())
+
+                # Compute cell indices relative to subgraph
                 src_cell_idx = src_idx - n_spots_sub
                 dst_cell_idx = dst_idx - n_spots_sub
 
-                if src_cell_idx >= 0 and dst_cell_idx >= 0 and src_cell_idx < n_cells and dst_cell_idx < n_cells:
-                    # 获取边属性
-                    lr_score = all_attrs_full[i, 0].item()
-                    lr_id = int(all_attrs_full[i, 1].item())
-                    exist_logits = all_attrs_full[i, 3].item()
-                    
-                    # 计算三种得分
-                    original_lr_score = lr_score
-                    edge_logits = exist_logits
-                    adjusted_score = original_lr_score * (1 + np.tanh(edge_logits))
-                    
-                    # 获取细胞名称
-                    src_cell = all_cell_names[src_cell_idx]
-                    dst_cell = all_cell_names[dst_cell_idx]
-                    
-                    # 获取LR对名称
-                    if lr_id in lr_id_to_pair:
-                        ligand, receptor = lr_id_to_pair[lr_id]
-                        lr_pair_name = f"{ligand}_{receptor}"
-                    else:
-                        lr_pair_name = f"lr_{lr_id}"
-                    
-                    # 写入三种得分
-                    f.write(f"{center_spot_idx},{src_cell},{dst_cell},{lr_pair_name},{original_lr_score:.6f},{edge_logits:.6f},{adjusted_score:.6f},original\n")
-                    f.write(f"{center_spot_idx},{src_cell},{dst_cell},{lr_pair_name},{original_lr_score:.6f},{edge_logits:.6f},{adjusted_score:.6f},logits\n")
-                    f.write(f"{center_spot_idx},{src_cell},{dst_cell},{lr_pair_name},{original_lr_score:.6f},{edge_logits:.6f},{adjusted_score:.6f},adjusted\n")
-                    
-                    generated_rows += 3
-                else:
-                    if generated_rows == 0 and i < 5:  # 只打印前5个不符合条件的边
-                        logging.warning(f"边 {i} 细胞索引超出范围: src_cell_idx={src_cell_idx}, dst_cell_idx={dst_cell_idx}, n_cells={n_cells}")
-            else:
-                if generated_rows == 0 and i < 5:  # 只打印前5个不符合条件的边
-                    logging.warning(f"边 {i} 节点索引不符合条件: src_idx={src_idx}, dst_idx={dst_idx}, n_spots_sub={n_spots_sub}")
-        
-        logging.info(f"生成数据行数: {generated_rows}")
+                # Bounds check
+                if not (0 <= src_cell_idx < n_cells and 0 <= dst_cell_idx < n_cells):
+                    # Record a few debug rows
+                    if first_bad_examples < 5:
+                        logging.warning(f"边 {idx} 细胞索引超出范围: src_cell_idx={src_cell_idx}, dst_cell_idx={dst_cell_idx}, n_cells={n_cells}")
+                        first_bad_examples += 1
+                    continue
 
-    logging.info(f"基于模型预测的通讯结果已保存: {model_based_comm_path}")
-    logging.info(f"   - 总边数: {all_edges_full.size(1)}")
+                lr_score = float(all_attrs_full[idx, 0].item())
+                lr_id = int(all_attrs_full[idx, 1].item())
+                attention_score = float(all_scores_full[idx].item())
+                edge_logits = attention_score
+                adjusted_score = attention_score
+
+                # Map cell names
+                src_cell = all_cell_names[src_cell_idx]
+                dst_cell = all_cell_names[dst_cell_idx]
+
+                # Get LR pair name
+                if lr_id in lr_id_to_pair:
+                    ligand, receptor = lr_id_to_pair[lr_id]
+                    lr_pair_name = f"{ligand}_{receptor}"
+                else:
+                    lr_pair_name = f"lr_{lr_id}"
+
+                # Map spot barcodes
+                if all_src_barcodes_flat is not None and all_dst_barcodes_flat is not None and idx < len(all_src_barcodes_flat):
+                    src_barcode = all_src_barcodes_flat[idx]
+                    dst_barcode = all_dst_barcodes_flat[idx]
+                elif spot_names is not None and center_spot_idx < len(spot_names):
+                    src_barcode = spot_names[center_spot_idx]
+                    dst_barcode = spot_names[center_spot_idx]
+                else:
+                    src_barcode = str(center_spot_idx)
+                    dst_barcode = str(center_spot_idx)
+
+                f.write(f"{src_barcode},{dst_barcode},{src_cell},{dst_cell},{lr_pair_name},{lr_score:.6f},{edge_logits:.6f},{adjusted_score:.6f}\n")
+                generated_rows += 1
+
+            logging.info(f"生成数据行数: {generated_rows}")
+
+            logging.info(f"统一的细胞通讯结果已保存: {unified_comm_path}")
+            logging.info(f"   - 总边数: {generated_rows}")
+            logging.info(f"   - 包含列: src_spot_barcode, dst_spot_barcode, source_cell, target_cell, lr_pair, original_lr_score, edge_logits, adjusted_score")
+    else:
+        logging.info(f"已跳过导出统一的细胞通讯结果 (export_unified=False)")
 
 def plot_dgi_loss(dgi_train_losses, dgi_val_losses=None, output_dir: str = None, epochs: int = None) -> None:
     """

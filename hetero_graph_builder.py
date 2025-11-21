@@ -534,7 +534,7 @@ class STHeteroSubgraphDataset:
             self.st_X = self.st_X.toarray()
         
         # 从knn_mask构建knn_indices（允许变长邻居）
-        # ✅ 修改：不再强制固定邻居数量，允许每个spot有不同数量的邻居
+ 
         self.knn_indices = []
         self.knn_neighbor_counts = []  # 记录每个spot实际的邻居数量
         
@@ -552,7 +552,7 @@ class STHeteroSubgraphDataset:
             self.knn_indices.append(neighbor_indices)
             self.knn_neighbor_counts.append(len(neighbor_indices))
         
-        # ✅ 注意：knn_indices 现在是变长的list，不能直接转为array
+
         # self.knn_indices 保持为 list of arrays
         
         # marker基因表达用于embedding计算
@@ -645,10 +645,9 @@ class STHeteroSubgraphDataset:
                     lr_id_counter += 1
                 
                 key = (spot_i_idx, spot_j_idx, cell_i_idx, cell_j_idx, ligand, receptor)
-                # ✅ 存储 (comm_score, is_important) 元组
+                # ✅ 存储 comm_score
                 comm_score = float(row['comm_score'])
-                is_important = int(row.get('is_important', 1))  # 默认为1（兼容旧CSV）
-                self.lr_scores_dict[key] = (comm_score, is_important)
+                self.lr_scores_dict[key] = comm_score
                 
                 # 同时更新lr_keys_by_spot_pair
                 spot_pair_key = (spot_i_idx, spot_j_idx, cell_i_idx, cell_j_idx)
@@ -792,70 +791,63 @@ class STHeteroSubgraphDataset:
         )
 
         # ========== Step 7: 构建Celltype-Celltype边 ==========
-        # ✅ 修改：不再局限于KNN邻居，允许更大范围的LR通信（500μm阈值）
+        # ✅ 修改：计算子图内所有spot的cell之间的通讯（不只是中心spot）
         # 注意：LR通讯得分已经预计算在CSV中，直接从字典查询
 
         edge_index_cc_list = []
-        edge_attr_cc_list = []  # 现在包含三个特征：[lr_score, lr_id, is_important]
+        edge_attr_cc_list = []  # 现在包含两个特征：[lr_score, lr_id]
 
-        # 只计算中心点（i_local=0）与其他点的通讯
-        center_local_idx = 0
-        center_global_idx = subgraph_spot_indices[center_local_idx]
-        composition_center = composition_subgraph_full[center_local_idx]
-        cells_in_center = np.where(composition_center > 1e-6)[0]
+        # ✅ 计算子图内所有spot的cell之间的通讯（有向边：配体细胞 -> 受体细胞）
+        # 包括同一个spot内的不同cell类型之间的通讯
+        for i_local in range(n_spots_sub):
+            spot_i_global = subgraph_spot_indices[i_local]
+            composition_i = composition_subgraph_full[i_local]
+            cells_in_i = np.where(composition_i > 1e-6)[0]
 
-        for j_local in range(1, n_spots_sub):  # 从1开始，跳过自己
-            spot_j_global = subgraph_spot_indices[j_local]
-            
-            # ✅ 移除KNN邻居检查，允许更大范围的LR通信
-            # 现在LR通信可以在500μm范围内发生，不再局限于KNN邻居
-            
-            composition_j = composition_subgraph_full[j_local]
-            cells_in_j = np.where(composition_j > 1e-6)[0]
-            
-            # ✅ 计算中心点cell到邻居点cell的通讯边（使用动态节点映射）
-            for cell_type_i in cells_in_center:
-                # 查找中心 spot 的这个 cell 类型对应的节点编号
-                cell_i_key = (center_local_idx, cell_type_i)
-                if cell_i_key not in spot_cell_mapping:
-                    continue
-                cell_i_node_local_idx = spot_cell_mapping[cell_i_key]
-                
-                for cell_type_j in cells_in_j:
-                    # 查找邻居 spot 的这个 cell 类型对应的节点编号
-                    cell_j_key = (j_local, cell_type_j)
-                    if cell_j_key not in spot_cell_mapping:
+            for j_local in range(n_spots_sub):
+                spot_j_global = subgraph_spot_indices[j_local]
+                composition_j = composition_subgraph_full[j_local]
+                cells_in_j = np.where(composition_j > 1e-6)[0]
+
+                # ✅ 计算spot i的cell到spot j的cell的有向通讯边
+                for cell_type_i in cells_in_i:
+                    # 查找spot i的这个cell类型对应的节点编号
+                    cell_i_key = (i_local, cell_type_i)
+                    if cell_i_key not in spot_cell_mapping:
                         continue
-                    cell_j_node_local_idx = spot_cell_mapping[cell_j_key]
-                    
-                    # 优化：直接查询预计算的LR得分，避免遍历所有LR对
-                    pair_key = (center_global_idx, spot_j_global, cell_type_i, cell_type_j)
-                    lr_keys = self.lr_keys_by_spot_pair.get(pair_key, [])
-                    
-                    total_lr_score = 0.0
-                    lr_ids = []
-                    is_important_labels = []  # ✅ 收集 is_important 标签
-                    for key in lr_keys:
-                        spot_i, spot_j, ct_i, ct_j, ligand, receptor = key
-                        # ✅ lr_scores_dict 现在存储 (score, is_important) 元组
-                        comm_score, is_important = self.lr_scores_dict[key]
-                        total_lr_score += comm_score
-                        lr_id = self.lr_pair_to_id[(ligand, receptor)]
-                        lr_ids.append(lr_id)
-                        is_important_labels.append(is_important)
-                    
-                    if total_lr_score > 1e-6 and lr_ids:
-                        # 使用第一个LR ID作为代表（如果有多个LR对，取平均得分但用第一个ID）
-                        lr_id = lr_ids[0]
-                        # ✅ 对于聚合的边，取 is_important 的最大值（只要有一条是真边，就标记为真边）
-                        is_important_final = max(is_important_labels)
-                        
-                        # ✅ 使用动态分配的节点编号
-                        cell_i_node_global_id = n_spots_sub + cell_i_node_local_idx
-                        cell_j_node_global_id = n_spots_sub + cell_j_node_local_idx
-                        edge_index_cc_list.append([cell_i_node_global_id, cell_j_node_global_id])
-                        # ✅ 边特征：[lr_score, lr_id, is_important]
-                        edge_attr_cc_list.append([total_lr_score, lr_id, is_important_final])
+                    cell_i_node_local_idx = spot_cell_mapping[cell_i_key]
+
+                    for cell_type_j in cells_in_j:
+                        # 查找spot j的这个cell类型对应的节点编号
+                        cell_j_key = (j_local, cell_type_j)
+                        if cell_j_key not in spot_cell_mapping:
+                            continue
+                        cell_j_node_local_idx = spot_cell_mapping[cell_j_key]
+
+                        # 优化：直接查询预计算的LR得分，避免遍历所有LR对
+                        pair_key = (spot_i_global, spot_j_global, cell_type_i, cell_type_j)
+                        lr_keys = self.lr_keys_by_spot_pair.get(pair_key, [])
+
+                        total_lr_score = 0.0
+                        lr_ids = []
+                        for key in lr_keys:
+                            spot_i, spot_j, ct_i, ct_j, ligand, receptor = key
+                            # ✅ lr_scores_dict 现在存储 score
+                            comm_score = self.lr_scores_dict[key]
+                            total_lr_score += comm_score
+                            lr_id = self.lr_pair_to_id[(ligand, receptor)]
+                            lr_ids.append(lr_id)
+
+                        if total_lr_score > 1e-6 and lr_ids:
+                            # 使用第一个LR ID作为代表（如果有多个LR对，取平均得分但用第一个ID）
+                            lr_id = lr_ids[0]
+
+                            # ✅ 使用动态分配的节点编号
+                            cell_i_node_global_id = n_spots_sub + cell_i_node_local_idx
+                            cell_j_node_global_id = n_spots_sub + cell_j_node_local_idx
+                            edge_index_cc_list.append([cell_i_node_global_id, cell_j_node_global_id])
+                            # ✅ 边特征：[lr_score, lr_id]
+                            edge_attr_cc_list.append([total_lr_score, lr_id])
                         
         edge_index_cc = torch.tensor(
             np.array(edge_index_cc_list).T if edge_index_cc_list else np.array([[], []]).astype(int),
@@ -909,7 +901,7 @@ def hetero_subgraph_collate_fn(batch):
     edge_index_like_list = [sample['edge_index_like'] for sample in batch]  # list of [2, E_i]
     edge_attr_like_list = [torch.cat([sample['edge_attr_like'].unsqueeze(-1), torch.zeros_like(sample['edge_attr_like'].unsqueeze(-1))], dim=-1) for sample in batch]    # list of [E_i, 2] - [weight, 0]
     edge_index_cc_list = [sample['edge_index_cc'] for sample in batch]      # list of [2, E_i]
-    edge_attr_cc_list = [sample['edge_attr_cc'] for sample in batch]        # list of [E_i, 3] - [lr_score, lr_id, is_important]
+    edge_attr_cc_list = [sample['edge_attr_cc'] for sample in batch]        # list of [E_i, 2] - [lr_score, lr_id]
     
     # ✅ 收集每个样本的实际 cell 节点数
     n_cells_list = [sample['n_cells'] for sample in batch]

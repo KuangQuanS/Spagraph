@@ -693,7 +693,7 @@ def main():
                        help='Batch size')
     parser.add_argument('--n_epochs', type=int, default=100,
                        help='Number of epochs')
-    parser.add_argument('--lr', type=float, default=1e-3,
+    parser.add_argument('--lr', type=float, default=5e-4,
                        help='Learning rate')
     parser.add_argument('--beta', type=float, default=1.0,
                        help='KL divergence weight (beta-VAE)')

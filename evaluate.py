@@ -23,6 +23,7 @@ def evaluate_cell_communication(
     all_spot_indices: List[torch.Tensor],
     all_n_spots_sub: List[torch.Tensor],
     all_cell_names: List[str],
+    all_cell_node_mappings: List[Dict[int, int]],
     output_dir: str,
     n_spots: int,
     n_cells: int,
@@ -62,9 +63,15 @@ def evaluate_cell_communication(
     # 合并所有batch的注意力得分
     all_scores = torch.cat(all_cc_attention_scores, dim=0)  # [total_edges]
     all_edges = torch.cat(all_edge_index_cc, dim=1)  # [2, total_edges]
-    all_attrs = torch.cat(all_edge_attr_cc, dim=0)  # [total_edges, 5] - [lr_score, lr_id, is_important, exist_logits, rate_pred]
+    all_attrs = torch.cat(all_edge_attr_cc, dim=0)  # [total_edges, 2] - [lr_score, lr_id]
     all_spots = torch.cat(all_spot_indices, dim=0)  # [total_edges] - center spot indices
     all_n_spots_sub_batch = torch.cat(all_n_spots_sub, dim=0)  # [total_edges] - n_spots_sub for each edge
+    
+    # 合并cell_node_mappings
+    all_cell_node_mappings_flat = []
+    for batch_idx, mapping in enumerate(all_cell_node_mappings):
+        num_edges_in_batch = all_cc_attention_scores[batch_idx].shape[0]
+        all_cell_node_mappings_flat.extend([mapping] * num_edges_in_batch)
     
     # 合并barcode列表
     if all_src_barcodes is not None and all_dst_barcodes is not None:
@@ -256,7 +263,7 @@ def evaluate_cell_communication(
     unified_comm_path = os.path.join(output_dir, "lr_communication.csv")
     if export_unified:
         with open(unified_comm_path, 'w') as f:
-            f.write("src_spot_barcode,dst_spot_barcode,source_cell,target_cell,lr_pair,original_lr_score,edge_logits,adjusted_score\n")
+            f.write("src_spot_barcode,dst_spot_barcode,source_cell,target_cell,lr_pair,original_lr_score,attention_score\n")
 
             # 使用完整数据，先计算哪些边是真正的cell-cell边
             src_nodes_full = all_edges_full[0]
@@ -319,28 +326,32 @@ def evaluate_cell_communication(
                 dst_idx = int(dst_nodes_full[idx].item())
                 center_spot_idx = int(all_spots_full[idx].item())
                 n_spots_sub = int(n_spots_sub_arr[idx].item())
+                cell_node_mapping = all_cell_node_mappings_flat[idx]
 
                 # Compute cell indices relative to subgraph
-                src_cell_idx = src_idx - n_spots_sub
-                dst_cell_idx = dst_idx - n_spots_sub
+                src_cell_local_idx = src_idx - n_spots_sub
+                dst_cell_local_idx = dst_idx - n_spots_sub
 
-                # Bounds check
-                if not (0 <= src_cell_idx < n_cells and 0 <= dst_cell_idx < n_cells):
-                    # Record a few debug rows
-                    if first_bad_examples < 5:
-                        logging.warning(f"边 {idx} 细胞索引超出范围: src_cell_idx={src_cell_idx}, dst_cell_idx={dst_cell_idx}, n_cells={n_cells}")
-                        first_bad_examples += 1
+                # Use mapping to get cell type ids
+                if src_cell_local_idx in cell_node_mapping and dst_cell_local_idx in cell_node_mapping:
+                    src_cell_type_id = cell_node_mapping[src_cell_local_idx]
+                    dst_cell_type_id = cell_node_mapping[dst_cell_local_idx]
+                    
+                    # Map cell type ids to cell names
+                    if src_cell_type_id < len(all_cell_names) and dst_cell_type_id < len(all_cell_names):
+                        src_cell = all_cell_names[src_cell_type_id]
+                        dst_cell = all_cell_names[dst_cell_type_id]
+                    else:
+                        logging.warning(f"细胞类型ID超出范围: src_cell_type_id={src_cell_type_id}, dst_cell_type_id={dst_cell_type_id}, len(all_cell_names)={len(all_cell_names)}")
+                        continue
+                else:
+                    logging.warning(f"细胞节点映射缺失: src_cell_local_idx={src_cell_local_idx}, dst_cell_local_idx={dst_cell_local_idx}")
                     continue
 
                 lr_score = float(all_attrs_full[idx, 0].item())
                 lr_id = int(all_attrs_full[idx, 1].item())
                 attention_score = float(all_scores_full[idx].item())
                 edge_logits = attention_score
-                adjusted_score = attention_score
-
-                # Map cell names
-                src_cell = all_cell_names[src_cell_idx]
-                dst_cell = all_cell_names[dst_cell_idx]
 
                 # Get LR pair name
                 if lr_id in lr_id_to_pair:
@@ -360,14 +371,14 @@ def evaluate_cell_communication(
                     src_barcode = str(center_spot_idx)
                     dst_barcode = str(center_spot_idx)
 
-                f.write(f"{src_barcode},{dst_barcode},{src_cell},{dst_cell},{lr_pair_name},{lr_score:.6f},{edge_logits:.6f},{adjusted_score:.6f}\n")
+                f.write(f"{src_barcode},{dst_barcode},{src_cell},{dst_cell},{lr_pair_name},{lr_score:.6f},{attention_score:.6f}\n")
                 generated_rows += 1
 
             logging.info(f"生成数据行数: {generated_rows}")
 
             logging.info(f"统一的细胞通讯结果已保存: {unified_comm_path}")
             logging.info(f"   - 总边数: {generated_rows}")
-            logging.info(f"   - 包含列: src_spot_barcode, dst_spot_barcode, source_cell, target_cell, lr_pair, original_lr_score, edge_logits, adjusted_score")
+            logging.info(f"   - 包含列: src_spot_barcode, dst_spot_barcode, source_cell, target_cell, lr_pair, original_lr_score, attention_score")
     else:
         logging.info(f"已跳过导出统一的细胞通讯结果 (export_unified=False)")
 

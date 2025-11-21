@@ -369,7 +369,7 @@ class HeteroSTModel(nn.Module):
             edge_index_like: [2, n_edges_like] 相似度边 (spot-spot + spot-celltype)
             edge_attr_like: [n_edges_like, 2] 相似度边特征 [weight, -1]
             edge_index_cc: [2, n_edges_cc] celltype-celltype边
-            edge_attr_cc: [n_edges_cc, 3] cell-cell边特征 [lr_score, lr_id, is_important]
+            edge_attr_cc: [n_edges_cc, 2] cell-cell边特征 [lr_score, lr_id]
             return_attention: 是否返回cell-cell边的注意力得分
             edge_mask_ratio: 边mask比例 (0.1-0.2)
 

@@ -551,7 +551,7 @@ def main():
                 edge_index_like = batch['edge_index_like'][b].to(device)  # [2, E_like]
                 edge_attr_like = batch['edge_attr_like'][b].to(device)    # [E_like]
                 edge_index_cc = batch['edge_index_cc'][b].to(device)      # [2, E_cc]
-                edge_attr_cc = batch['edge_attr_cc'][b].to(device)        # [E_cc, 3] = [lr_score, lr_id, is_important]
+                edge_attr_cc = batch['edge_attr_cc'][b].to(device)        # [E_cc, 2] = [lr_score, lr_id]
 
                 # ✅ 模型只需要前2列 [lr_score, lr_id]，保留完整的edge_attr_cc用于损失计算
                 edge_attr_cc_input = torch.zeros(edge_attr_cc.size(0), 2, device=device)  # [E_cc, 2]
@@ -623,7 +623,7 @@ def main():
                     edge_index_like = batch['edge_index_like'][b].to(device)
                     edge_attr_like = batch['edge_attr_like'][b].to(device)
                     edge_index_cc = batch['edge_index_cc'][b].to(device)
-                    edge_attr_cc = batch['edge_attr_cc'][b].to(device)  # [E_cc, 3] = [lr_score, lr_id, is_important]
+                    edge_attr_cc = batch['edge_attr_cc'][b].to(device)  # [E_cc, 2] = [lr_score, lr_id]
 
                     # ✅ 模型只需要前2列 [lr_score, lr_id]
                     edge_attr_cc_input = torch.zeros(edge_attr_cc.size(0), 2, device=device)  # [E_cc, 2]
@@ -803,6 +803,7 @@ def main():
         all_spot_indices=all_spot_indices,
         all_n_spots_sub=all_n_spots_sub,
         all_cell_names=all_cell_names,
+        all_cell_node_mappings=all_cell_node_mappings,
         output_dir=args.output_dir,
         n_spots=n_spots,
         n_cells=n_cells,

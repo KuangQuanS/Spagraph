@@ -59,7 +59,7 @@ def calculate_lr_scores(
     
     # ✅ 构建LR通信邻域mask（允许更大范围的通信）
     # 使用更大的距离阈值，允许细胞间通信在更远距离发生
-    lr_comm_distance_threshold = 500.0  # 500μm - 允许更远距离的LR通信
+    lr_comm_distance_threshold = 200.0  # 200μm - 允许更远距离的LR通信
     lr_comm_mask = np.zeros((n_spots, n_spots), dtype=bool)
     
     for i in range(n_spots):
@@ -326,36 +326,6 @@ def calculate_lr_scores(
         comm_event_records,
         columns=['spot_i', 'spot_j', 'cell_i', 'cell_j', 'ligand', 'receptor', 'comm_score', 'in_knn', 'distance']
     )
-    
-    # ========== 基于得分百分位数和距离设置 is_important ==========
-    # 策略：计算所有LR通信的得分分布，取top 25%作为真边
-    # 同时，距离超过阈值的边标记为假边（让模型学习距离的重要性）
-    logging.info(f"\n应用伪标签生成策略: KNN邻居 + 得分 top 25% + 距离过滤(100μm)")
-    
-    # 1. 统计所有LR通信事件
-    logging.info(f"   - 总LR通信事件: {len(df)}")
-    
-    # 2. 计算所有LR通信得分的75th百分位数（top 25%）
-    if len(df) > 0:
-        score_threshold = df['comm_score'].quantile(0.75)
-        distance_threshold = 200.0  # 距离阈值：200μm内算真边
-        
-        logging.info(f"   - LR通信得分75th百分位数: {score_threshold:.4f}")
-        logging.info(f"   - 距离阈值: {distance_threshold}μm")
-        
-        # 3. 设置 is_important 标签
-        # 条件：得分在top 25% 且 距离不超过阈值
-        df['is_important'] = 0  # 默认为假阳性
-        mask_important = (df['comm_score'] >= score_threshold) & (df['distance'] <= distance_threshold)
-        df.loc[mask_important, 'is_important'] = 1
-        
-        logging.info(f"\n伪标签生成完成:")
-        logging.info(f"   - 真边数 (is_important=1): {(df['is_important']==1).sum()} ({(df['is_important']==1).sum()/len(df)*100:.1f}%)")
-        logging.info(f"   - 假阳性候选 (is_important=0): {(df['is_important']==0).sum()} ({(df['is_important']==0).sum()/len(df)*100:.1f}%)")
-        logging.info(f"   - 距离过滤掉的边: {(df['distance'] > distance_threshold).sum()} ({(df['distance'] > distance_threshold).sum()/len(df)*100:.1f}%)")
-    else:
-        logging.warning(f"⚠️ 没有LR通信事件，所有边标记为假阳性！")
-        df['is_important'] = 0
     
     df.to_csv(csv_path, index=False)
     logging.info(f"\nLR通讯得分已保存到: {csv_path}")

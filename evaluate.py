@@ -30,7 +30,8 @@ def evaluate_cell_communication(
     spot_names: List[str] = None,
     all_src_barcodes: List[List[str]] = None,
     all_dst_barcodes: List[List[str]] = None,
-    export_unified: bool = True
+    export_unified: bool = True,
+    attention_threshold: float = 0.1
 ) -> None:
     """
     Evaluate cell-cell communication from trained model attention scores.
@@ -45,6 +46,7 @@ def evaluate_cell_communication(
         output_dir: Output directory for results
         n_spots: Number of spots in the dataset
         n_cells: Number of cell types
+        attention_threshold: Threshold for filtering edges by attention score (default: 0.1)
     """
     logging.info("="*80)
     logging.info("阶段5: 统计cell-cell边重要性")
@@ -100,41 +102,17 @@ def evaluate_cell_communication(
     logging.info(f"边存在性概率分布: min={p_exist.min():.3f}, mean={p_exist.mean():.3f}, max={p_exist.max():.3f}")
     logging.info(f"边存在性概率 > 0.5: {(p_exist > 0.5).sum()}/{len(p_exist)} ({(p_exist > 0.5).sum()/len(p_exist)*100:.1f}%)")
 
-    # ========== 应用边过滤策略：Top-K per source node ==========
-    # 为每个源节点（spot-cell对）保留top-k条边，去除假阳性
+    # ========== 应用边过滤策略：Attention Threshold ==========
+    # 保留注意力得分高于阈值的边，去除假阳性
     logging.info("\n" + "="*60)
-    logging.info("应用Top-K边过滤策略")
+    logging.info("应用注意力阈值过滤策略")
     logging.info("="*60)
 
-    edge_topk = 5  # 每个源节点最多保留5条边
-    keep_mask = torch.zeros(len(p_exist), dtype=torch.bool)
+    keep_mask = (avg_scores >= attention_threshold)
 
-    # 按源节点分组
-    unique_sources = torch.unique(all_edges[0])
-    for src_node in unique_sources:
-        src_edges_mask = (all_edges[0] == src_node)
-        src_p_exist = p_exist[src_edges_mask]
-
-        k = min(edge_topk, src_p_exist.size(0))
-        if k > 0:
-            # 获取top-k边的索引
-            topk_values, topk_indices = torch.topk(src_p_exist, k)
-
-            # 将全局索引中对应的位置标记为保留
-            src_global_indices = torch.where(src_edges_mask)[0]
-            keep_mask[src_global_indices[topk_indices]] = True
-
-    # 应用过滤
-    filtered_scores = avg_scores[keep_mask]
-    filtered_edges = all_edges[:, keep_mask]
-    filtered_attrs = all_attrs[keep_mask]
-    filtered_spots = all_spots[keep_mask]
-    filtered_p_exist = p_exist[keep_mask]
-    filtered_rate_pred = rate_pred[keep_mask]
-
-    logging.info(f"过滤前边数: {len(p_exist)}")
-    logging.info(f"过滤后边数: {keep_mask.sum()} ({keep_mask.sum()/len(p_exist)*100:.1f}% 保留)")
-    logging.info(f"平均每个源节点保留: {keep_mask.sum()/len(unique_sources):.1f} 条边")
+    logging.info(f"过滤前边数: {len(avg_scores)}")
+    logging.info(f"过滤后边数: {keep_mask.sum()} ({keep_mask.sum()/len(avg_scores)*100:.1f}% 保留)")
+    logging.info(f"注意力阈值: {attention_threshold}")
 
     # ✅ 保存过滤前的完整数据，用于生成 model_based_comm_path
     all_scores_full = avg_scores.clone()  # 保存过滤前的完整注意力得分
@@ -143,11 +121,13 @@ def evaluate_cell_communication(
     all_spots_full = all_spots.clone()    # 保存过滤前的完整spot索引
     all_n_spots_sub_full = all_n_spots_sub_batch.clone()  # 保存过滤前的完整n_spots_sub
 
-    # ✅ 使用过滤后的数据替换原始数据（用于其他分析）
-    avg_scores = filtered_scores
-    all_edges = filtered_edges
-    all_attrs = filtered_attrs
-    all_spots = filtered_spots
+    # 应用过滤
+    filtered_scores = avg_scores[keep_mask]
+    filtered_edges = all_edges[:, keep_mask]
+    filtered_attrs = all_attrs[keep_mask]
+    filtered_spots = all_spots[keep_mask]
+    filtered_p_exist = p_exist[keep_mask]
+    filtered_rate_pred = rate_pred[keep_mask]
 
     # 加载LR对映射
     lr_mapping_path = os.path.join(output_dir, "lr_pair_mapping.txt")

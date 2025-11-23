@@ -93,6 +93,17 @@ class EdgeAttentionLayer(nn.Module):
         n_edges = edge_attr.size(0)
         n_nodes = node_feat.size(0)
 
+        # Handle empty edges case
+        if n_edges == 0:
+            # No edges, just return node features projected to hidden_dim
+            out = self.node_proj(node_feat)
+            out = self.output_projection(out)
+            out = self.output_dropout(out)
+            if return_attention:
+                return out, (torch.empty(0, self.num_heads, device=edge_attr.device), torch.empty(0, device=edge_attr.device))
+            else:
+                return out, None
+
         # 1. 预测边强度（raw logits，用于监督学习和评估）
         edge_strength_logits = self.edge_strength_predictor(edge_attr).squeeze(-1)  # [n_edges]
 
@@ -351,9 +362,11 @@ class HeteroSTModel(nn.Module):
         # α_sc: spot-cell边权重调节因子
         self.alpha_ss = nn.Parameter(torch.tensor(1.0))  # 初始化为1.0
         self.alpha_sc = nn.Parameter(torch.tensor(1.0))  # 初始化为1.0
-        # DGI discriminator weight（双线性判别器）
-        self.dgi_discriminator_weight = nn.Parameter(torch.randn(gat_hidden_dims[-1], gat_hidden_dims[-1]))
-        nn.init.xavier_uniform_(self.dgi_discriminator_weight)
+        # DGI discriminator (标准实现：简单的线性层)
+        self.dgi_discriminator = nn.Linear(gat_hidden_dims[-1] * 2, 1)
+        # 初始化权重较小以避免数值问题
+        nn.init.xavier_uniform_(self.dgi_discriminator.weight, gain=0.01)
+        nn.init.zeros_(self.dgi_discriminator.bias)
         # DGI readout mode
         self.dgi_readout_mode = 'mean'
     
@@ -612,17 +625,35 @@ class HeteroSTModel(nn.Module):
         feat_cell = self.mlp_encoder(torch.log1p(cell_expr_raw))
         all_features = torch.cat([feat_spot, feat_cell], dim=0)
 
-        # positive embeddings
-        pos_embeddings, _ = self.edge_attn_spatial(edge_attr, edge_index, all_features, return_attention=False)
-        summary = self._readout(pos_embeddings, mode=self.dgi_readout_mode)
+        # Check if there are edges
+        if edge_index.size(1) == 0:
+            # No edges, use fallback projection
+            pos_embeddings = self.fallback_proj(all_features)
+            summary = self._readout(pos_embeddings, mode=self.dgi_readout_mode)
+            
+            # For corruption, also use fallback
+            corrupted_features = self.corrupt_features(all_features, mode=corruption_mode, mask_ratio=mask_ratio)
+            neg_embeddings = self.fallback_proj(corrupted_features)
+        else:
+            # positive embeddings
+            pos_embeddings, _ = self.edge_attn_spatial(edge_attr, edge_index, all_features, return_attention=False)
+            summary = self._readout(pos_embeddings, mode=self.dgi_readout_mode)
 
-        # corruption
-        corrupted_features = self.corrupt_features(all_features, mode=corruption_mode, mask_ratio=mask_ratio)
-        corrupted_edge_index, corrupted_edge_attr = self.corrupt_edges(edge_index, edge_attr, mode=edge_drop_mode, mask_ratio=edge_drop_rate, epoch=epoch, total_epochs=total_epochs)
-        neg_embeddings, _ = self.edge_attn_spatial(corrupted_edge_attr, corrupted_edge_index, corrupted_features, return_attention=False)
+            # corruption
+            corrupted_features = self.corrupt_features(all_features, mode=corruption_mode, mask_ratio=mask_ratio)
+            corrupted_edge_index, corrupted_edge_attr = self.corrupt_edges(edge_index, edge_attr, mode=edge_drop_mode, mask_ratio=edge_drop_rate, epoch=epoch, total_epochs=total_epochs)
+            
+            if corrupted_edge_index.size(1) == 0:
+                neg_embeddings = self.fallback_proj(corrupted_features)
+            else:
+                neg_embeddings, _ = self.edge_attn_spatial(corrupted_edge_attr, corrupted_edge_index, corrupted_features, return_attention=False)
 
-        pos_scores = torch.matmul(pos_embeddings, torch.matmul(self.dgi_discriminator_weight, summary))
-        neg_scores = torch.matmul(neg_embeddings, torch.matmul(self.dgi_discriminator_weight, summary))
+        # DGI discriminator scores
+        pos_pairs = torch.cat([pos_embeddings, summary.unsqueeze(0).expand(pos_embeddings.size(0), -1)], dim=-1)
+        neg_pairs = torch.cat([neg_embeddings, summary.unsqueeze(0).expand(neg_embeddings.size(0), -1)], dim=-1)
+        
+        pos_scores = self.dgi_discriminator(pos_pairs).squeeze(-1)  # [n_nodes]
+        neg_scores = self.dgi_discriminator(neg_pairs).squeeze(-1)  # [n_nodes]
 
         pos_loss = -torch.log(torch.sigmoid(pos_scores) + 1e-15).mean()
         neg_loss = -torch.log(1 - torch.sigmoid(neg_scores) + 1e-15).mean()

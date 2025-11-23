@@ -858,6 +858,10 @@ class STHeteroSubgraphDataset:
             dtype=torch.float32
         )
         
+        # 如果通讯边数量少于阈值，直接丢弃该子图样本
+        if edge_index_cc.size(1) < self.min_comm_edges:
+            return None
+        
         # ========== Step 8: 整理返回数据 ==========
         coords_subgraph = torch.tensor(coords_sub, dtype=torch.float32)
         composition_subgraph = torch.tensor(composition_subgraph_full, dtype=torch.float32)
@@ -886,7 +890,11 @@ class STHeteroSubgraphDataset:
 
 def hetero_subgraph_collate_fn(batch):
     """自定义collate_fn处理异构子图批次"""
+    # 过滤掉没有通讯边的子图（__getitem__ 返回 None）
+    batch = [sample for sample in batch if sample is not None]
     batch_size = len(batch)
+    if batch_size == 0:
+        return None
     
     # ✅ 每个样本的 spot 数量可能不同（因为邻居数量受距离阈值影响）
     n_spots_sub_list = [sample['n_spots_sub'] for sample in batch]

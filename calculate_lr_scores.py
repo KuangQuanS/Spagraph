@@ -59,7 +59,7 @@ def calculate_lr_scores(
     
     # ✅ 构建LR通信邻域mask（允许更大范围的通信）
     # 使用更大的距离阈值，允许细胞间通信在更远距离发生
-    lr_comm_distance_threshold = 200.0  # 200μm - 允许更远距离的LR通信
+    lr_comm_distance_threshold = 150.0  # 150μm - 允许更远距离的LR通信
     lr_comm_mask = np.zeros((n_spots, n_spots), dtype=bool)
     
     for i in range(n_spots):
@@ -74,7 +74,7 @@ def calculate_lr_scores(
     logging.info("开始计算LR通讯得分...")
     logging.info(f"   - 活跃基因筛选: normalize_total(1e4) > {args.mean_expr_threshold}")
     logging.info(f"   - 通讯得分过滤阈值: {args.mean_expr_threshold} (与活跃基因阈值一致)")
-    logging.info(f"   - 通讯得分计算: 配体×受体表达相乘（无距离衰减）")
+    logging.info(f"   - 通讯得分计算: 配体×受体表达相乘后取sqrt，再log1p变换（处理长尾分布）")
 
     # ✅ 调试：检查KNN mask状态
     logging.info(f"   - KNN mask形状: {knn_mask.shape}")
@@ -289,6 +289,9 @@ def calculate_lr_scores(
                             score = np.sqrt(lig_val * rec_product) * normalization_factor
                         else:
                             score = 0
+
+                        # ✅ 对通讯得分应用log1p变换，处理长尾分布
+                        score = np.log1p(score)
 
                         # ✅ 过滤低于阈值的通讯事件
                         if score >= args.mean_expr_threshold:

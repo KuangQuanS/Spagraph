@@ -51,29 +51,6 @@ def parse_args():
     parser.add_argument('--output_dim', type=int, default=120, help='输出维度')
     
     # DGI 模块参数 (用于主训练的自监督目标)
-    parser.add_argument('--freeze_encoder', type=str, default='false',
-                       choices=['true', 'false'],
-                       help='是否冻结编码器（true=只训练预测头，false=微调整个模型）')
-    
-    # 混合训练参数（监督 + 自监督）
-    parser.add_argument('--supervised_weight', type=float, default=0.5,
-                        help='监督学习权重alpha（0~1），自监督权重为1-alpha，默认0.5')
-    parser.add_argument('--negative_sample_ratio', type=float, default=1.0,
-                        help='负采样比例（相对于正边数量），默认1.0')
-    
-    # 双头边过滤参数
-    parser.add_argument('--lambda_exist', type=float, default=0.5,
-                        help='边存在性损失权重 (default: 0.5)')
-    parser.add_argument('--lambda_rate', type=float, default=0.4,
-                        help='边强度回归损失权重 (default: 0.4)')
-    parser.add_argument('--edge_topk', type=int, default=5,
-                        help='推理时每个源节点保留的最大边数 (default: 5)')
-    parser.add_argument('--edge_exist_threshold', type=float, default=0.5,
-                        help='边存在性概率阈值 (default: 0.5)')
-    
-    # DGI训练参数，用于在主训练阶段的DGI损失计算（不再用于独立预训练）
-    parser.add_argument('--dgi_epochs', type=int, default=30, help='DGI训练的epoch数（仅作为监控使用）')
-    parser.add_argument('--dgi_lr', type=float, default=1e-4, help='DGI子模块中可能使用的学习率（不作为主训练的单独优化器）')
     parser.add_argument('--corruption_mode', type=str, default='feature_mask', 
                        choices=['feature_mask', 'gaussian_noise', 'shuffle'],
                        help='DGI特征破坏模式')
@@ -81,14 +58,9 @@ def parse_args():
     parser.add_argument('--noise_std', type=float, default=0.2, help='高斯噪声标准差 (建议0.1-0.3)')
     parser.add_argument('--edge_drop_rate', type=float, default=0.3, help='边丢弃比例 (建议0.2-0.4，增强图结构扰动)')
     parser.add_argument('--edge_drop_mode', type=str, default='edge_drop_random', choices=['edge_drop_random','edge_drop_weighted','edge_drop_high','edge_drop_low','edge_drop_anneal'], help='边丢弃策略')
-    parser.add_argument('--use_dgi_as_main', action='store_true', help='在主训练中使用DGI损失作为主要训练信号')
     parser.add_argument('--lambda_dgi', type=float, default=1.0, help='主训练中DGI loss的权重 (default: 1.0)')
-    parser.add_argument('--readout_mode', type=str, default='mean', 
-                       choices=['mean', 'sum', 'gated'],
-                       help='图readout模式')
-    # 早停参数用于主训练（保留作为通用参数）
-    parser.add_argument('--dgi_early_stop_patience', type=int, default=5, help='早停patience，0表示不使用早停 (default: 5)')
-    parser.add_argument('--dgi_early_stop_min_delta', type=float, default=1e-2, help='早停最小改善阈值 (default: 1e-2)')
+    parser.add_argument('--attention_threshold', type=float, default=0,
+                       help='注意力得分阈值，用于过滤边 (default: 0)')
     
 
     # 训练参数
@@ -98,12 +70,11 @@ def parse_args():
     parser.add_argument('--weight_decay', type=float, default=1e-5, help='权重衰减')
     parser.add_argument('--seed', type=int, default=42, help='随机种子')
     parser.add_argument('--device', type=str, default='cuda', help='设备')
-    parser.add_argument('--checkpoint_interval', type=int, default=50, help='检查点间隔')
     parser.add_argument('--sample_rate', type=float, default=1.0, help='每个epoch采样比例 (default: 1.0, 即全部数据; 0.3表示采样30%%)')
     parser.add_argument('--val_split', type=float, default=0.1, 
                        help='验证集比例 (default: 0.1，即10%%作为验证集)')
-    parser.add_argument('--early_stop_patience', type=int, default=20, help='早停patience，0表示不使用早停 (default: 0)')
-    parser.add_argument('--early_stop_min_delta', type=float, default=0.0001, help='早停最小改善阈值 (default: 0.0001)')
+    parser.add_argument('--early_stop_patience', type=int, default=5, help='早停patience，0表示不使用早停 (default: 0)')
+    parser.add_argument('--early_stop_min_delta', type=float, default=0.01, help='早停最小改善阈值 (default: 0.0001)')
     
     return parser.parse_args()
 
@@ -324,7 +295,9 @@ def main():
     
     # 为MLP创建输入特征：使用激活基因的cluster表达
     activated_cluster_expr = cluster_full_expr[available_activated_genes].copy()
-    logging.info(f"MLP输入特征形状: {activated_cluster_expr.shape} (clusters x activated genes)")
+    # 应用log1p变换到每个元素
+    activated_cluster_expr = activated_cluster_expr.apply(lambda x: np.log1p(x.astype(float)))
+    logging.info(f"MLP输入特征形状: {activated_cluster_expr.shape} (clusters x activated genes) - 已应用 log1p")
     
     # 为Dataset接口创建占位符（实际不会使用）
     cluster_expr = pd.DataFrame(
@@ -529,8 +502,12 @@ def main():
         # ========== 训练阶段 ==========
         model.train()
         total_train_loss = 0.0
+        processed_train_batches = 0
         
         for batch_idx, batch in enumerate(train_dataloader, 1):
+            # 丢弃被collate过滤掉的空batch
+            if batch is None or batch.get('batch_size', 0) == 0:
+                continue
             batch_size = batch['batch_size']
             n_spots_sub_list = batch['n_spots_sub']  # ✅ 现在是列表
             n_cells_list = batch['n_cells']  # ✅ 现在是列表
@@ -551,10 +528,14 @@ def main():
                 edge_index_like = batch['edge_index_like'][b].to(device)  # [2, E_like]
                 edge_attr_like = batch['edge_attr_like'][b].to(device)    # [E_like]
                 edge_index_cc = batch['edge_index_cc'][b].to(device)      # [2, E_cc]
-                edge_attr_cc = batch['edge_attr_cc'][b].to(device)        # [E_cc, 2] = [lr_score, lr_id]
+                edge_attr_cc = batch['edge_attr_cc'][b]
+                # 可能为空边，保证形状为 [E_cc, 2]
+                if edge_attr_cc.dim() == 1:
+                    edge_attr_cc = edge_attr_cc.view(-1, 2) if edge_attr_cc.numel() > 0 else edge_attr_cc.new_zeros((0, 2))
+                edge_attr_cc = edge_attr_cc.to(device)        # [E_cc, 2] = [lr_score, lr_id]
 
-                # ✅ 模型只需要前2列 [lr_score, lr_id]，保留完整的edge_attr_cc用于损失计算
-                edge_attr_cc_input = torch.zeros(edge_attr_cc.size(0), 2, device=device)  # [E_cc, 2]
+                # ✅ 使用真实的通信特征 [lr_score, lr_id] 以学习/输出有意义的注意力
+                edge_attr_cc_input = edge_attr_cc[:, :2]  # [E_cc, 2]
 
                 # ========== 前向传播 ==========
                 spot_repr, cell_repr, combined, spot_proj, cc_attention, predicted_masked_edges, edge_mask, exist_logits, rate_pred = model(
@@ -604,16 +585,19 @@ def main():
             avg_batch_loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
-            scheduler.step()
 
             total_train_loss += avg_batch_loss.item()
+            processed_train_batches += 1
         
         # ========== 验证阶段 ==========
         model.eval()
         total_val_loss = 0.0
+        processed_val_batches = 0
         
         with torch.no_grad():
             for batch_idx, batch in enumerate(val_dataloader, 1):
+                if batch is None or batch.get('batch_size', 0) == 0:
+                    continue
                 batch_size = batch['batch_size']
                 batch_loss = 0.0
 
@@ -623,10 +607,13 @@ def main():
                     edge_index_like = batch['edge_index_like'][b].to(device)
                     edge_attr_like = batch['edge_attr_like'][b].to(device)
                     edge_index_cc = batch['edge_index_cc'][b].to(device)
-                    edge_attr_cc = batch['edge_attr_cc'][b].to(device)  # [E_cc, 2] = [lr_score, lr_id]
+                    edge_attr_cc = batch['edge_attr_cc'][b]
+                    if edge_attr_cc.dim() == 1:
+                        edge_attr_cc = edge_attr_cc.view(-1, 2) if edge_attr_cc.numel() > 0 else edge_attr_cc.new_zeros((0, 2))
+                    edge_attr_cc = edge_attr_cc.to(device)  # [E_cc, 2] = [lr_score, lr_id]
 
-                    # ✅ 模型只需要前2列 [lr_score, lr_id]
-                    edge_attr_cc_input = torch.zeros(edge_attr_cc.size(0), 2, device=device)  # [E_cc, 2]
+                    # ✅ 使用真实通信特征，确保验证注意力与LR信息对应
+                    edge_attr_cc_input = edge_attr_cc[:, :2]  # [E_cc, 2]
 
                     # 前向传播（验证阶段不进行边mask）
                     spot_repr, cell_repr, combined, spot_proj, cc_attention, _, _, exist_logits, rate_pred = model(
@@ -665,13 +652,17 @@ def main():
                 
                 avg_batch_loss = batch_loss / batch_size
                 total_val_loss += avg_batch_loss.item()
+                processed_val_batches += 1
         
         # 计算epoch平均损失
-        avg_train_loss = total_train_loss / len(train_dataloader) if len(train_dataloader) > 0 else 0
-        avg_val_loss = total_val_loss / len(val_dataloader) if len(val_dataloader) > 0 else 0
+        avg_train_loss = total_train_loss / processed_train_batches if processed_train_batches > 0 else 0
+        avg_val_loss = total_val_loss / processed_val_batches if processed_val_batches > 0 else 0
         
         train_losses.append(avg_train_loss)
         val_losses.append(avg_val_loss)
+        
+        # 每个epoch结束时更新学习率调度器
+        scheduler.step()
         
         # ========== 早停检查 ==========
         if early_stop_patience > 0:
@@ -695,7 +686,7 @@ def main():
             'λ_DGI': f'{args.lambda_dgi:.1f}'  # DGI权重
         })
     logging.info(f"   - 评估数据集大小: {len(dataset)} spots")
-    logging.info(f"   - 评估batch数量: {len(eval_dataloader)} batches")
+    logging.info(f"   - 评估batch数量: {len(eval_dataloader)} batches（可能包含被过滤的空子图）")
     
     # 在训练结束后，用训练好的模型对完整数据集进行一次评估，收集注意力得分
     logging.info("使用训练好的模型对完整数据集进行评估，收集cell-cell注意力得分...")
@@ -714,8 +705,12 @@ def main():
     # ✅ 定义细胞类型名称列表
     all_cell_names = cell_names
     
+    processed_eval_batches = 0
+    
     with torch.no_grad():
         for batch_idx, batch in enumerate(tqdm(eval_dataloader, desc="Evaluating", leave=True)):
+            if batch is None or batch.get('batch_size', 0) == 0:
+                continue
             batch_size = batch['batch_size']
             
             for b in range(batch_size):
@@ -724,10 +719,14 @@ def main():
                 edge_index_like = batch['edge_index_like'][b].to(device)
                 edge_attr_like = batch['edge_attr_like'][b].to(device)
                 edge_index_cc = batch['edge_index_cc'][b].to(device)
-                edge_attr_cc = batch['edge_attr_cc'][b].to(device)
+                edge_attr_cc = batch['edge_attr_cc'][b]
+                if edge_attr_cc.dim() == 1:
+                    edge_attr_cc = edge_attr_cc.view(-1, 2) if edge_attr_cc.numel() > 0 else edge_attr_cc.new_zeros((0, 2))
+                edge_attr_cc = edge_attr_cc.to(device)
                 
                 # 模型前向传播
-                edge_attr_cc_input = torch.zeros(edge_attr_cc.size(0), 2, device=device)
+                # ✅ 推理阶段也传入真实通信特征，收集的注意力才与LR信息一致
+                edge_attr_cc_input = edge_attr_cc[:, :2]
                 spot_repr, cell_repr, combined, spot_proj, cc_attention, _, _, exist_logits, rate_pred = model(
                     expr_raw=expr_raw,
                     cell_expr_raw=cell_expr_raw,
@@ -789,12 +788,40 @@ def main():
                     
                     all_src_barcodes.append(src_barcodes)  # 列表 of strings
                     all_dst_barcodes.append(dst_barcodes)  # 列表 of strings
+            processed_eval_batches += 1
+    
+    logging.info(f"评估阶段实际处理的batch数: {processed_eval_batches}")
     
     logging.info(f"评估完成，收集到 {len(all_cc_attention_scores)} 个spots的注意力得分")
     total_edges_collected = sum(scores.shape[0] for scores in all_cc_attention_scores)
     logging.info(f"   - 子图内边数（模型实际使用）: {total_edges_collected} 条")
-    logging.info(f"   - 平均每个spot子图: {total_edges_collected/len(all_cc_attention_scores):.1f} 条边")
+    if len(all_cc_attention_scores) > 0:
+        logging.info(f"   - 平均每个spot子图: {total_edges_collected/len(all_cc_attention_scores):.1f} 条边")
+    else:
+        logging.info(f"   - 平均每个spot子图: N/A (无注意力得分)")
     logging.info(f"   - 注意：这是子图内的边数，不包含spot间的跨子图通讯")
+    
+    # 计算degree-scaled attention（反归一化注意力得分）
+    logging.info("计算degree-scaled attention（注意力得分 × 目标节点入度）...")
+    for i in range(len(all_cc_attention_scores)):
+        edge_index = all_edge_index_cc[i]
+        attention = all_cc_attention_scores[i]
+        targets = edge_index[1]  # 目标节点索引
+        
+        # 计算每个目标节点的入度
+        unique_targets, counts = torch.unique(targets, return_counts=True)
+        degree_dict = {target.item(): count.item() for target, count in zip(unique_targets, counts)}
+        
+        # 计算scaled attention: attention_score * degree
+        scaled_attention = torch.zeros_like(attention)
+        for e in range(attention.shape[0]):
+            target = targets[e].item()
+            deg = degree_dict.get(target, 0)
+            scaled_attention[e] = attention[e] * deg
+        
+        all_cc_attention_scores[i] = scaled_attention
+    
+    logging.info("degree-scaled attention计算完成")
     
     evaluate_cell_communication(
         all_cc_attention_scores=all_cc_attention_scores,
@@ -809,7 +836,8 @@ def main():
         n_cells=n_cells,
         spot_names=spot_names,
         all_src_barcodes=all_src_barcodes,
-        all_dst_barcodes=all_dst_barcodes
+        all_dst_barcodes=all_dst_barcodes,
+        attention_threshold=args.attention_threshold
     )
     
     # 绘制损失曲线

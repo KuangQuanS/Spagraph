@@ -5,47 +5,15 @@ from typing import Tuple, Optional
 import math
 
 class EdgeAttentionLayer(nn.Module):
-    """基于边特征的注意力层 - Edge Attention"""
-
-    def __init__(self, edge_dim: int, hidden_dim: int, num_heads: int = 4, dropout: float = 0.1):
-        super().__init__()
-
-        self.edge_dim = edge_dim
-        self.hidden_dim = hidden_dim
-        self.num_heads = num_heads
-        self.head_dim = hidden_dim // num_heads
-
-        assert hidden_dim % num_heads == 0, "hidden_dim must be divisible by num_heads"
-
-        # 边特征编码器 - 将边特征转换为节点表示的更新
-        self.edge_encoder = nn.Sequential(
-            nn.Linear(edge_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim)
-        )
-
-        # 注意力权重预测器 - 基于边特征预测注意力权重
-        self.attention_predictor = nn.Sequential(
-            nn.Linear(edge_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, num_heads),
-            nn.Sigmoid()  # 输出[0,1]范围的注意力权重
-        )
-
-        self.output_projection = nn.Linear(hidden_dim, hidden_dim)
-        self.output_dropout = nn.Dropout(dropout)
-
-class EdgeAttentionLayer(nn.Module):
     """基于边特征的注意力层 - 简化版Edge Attention"""
 
-    def __init__(self, edge_dim: int, hidden_dim: int, node_dim: int, num_heads: int = 4, dropout: float = 0.1, temperature: float = 1.0):
+    def __init__(self, edge_dim: int, hidden_dim: int, node_dim: int, num_heads: int = 4, dropout: float = 0.1):
         super().__init__()
 
         self.edge_dim = edge_dim
         self.hidden_dim = hidden_dim
         self.num_heads = num_heads
         self.head_dim = hidden_dim // num_heads
-        self.temperature = temperature  # 温度系数，用于控制注意力分布的尖锐程度
 
         assert hidden_dim % num_heads == 0, "hidden_dim must be divisible by num_heads"
 
@@ -190,17 +158,17 @@ class EdgeAttentionNetwork(nn.Module):
     """多层边注意力网络"""
 
     def __init__(self, edge_dim: int, node_dim: int, hidden_dims: list = [256, 256, 128],
-                 num_heads: int = 4, dropout: float = 0.1, temperature: float = 1.0):
+                 num_heads: int = 4, dropout: float = 0.1):
         super().__init__()
 
         self.layers = nn.ModuleList([
-            EdgeAttentionLayer(edge_dim, hidden_dims[0], node_dim, num_heads, dropout, temperature)
+            EdgeAttentionLayer(edge_dim, hidden_dims[0], node_dim, num_heads, dropout)
         ])
         
         # 后续层都使用相同的edge_dim（因为边特征不变）和递增的hidden_dim
         for i in range(len(hidden_dims) - 1):
             self.layers.append(
-                EdgeAttentionLayer(edge_dim, hidden_dims[i+1], hidden_dims[i], num_heads, dropout, temperature)
+                EdgeAttentionLayer(edge_dim, hidden_dims[i+1], hidden_dims[i], num_heads, dropout)
             )
 
         self.activation = nn.ReLU()
@@ -219,6 +187,7 @@ class EdgeAttentionNetwork(nn.Module):
             attention_scores: [n_edges, num_heads] 如果return_attention=True，否则None
         """
         x = node_feat
+        attn_scores = None
 
         for i, layer in enumerate(self.layers):
             if i == len(self.layers) - 1 and return_attention:
@@ -282,10 +251,10 @@ class HeteroSTModel(nn.Module):
     
     def __init__(self, n_genes: int = None, mlp_latent_dim: int = 64, mlp_hidden_dims: list = [256, 128],
                  image_dim: int = None, fusion_dim: int = 256, 
-                 gat_layers: int = 3, gat_hidden_dims: list = None,
+                 gat_hidden_dims: list = None,
                  gat_heads: int = 4, gat_dropout: float = 0.1,
                  output_dim: int = 64, n_celltypes: int = None,
-                 temperature: float = 1.0):
+                 n_lr_pairs: int = 1, lr_id_emb_dim: int = 8):
         super().__init__()
         
         if gat_hidden_dims is None:
@@ -295,6 +264,9 @@ class HeteroSTModel(nn.Module):
         self.mlp_latent_dim = mlp_latent_dim
         self.output_dim = output_dim
         self.gat_hidden_dims = gat_hidden_dims
+        self.n_lr_pairs = max(1, n_lr_pairs)
+        self.lr_id_emb_dim = lr_id_emb_dim
+        self.node_recon_head = nn.Linear(output_dim, n_genes)
         
         # MLP编码器替代VAE
         self.mlp_encoder = MLPEncoder(
@@ -308,8 +280,11 @@ class HeteroSTModel(nn.Module):
         # 注意：统一使用edge_dim=2，所有边都包含[score, id]
         # 对于相似度边：[weight, -1]（-1表示非通讯边）
         # 对于通讯边：[lr_score, lr_id]
-        self.edge_attn_spatial = EdgeAttentionNetwork(edge_dim=2, node_dim=mlp_latent_dim, hidden_dims=gat_hidden_dims, num_heads=gat_heads, dropout=gat_dropout, temperature=temperature)  # 空间相似度图
-        self.edge_attn_comm = EdgeAttentionNetwork(edge_dim=2, node_dim=mlp_latent_dim, hidden_dims=gat_hidden_dims, num_heads=gat_heads, dropout=gat_dropout, temperature=temperature)     # 通讯图
+        self.edge_attn_spatial = EdgeAttentionNetwork(edge_dim=2, node_dim=mlp_latent_dim, hidden_dims=gat_hidden_dims, num_heads=gat_heads, dropout=gat_dropout)  # 空间相似度图
+        # 通讯边：包含 score + lr_id 嵌入
+        comm_edge_dim = 1 + lr_id_emb_dim
+        self.edge_attn_comm = EdgeAttentionNetwork(edge_dim=comm_edge_dim, node_dim=mlp_latent_dim, hidden_dims=gat_hidden_dims, num_heads=gat_heads, dropout=gat_dropout)     # 通讯图
+        self.lr_id_embedding = nn.Embedding(self.n_lr_pairs + 1, lr_id_emb_dim)  # +1 以容纳潜在的填充值
         
         # ✅ 备用投影层：当没有边时，将 MLP latent 投影到 GAT 输出维度
         self.fallback_proj = nn.Linear(mlp_latent_dim, gat_hidden_dims[-1])
@@ -362,19 +337,14 @@ class HeteroSTModel(nn.Module):
         # α_sc: spot-cell边权重调节因子
         self.alpha_ss = nn.Parameter(torch.tensor(1.0))  # 初始化为1.0
         self.alpha_sc = nn.Parameter(torch.tensor(1.0))  # 初始化为1.0
-        # DGI discriminator (标准实现：简单的线性层)
-        self.dgi_discriminator = nn.Linear(gat_hidden_dims[-1] * 2, 1)
-        # 初始化权重较小以避免数值问题
-        nn.init.xavier_uniform_(self.dgi_discriminator.weight, gain=0.01)
-        nn.init.zeros_(self.dgi_discriminator.bias)
-        # DGI readout mode
-        self.dgi_readout_mode = 'mean'
+        # DGI相关组件已移除
     
     def forward(self, expr_raw: torch.Tensor,
                 cell_expr_raw: torch.Tensor,
                 edge_index_like: torch.Tensor, edge_attr_like: torch.Tensor,
                 edge_index_cc: torch.Tensor, edge_attr_cc: torch.Tensor,
-                return_attention: bool = False, edge_mask_ratio: float = 0.15) -> Tuple:
+                return_attention: bool = False, edge_mask_ratio: float = 0.15, node_mask_ratio: float = 0.0,
+                mask_generator: torch.Generator = None) -> Tuple:
         """
         Args:
             expr_raw: [k+1, n_genes] 原始Spot基因表达量
@@ -394,16 +364,12 @@ class HeteroSTModel(nn.Module):
             cc_attention: [n_edges_cc] cell-cell注意力得分/边强度logits（如果return_attention=True）
             predicted_masked_edges: 被mask边的预测值（用于训练）
             edge_mask: 边mask信息
-            exist_logits: [n_edges_cc] 边存在性logits（用于BCE损失）
-            rate_pred: [n_edges_cc] 边强度预测值（回归目标）
+            exist_logits: None（保留占位，不再使用）
+            rate_pred: None（保留占位，不再使用）
         """
-        # MLP编码（使用log1p预处理）
-        # 对基因表达进行log1p预处理
-        expr_raw_log = torch.log1p(expr_raw)  # [k+1, n_genes]
-        cell_expr_raw_log = torch.log1p(cell_expr_raw)  # [(k+1)*n_cells, n_genes]
-        
-        spot_latent = self.mlp_encoder(expr_raw_log)  # [k+1, mlp_latent_dim]
-        cell_latent = self.mlp_encoder(cell_expr_raw_log)  # [(k+1)*n_cells, mlp_latent_dim]
+        # MLP编码（直接使用原始特征）
+        spot_latent = self.mlp_encoder(expr_raw)  # [k+1, mlp_latent_dim]
+        cell_latent = self.mlp_encoder(cell_expr_raw)  # [(k+1)*n_cells, mlp_latent_dim]
 
         n_spots = spot_latent.size(0)
         n_cells_total = cell_latent.size(0)
@@ -417,26 +383,25 @@ class HeteroSTModel(nn.Module):
         # 拼接所有节点特征
         all_feat = torch.cat([spot_feat, cell_feat], dim=0)  # [n_spots+n_cells_total, vae_latent_dim]
 
-        # ========== 边Mask机制 ==========
-        # 对通讯边进行mask，用于训练边预测任务
+        # ========== 边Mask机制（训练时遮一部分score，验证默认不遮） ==========
         edge_mask = None
         masked_edge_attr_cc = edge_attr_cc
         predicted_masked_edges = None
 
-        if self.training and edge_index_cc.size(1) > 0:
-            # 随机选择一部分边进行mask
+        if edge_mask_ratio > 0 and edge_index_cc.size(1) > 0:
+            # 随机选择一部分边进行mask（只mask score，保留id用于重构）
             n_edges_cc = edge_index_cc.size(1)
             n_mask = int(n_edges_cc * edge_mask_ratio)
 
             if n_mask > 0:
-                # 随机选择要mask的边
                 mask_indices = torch.randperm(n_edges_cc, device=edge_attr_cc.device)[:n_mask]
+                if mask_generator is not None:
+                    mask_indices = torch.randperm(n_edges_cc, device=edge_attr_cc.device, generator=mask_generator)[:n_mask]
                 edge_mask = torch.zeros(n_edges_cc, dtype=torch.bool, device=edge_attr_cc.device)
                 edge_mask[mask_indices] = True
 
-                # 创建mask后的边特征（被mask的边特征设为0）
                 masked_edge_attr_cc = edge_attr_cc.clone()
-                masked_edge_attr_cc[mask_indices] = 0
+                masked_edge_attr_cc[mask_indices, 0] = 0
 
         # ========== 应用可学习的边权重调节 ==========
         # 对相似度边应用可学习的权重调节因子（只调节权重部分）
@@ -470,42 +435,37 @@ class HeteroSTModel(nn.Module):
 
         # ✅ 通讯边 - 使用Edge Attention
         if edge_index_cc.size(1) > 0:
+            # 构造通讯边特征：未mask边用真实score，mask边score=0，保留lr_id
+            lr_scores = masked_edge_attr_cc[:, 0:1]
+            lr_ids = edge_attr_cc[:, 1].long().clamp(min=0, max=self.n_lr_pairs)
+            lr_id_emb = self.lr_id_embedding(lr_ids)
+            comm_edge_feat = torch.cat([lr_scores, lr_id_emb], dim=1)
+
             comm_repr, cc_attention_tuple = self.edge_attn_comm(
-                masked_edge_attr_cc, edge_index_cc, all_feat, return_attention=return_attention
+                comm_edge_feat, edge_index_cc, all_feat, return_attention=return_attention
             )
 
             # cc_attention_tuple: (attn_avg, edge_strength_logits) or None
             if cc_attention_tuple is not None:
                 attn_avg, edge_strength_logits = cc_attention_tuple
-                # cc_attention (external) => normalized per-edge attention used by GAT
                 cc_attention = attn_avg
+                # 只对被mask的边进行重构预测
+                if edge_mask is not None and edge_mask.any():
+                    src_idx, dst_idx = edge_index_cc
+                    masked_src_idx = src_idx[edge_mask]
+                    masked_dst_idx = dst_idx[edge_mask]
+                    masked_src_repr = comm_repr[masked_src_idx]
+                    masked_dst_repr = comm_repr[masked_dst_idx]
+                    masked_attention = edge_strength_logits[edge_mask]
+                    masked_edge_features = torch.cat([
+                        masked_attention.unsqueeze(-1),
+                        masked_src_repr,
+                        masked_dst_repr
+                    ], dim=-1)
+                    predicted_masked_edges = self.comm_predictor(masked_edge_features).squeeze(-1)
             else:
                 attn_avg, edge_strength_logits = None, None
                 cc_attention = None
-
-            # 如果有mask，预测被mask的边
-            if edge_mask is not None and edge_mask.any():
-                # 使用注意力权重和节点表示来预测被mask的边
-                src_idx, dst_idx = edge_index_cc
-                masked_src_idx = src_idx[edge_mask]
-                masked_dst_idx = dst_idx[edge_mask]
-
-                # 获取节点表示
-                masked_src_repr = comm_repr[masked_src_idx]  # [n_masked, hidden_dim]
-                masked_dst_repr = comm_repr[masked_dst_idx]  # [n_masked, hidden_dim]
-
-                # 获取对应的边强度logits（已经是1维的）
-                # masked_attention用于mask预测器，应使用edge_strength_logits（raw logits）
-                masked_attention = edge_strength_logits[edge_mask]  # [n_masked] - edge_strength_logits
-
-                # 组合特征进行预测
-                masked_edge_features = torch.cat([
-                    masked_attention.unsqueeze(-1),  # [n_masked, 1]
-                    masked_src_repr,                 # [n_masked, hidden_dim]
-                    masked_dst_repr                   # [n_masked, hidden_dim]
-                ], dim=-1)  # [n_masked, 1 + hidden_dim * 2]
-
-                predicted_masked_edges = self.comm_predictor(masked_edge_features).squeeze(-1)  # [n_masked]
         else:
             comm_repr = self.fallback_proj(all_feat)
             cc_attention = None
@@ -538,17 +498,27 @@ class HeteroSTModel(nn.Module):
         spot_repr_out = repr_out[:n_spots]  # [n_spots, output_dim]
         cell_repr_out = repr_out[n_spots:]  # [n_cells_total, output_dim]
 
+        # 节点特征重构（mask 一部分特征做重建）
+        node_recon_pred = self.node_recon_head(repr_out)  # [n_nodes, n_genes]
+        node_mask = None
+        if node_mask_ratio > 0:
+            base = torch.cat([expr_raw, cell_expr_raw], dim=0)
+            rand_mask = torch.rand(base.shape, device=base.device, generator=mask_generator)
+            node_mask = (rand_mask < node_mask_ratio)
+        else:
+            node_mask = torch.zeros_like(torch.cat([expr_raw, cell_expr_raw], dim=0), dtype=torch.bool)
+
         # 对比学习投影
         spot_proj = self.projection_head(spot_repr_out)  # [n_spots, output_dim]
 
         # ✅ 返回结果（去掉exist_logits和rate_pred）
         if return_attention:
-            return spot_repr_out, cell_repr_out, combined, spot_proj, cc_attention, predicted_masked_edges, edge_mask, None, None
+            return spot_repr_out, cell_repr_out, combined, spot_proj, cc_attention, predicted_masked_edges, edge_mask, node_recon_pred, node_mask
         else:
-            return spot_repr_out, cell_repr_out, combined, spot_proj, None, predicted_masked_edges, edge_mask, None, None
+            return spot_repr_out, cell_repr_out, combined, spot_proj, None, predicted_masked_edges, edge_mask, node_recon_pred, node_mask
 
 
-    # ==================== DGI相关方法 ====================
+# ==================== 辅助方法 ====================
     def _readout(self, node_embeddings: torch.Tensor, mode: str = 'mean') -> torch.Tensor:
         if mode == 'mean':
             return node_embeddings.mean(dim=0)
@@ -559,102 +529,3 @@ class HeteroSTModel(nn.Module):
             return (gate * node_embeddings).mean(dim=0)
         else:
             return node_embeddings.mean(dim=0)
-
-    def corrupt_features(self, features: torch.Tensor, mode: str = 'feature_mask', mask_ratio: float = 0.3, noise_std: float = 0.1) -> torch.Tensor:
-        corrupted = features.clone()
-        if mode == 'feature_mask':
-            mask = (torch.rand_like(features) > mask_ratio).float()
-            corrupted = corrupted * mask
-        elif mode == 'gaussian_noise':
-            noise = torch.randn_like(features) * noise_std
-            corrupted = corrupted + noise
-        elif mode == 'shuffle':
-            perm = torch.randperm(features.size(0), device=features.device)
-            corrupted = corrupted[perm]
-        else:
-            mask = (torch.rand_like(features) > mask_ratio).float()
-            corrupted = corrupted * mask
-        return corrupted
-
-    def corrupt_edges(self, edge_index: torch.Tensor, edge_attr: torch.Tensor, mode: str = 'edge_drop_random', mask_ratio: float = 0.2, epoch: int = None, total_epochs: int = None) -> Tuple[torch.Tensor, torch.Tensor]:
-        n_edges = edge_index.size(1)
-        device = edge_index.device
-        if edge_attr is None or edge_attr.numel() == 0:
-            edge_scores = torch.zeros(n_edges, device=device)
-        else:
-            edge_scores = edge_attr[:, 0].view(-1)
-        if n_edges == 0:
-            return edge_index, edge_attr
-        min_s, max_s = float(edge_scores.min()), float(edge_scores.max())
-        norm_scores = (edge_scores - min_s) / (max(1e-8, max_s - min_s))
-
-        if mode == 'edge_drop_random':
-            keep_mask = (torch.rand(n_edges, device=device) > mask_ratio)
-        elif mode == 'edge_drop_low':
-            thr = torch.quantile(edge_scores, mask_ratio)
-            keep_mask = edge_scores > thr
-        elif mode == 'edge_drop_high':
-            thr = torch.quantile(edge_scores, 1.0 - mask_ratio)
-            keep_mask = edge_scores < thr
-        elif mode == 'edge_drop_weighted':
-            prob = norm_scores * mask_ratio
-            keep_mask = (torch.rand(n_edges, device=device) > prob)
-        elif mode == 'edge_drop_anneal':
-            if epoch is None or total_epochs is None:
-                keep_mask = (torch.rand(n_edges, device=device) > mask_ratio)
-            else:
-                alpha = min(1.0, epoch / max(1, total_epochs))
-                rand_mask = (torch.rand(n_edges, device=device) > mask_ratio)
-                prob = norm_scores * mask_ratio
-                weighted_mask = (torch.rand(n_edges, device=device) > prob)
-                # mix
-                keep_mask = torch.where(torch.rand(n_edges, device=device) < alpha, weighted_mask, rand_mask)
-        else:
-            keep_mask = (torch.rand(n_edges, device=device) > mask_ratio)
-
-        if keep_mask.sum() == 0:
-            idx = torch.randint(0, n_edges, (1,), device=device)
-            keep_mask[idx] = True
-        return edge_index[:, keep_mask], edge_attr[keep_mask]
-
-    def compute_dgi_loss(self, expr_raw: torch.Tensor, cell_expr_raw: torch.Tensor, edge_index: torch.Tensor, edge_attr: torch.Tensor,
-                         corruption_mode: str = 'feature_mask', mask_ratio: float = 0.3,
-                         edge_drop_mode: str = 'edge_drop_random', edge_drop_rate: float = 0.2,
-                         epoch: int = None, total_epochs: int = None) -> torch.Tensor:
-        feat_spot = self.mlp_encoder(torch.log1p(expr_raw))
-        feat_cell = self.mlp_encoder(torch.log1p(cell_expr_raw))
-        all_features = torch.cat([feat_spot, feat_cell], dim=0)
-
-        # Check if there are edges
-        if edge_index.size(1) == 0:
-            # No edges, use fallback projection
-            pos_embeddings = self.fallback_proj(all_features)
-            summary = self._readout(pos_embeddings, mode=self.dgi_readout_mode)
-            
-            # For corruption, also use fallback
-            corrupted_features = self.corrupt_features(all_features, mode=corruption_mode, mask_ratio=mask_ratio)
-            neg_embeddings = self.fallback_proj(corrupted_features)
-        else:
-            # positive embeddings
-            pos_embeddings, _ = self.edge_attn_spatial(edge_attr, edge_index, all_features, return_attention=False)
-            summary = self._readout(pos_embeddings, mode=self.dgi_readout_mode)
-
-            # corruption
-            corrupted_features = self.corrupt_features(all_features, mode=corruption_mode, mask_ratio=mask_ratio)
-            corrupted_edge_index, corrupted_edge_attr = self.corrupt_edges(edge_index, edge_attr, mode=edge_drop_mode, mask_ratio=edge_drop_rate, epoch=epoch, total_epochs=total_epochs)
-            
-            if corrupted_edge_index.size(1) == 0:
-                neg_embeddings = self.fallback_proj(corrupted_features)
-            else:
-                neg_embeddings, _ = self.edge_attn_spatial(corrupted_edge_attr, corrupted_edge_index, corrupted_features, return_attention=False)
-
-        # DGI discriminator scores
-        pos_pairs = torch.cat([pos_embeddings, summary.unsqueeze(0).expand(pos_embeddings.size(0), -1)], dim=-1)
-        neg_pairs = torch.cat([neg_embeddings, summary.unsqueeze(0).expand(neg_embeddings.size(0), -1)], dim=-1)
-        
-        pos_scores = self.dgi_discriminator(pos_pairs).squeeze(-1)  # [n_nodes]
-        neg_scores = self.dgi_discriminator(neg_pairs).squeeze(-1)  # [n_nodes]
-
-        pos_loss = -torch.log(torch.sigmoid(pos_scores) + 1e-15).mean()
-        neg_loss = -torch.log(1 - torch.sigmoid(neg_scores) + 1e-15).mean()
-        return pos_loss + neg_loss

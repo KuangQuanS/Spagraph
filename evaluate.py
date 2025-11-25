@@ -359,6 +359,77 @@ def evaluate_cell_communication(
             logging.info(f"统一的细胞通讯结果已保存: {unified_comm_path}")
             logging.info(f"   - 总边数: {generated_rows}")
             logging.info(f"   - 包含列: src_spot_barcode, dst_spot_barcode, source_cell, target_cell, lr_pair, original_lr_score, attention_score")
+
+        # 生成按注意力阈值过滤后的通讯结果
+        filtered_comm_path = os.path.join(output_dir, f"lr_communication_filtered_{attention_threshold}.csv")
+        with open(filtered_comm_path, 'w') as f:
+            f.write("src_spot_barcode,dst_spot_barcode,source_cell,target_cell,lr_pair,original_lr_score,attention_score\n")
+
+            # 过滤后的数据
+            src_nodes_f = filtered_edges[0]
+            dst_nodes_f = filtered_edges[1]
+            n_spots_sub_f = all_n_spots_sub_full[keep_mask]
+
+            cell_cell_mask_f = (src_nodes_f >= n_spots_sub_f) & (dst_nodes_f >= n_spots_sub_f)
+            total_cell_cell_edges_f = int(cell_cell_mask_f.sum().item())
+            logging.info(f"过滤后cell-cell边数: {total_cell_cell_edges_f} / {filtered_edges.size(1)}")
+
+            keep_indices = keep_mask.nonzero(as_tuple=False).view(-1).tolist()
+            filtered_cell_node_mappings = [all_cell_node_mappings_flat[i] for i in keep_indices]
+            if all_src_barcodes_flat is not None and all_dst_barcodes_flat is not None:
+                filtered_src_barcodes = [all_src_barcodes_flat[i] for i in keep_indices]
+                filtered_dst_barcodes = [all_dst_barcodes_flat[i] for i in keep_indices]
+            else:
+                filtered_src_barcodes = None
+                filtered_dst_barcodes = None
+
+            generated_rows = 0
+            cell_cell_indices_f = torch.where(cell_cell_mask_f)[0].tolist()
+            for idx in cell_cell_indices_f:
+                src_idx = int(src_nodes_f[idx].item())
+                dst_idx = int(dst_nodes_f[idx].item())
+                n_spots_sub = int(n_spots_sub_f[idx].item())
+                center_spot_idx = int(filtered_spots[idx].item())
+                cell_node_mapping = filtered_cell_node_mappings[idx]
+
+                src_cell_local_idx = src_idx - n_spots_sub
+                dst_cell_local_idx = dst_idx - n_spots_sub
+                if src_cell_local_idx not in cell_node_mapping or dst_cell_local_idx not in cell_node_mapping:
+                    continue
+
+                src_cell_type_id = cell_node_mapping[src_cell_local_idx]
+                dst_cell_type_id = cell_node_mapping[dst_cell_local_idx]
+                if src_cell_type_id >= len(all_cell_names) or dst_cell_type_id >= len(all_cell_names):
+                    continue
+
+                src_cell = all_cell_names[src_cell_type_id]
+                dst_cell = all_cell_names[dst_cell_type_id]
+
+                lr_score = float(filtered_attrs[idx, 0].item())
+                lr_id = int(filtered_attrs[idx, 1].item())
+                attention_score = float(filtered_scores[idx].item())
+
+                if lr_id in lr_id_to_pair:
+                    ligand, receptor = lr_id_to_pair[lr_id]
+                    lr_pair_name = f"{ligand}_{receptor}"
+                else:
+                    lr_pair_name = f"lr_{lr_id}"
+
+                if filtered_src_barcodes is not None and filtered_dst_barcodes is not None and idx < len(filtered_src_barcodes):
+                    src_barcode = filtered_src_barcodes[idx]
+                    dst_barcode = filtered_dst_barcodes[idx]
+                elif spot_names is not None and center_spot_idx < len(spot_names):
+                    src_barcode = spot_names[center_spot_idx]
+                    dst_barcode = spot_names[center_spot_idx]
+                else:
+                    src_barcode = str(center_spot_idx)
+                    dst_barcode = str(center_spot_idx)
+
+                f.write(f"{src_barcode},{dst_barcode},{src_cell},{dst_cell},{lr_pair_name},{lr_score:.6f},{attention_score:.6f}\n")
+                generated_rows += 1
+
+        logging.info(f"过滤后的细胞通讯结果已保存: {filtered_comm_path}")
+        logging.info(f"   - 注意力阈值: {attention_threshold}")
     else:
         logging.info(f"已跳过导出统一的细胞通讯结果 (export_unified=False)")
 

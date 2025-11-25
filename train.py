@@ -14,8 +14,17 @@ from tqdm import tqdm
 # 已经将DGI集成到HeteroSTModel (compute_dgi_loss)，不再需要独立的 DGIPretrainModel
 from hetero_model import HeteroSTModel
 from hetero_graph_builder import STHeteroSubgraphDataset, hetero_subgraph_collate_fn, setup_logging, set_seed
-from evaluate import evaluate_cell_communication, plot_training_loss, plot_dgi_loss
+from evaluate import evaluate_cell_communication, plot_training_loss
 from calculate_lr_scores import calculate_lr_scores
+
+def _scalar(x):
+    """Convert tensor/number to Python float for logging/accumulation."""
+    if isinstance(x, (float, int)):
+        return float(x)
+    try:
+        return x.item()
+    except Exception:
+        return float(x)
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Heterogeneous ST Communication Model Training')
@@ -29,11 +38,10 @@ def parse_args():
     parser.add_argument('--mlp_hidden_dims', type=str, default='256,128', help='MLP隐层维度')
     
     # 图参数
-    parser.add_argument('--n_spot_neighbors', type=int, default=10, help='Spot邻近数')
+    parser.add_argument('--n_spot_neighbors', type=int, default=6, help='Spot邻近数')
     
     # LR通讯参数
-    parser.add_argument('--lr_distance_sigma', type=float, default=50.0, help='LR通讯距离衰减参数sigma')
-    parser.add_argument('--mean_expr_threshold', type=float, default=5.0, 
+    parser.add_argument('--mean_expr_threshold', type=float, default=3.0, 
                        help='激活基因选择和LR通讯的平均表达阈值 (normalize_total 1e4后，default: 5.0)')
     parser.add_argument('--min_comm_edges', type=int, default=1, 
                        help='最小通讯边数阈值，少于此值的spot将被过滤 (default: 1)')
@@ -41,26 +49,21 @@ def parse_args():
                        help='预计算的spot-cell全基因表达CSV文件路径，如果提供则跳过构建步骤')
 
     # GAT参数
-    parser.add_argument('--gat_layers', type=int, default=6, help='GAT层数')
     parser.add_argument('--gat_hidden_dims', type=str, default='512,256,128', help='GAT隐层维度')
     parser.add_argument('--gat_heads', type=int, default=8, help='注意力头数')
     parser.add_argument('--gat_dropout', type=float, default=0.3, help='Dropout概率')
-    parser.add_argument('--temperature', type=float, default=2.0, help='注意力温度系数，用于控制注意力分布的尖锐程度 (default: 1.0)')
     
     # 模型参数
     parser.add_argument('--output_dim', type=int, default=120, help='输出维度')
     
-    # DGI 模块参数 (用于主训练的自监督目标)
-    parser.add_argument('--corruption_mode', type=str, default='feature_mask', 
-                       choices=['feature_mask', 'gaussian_noise', 'shuffle'],
-                       help='DGI特征破坏模式')
-    parser.add_argument('--mask_ratio', type=float, default=0.5, help='特征mask比例 (建议0.4-0.6，增强对比学习难度)')
-    parser.add_argument('--noise_std', type=float, default=0.2, help='高斯噪声标准差 (建议0.1-0.3)')
-    parser.add_argument('--edge_drop_rate', type=float, default=0.3, help='边丢弃比例 (建议0.2-0.4，增强图结构扰动)')
-    parser.add_argument('--edge_drop_mode', type=str, default='edge_drop_random', choices=['edge_drop_random','edge_drop_weighted','edge_drop_high','edge_drop_low','edge_drop_anneal'], help='边丢弃策略')
-    parser.add_argument('--lambda_dgi', type=float, default=1.0, help='主训练中DGI loss的权重 (default: 1.0)')
-    parser.add_argument('--attention_threshold', type=float, default=0,
+    parser.add_argument('--lambda_mask_recon', type=float, default=1.0, help='mask边重构损失的权重 (default: 1.0)')
+    parser.add_argument('--lambda_node_recon', type=float, default=0.5, help='节点特征重构损失的权重 (default: 0.5)')
+    parser.add_argument('--attention_threshold', type=float, default=1,
                        help='注意力得分阈值，用于过滤边 (default: 0)')
+    parser.add_argument('--edge_mask_ratio', type=float, default=0.2, help='mask通讯边的比例 (默认20%%)')
+    parser.add_argument('--node_mask_ratio', type=float, default=0.15, help='mask节点特征比例 (默认15%%)')
+    parser.add_argument('--mask_seed', type=int, default=1234, help='验证阶段mask的固定随机种子')
+    parser.add_argument('--lr_id_emb_dim', type=int, default=8, help='LR id 嵌入维度，用于通讯边特征')
     
 
     # 训练参数
@@ -73,8 +76,8 @@ def parse_args():
     parser.add_argument('--sample_rate', type=float, default=1.0, help='每个epoch采样比例 (default: 1.0, 即全部数据; 0.3表示采样30%%)')
     parser.add_argument('--val_split', type=float, default=0.1, 
                        help='验证集比例 (default: 0.1，即10%%作为验证集)')
-    parser.add_argument('--early_stop_patience', type=int, default=5, help='早停patience，0表示不使用早停 (default: 0)')
-    parser.add_argument('--early_stop_min_delta', type=float, default=0.01, help='早停最小改善阈值 (default: 0.0001)')
+    parser.add_argument('--early_stop_patience', type=int, default=10, help='早停patience，0表示不使用早停 (default: 0)')
+    parser.add_argument('--early_stop_min_delta', type=float, default=0.1, help='早停最小改善阈值 (default: 0.0001)')
     
     return parser.parse_args()
 
@@ -186,10 +189,7 @@ def main():
             raise ValueError("VAE checkpoint 中找不到 all_genes 列表")
     else:
         raise FileNotFoundError(f"找不到VAE权重文件: {vae_weight_path}")
-    
-    # 使用MLP编码器，不再需要VAE
-    logging.info("使用MLP编码器替代VAE，直接使用激活基因特征")
-
+  
     # ========== 阶段2：构建spot-cell全基因表达 ==========
     logging.info("="*80)
     logging.info("阶段2: 构建spot-cell全基因表达")
@@ -293,12 +293,9 @@ def main():
     available_activated_genes = [g for g in activated_genes if g in cluster_full_expr.columns]
     logging.info(f"激活基因在cluster表达中的可用性: {len(available_activated_genes)}/{len(activated_genes)}")
     
-    # 为MLP创建输入特征：使用激活基因的cluster表达
+    # 为MLP创建输入特征：使用激活基因的cluster表达（无需log1p，这里保持原值）
     activated_cluster_expr = cluster_full_expr[available_activated_genes].copy()
-    # 应用log1p变换到每个元素
-    activated_cluster_expr = activated_cluster_expr.apply(lambda x: np.log1p(x.astype(float)))
-    logging.info(f"MLP输入特征形状: {activated_cluster_expr.shape} (clusters x activated genes) - 已应用 log1p")
-    
+
     # 为Dataset接口创建占位符（实际不会使用）
     cluster_expr = pd.DataFrame(
         np.zeros((len(cluster_to_celltype), len(available_activated_genes)), dtype=np.float32),
@@ -315,18 +312,12 @@ def main():
     # 提取实际存在的celltype（从spot_cell_expr_df的index中解析）
     cell_names = sorted(set([idx.split('_', 1)[1] for idx in spot_cell_expr_df.index]))
     logging.info(f"实际存在的细胞类型数: {len(cell_names)}")
+    # 使用spot-cell全表达对每个cell类型做均值，避免全部为0的占位符
+    cell_expr_mean = spot_cell_expr_df.copy()
+    cell_expr_mean['celltype'] = [idx.split('_', 1)[1] for idx in spot_cell_expr_df.index]
+    cell_expr = cell_expr_mean.groupby('celltype')[available_activated_genes].mean().reindex(cell_names).fillna(0.0)
     
-    cell_expr = pd.DataFrame(
-        np.zeros((len(cell_names), len(available_activated_genes)), dtype=np.float32),
-        index=cell_names,
-        columns=available_activated_genes
-    )
-    
-    cell_full_expr = pd.DataFrame(
-        np.zeros((len(cell_names), cluster_full_expr.shape[1]), dtype=np.float32),
-        index=cell_names,
-        columns=cluster_full_expr.columns
-    )
+    cell_full_expr = cell_expr_mean.groupby('celltype')[cluster_full_expr.columns].mean().reindex(cell_names).fillna(0.0)
 
     composition = pd.DataFrame(0.0, index=cluster_composition.index, columns=cell_names)
     for spot_idx in range(len(cluster_composition)):
@@ -428,21 +419,20 @@ def main():
     
     n_genes = cluster_expr.shape[1]
     n_cells = cell_expr.shape[0]
+    n_lr_pairs = len(dataset.lr_id_to_pair)
     
     model = HeteroSTModel(
         n_genes=len(available_activated_genes),  # 使用激活基因数量
         mlp_latent_dim=args.mlp_latent_dim,
         mlp_hidden_dims=[int(x) for x in args.mlp_hidden_dims.split(',')],
-        gat_layers=args.gat_layers,
         gat_hidden_dims=gat_hidden_dims,
         gat_heads=args.gat_heads,
         gat_dropout=args.gat_dropout,
         output_dim=args.output_dim,
         n_celltypes=n_cells,
-        temperature=args.temperature
+        n_lr_pairs=n_lr_pairs,
+        lr_id_emb_dim=args.lr_id_emb_dim
     ).to(device)
-    
-    logging.info("从头开始训练模型（MLP编码器直接训练，无预训练）")
     
     optimizer = torch.optim.Adam(
         model.parameters(),
@@ -457,21 +447,24 @@ def main():
     logging.info(f"   - 可训练参数数: {trainable_params:,}")
     
     # 当使用 DGI loss 作为主训练目标时，确认 encoder/edge attention 已准备好并共享
-    logging.info("在主训练中将使用 DGI loss，edge_attn_comm 已与 edge_attn_spatial 共享（单一 DGI encoder 实例）")
-    model.edge_attn_comm = model.edge_attn_spatial
+    logging.info("在主训练中将使用 DGI loss，空间边与通讯边保持独立注意力参数")
     
     # 训练循环
     train_losses = []
     val_losses = []
+    train_mask_losses = []
+    val_mask_losses = []
+    train_node_losses = []
+    val_node_losses = []
     
     # ========== 阶段4：训练循环 ==========
     logging.info("="*80)
     logging.info("阶段4: 开始训练（DGI作为主要训练目标）")
     logging.info("="*80)
     logging.info(f"训练配置:")
-    logging.info(f"  - 使用DGI loss作为主要训练信号 (lambda_dgi={args.lambda_dgi})")
-    logging.info(f"  - 边腐败模式: {args.corruption_mode}, mask_ratio={args.mask_ratio}")
-    logging.info(f"  - 边丢弃模式: {args.edge_drop_mode}, drop_rate={args.edge_drop_rate}")
+    logging.info(f"  - 边mask重构: ratio={args.edge_mask_ratio}, lambda={args.lambda_mask_recon}")
+    logging.info(f"  - 节点mask重构: ratio={args.node_mask_ratio}, lambda={args.lambda_node_recon}")
+    logging.info(f"  - 验证mask种子: {args.mask_seed}")
     logging.info("="*80)
 
     # 使用外层tqdm跟踪epoch进度
@@ -479,7 +472,7 @@ def main():
     epoch_pbar = tqdm(range(args.epochs), desc="Training", leave=True, dynamic_ncols=True)
     
     # 主训练早停参数
-    best_val_loss = float('inf')
+    best_val_metric = float('inf')
     patience_counter = 0
     early_stop_patience = args.early_stop_patience
     early_stop_min_delta = args.early_stop_min_delta
@@ -499,9 +492,13 @@ def main():
     )
 
     for epoch in epoch_pbar:
+        # 固定验证mask种子，保证每个epoch验证使用相同的mask模式
+        val_mask_gen = torch.Generator(device=device).manual_seed(args.mask_seed)
         # ========== 训练阶段 ==========
         model.train()
         total_train_loss = 0.0
+        total_train_mask = 0.0
+        total_train_node = 0.0
         processed_train_batches = 0
         
         for batch_idx, batch in enumerate(train_dataloader, 1):
@@ -518,6 +515,8 @@ def main():
 
             # 累积批次损失
             batch_loss = 0.0
+            batch_mask = 0.0
+            batch_node = 0.0
 
             # 处理每个subgraph
             for b in range(batch_size):
@@ -538,7 +537,7 @@ def main():
                 edge_attr_cc_input = edge_attr_cc[:, :2]  # [E_cc, 2]
 
                 # ========== 前向传播 ==========
-                spot_repr, cell_repr, combined, spot_proj, cc_attention, predicted_masked_edges, edge_mask, exist_logits, rate_pred = model(
+                spot_repr, cell_repr, combined, spot_proj, cc_attention, predicted_masked_edges, edge_mask, node_recon_pred, node_mask = model(
                     expr_raw=expr_raw,
                     cell_expr_raw=cell_expr_raw,
                     edge_index_like=edge_index_like,
@@ -546,39 +545,40 @@ def main():
                     edge_index_cc=edge_index_cc,
                     edge_attr_cc=edge_attr_cc_input,  # 不输入真实强度，避免信息泄露
                     return_attention=True,
-                    edge_mask_ratio=0.0  # 禁用边mask，使用双头监督
+                    edge_mask_ratio=args.edge_mask_ratio,
+                    node_mask_ratio=args.node_mask_ratio,
+                    mask_generator=None
                 )
 
                 # ========== DGI训练：使用对比学习损失 ==========
-                # DGI需要完整的图边和edge_attr (前2列)
-                if edge_attr_like.dim() == 1:
-                    edge_attr_like_ext = torch.cat([edge_attr_like.unsqueeze(-1), torch.full_like(edge_attr_like.unsqueeze(-1), -1)], dim=-1)
-                else:
-                    edge_attr_like_ext = edge_attr_like
-                edge_attr_cc_dgi = edge_attr_cc[:, :2] if edge_attr_cc.dim() > 1 and edge_attr_cc.size(1) > 2 else edge_attr_cc
-                edge_index_combined = torch.cat([edge_index_like, edge_index_cc], dim=1)
-                edge_attr_combined = torch.cat([edge_attr_like_ext, edge_attr_cc_dgi], dim=0)
-                # 调用模型内置的 compute_dgi_loss（encoder 已与主模型共享），计算DGI损失
-                dgi_loss_val = model.compute_dgi_loss(
-                    expr_raw,
-                    cell_expr_raw,
-                    edge_index_combined,
-                    edge_attr_combined,
-                    corruption_mode=args.corruption_mode,
-                    mask_ratio=args.mask_ratio,
-                    edge_drop_mode=args.edge_drop_mode,
-                    edge_drop_rate=args.edge_drop_rate,
-                    epoch=epoch,
-                    total_epochs=args.epochs
+                mask_recon_loss = 0.0
+                if edge_mask is not None and edge_mask.any() and predicted_masked_edges is not None:
+                    target_scores = edge_attr_cc[:, 0][edge_mask]
+                    if target_scores.numel() > 0:
+                        mask_recon_loss = torch.nn.functional.mse_loss(predicted_masked_edges, target_scores)
+
+                node_recon_loss = 0.0
+                if node_recon_pred is not None and node_mask is not None and node_mask.any():
+                    node_target = torch.cat([expr_raw, cell_expr_raw], dim=0)
+                    node_recon_loss = torch.nn.functional.mse_loss(
+                        node_recon_pred[node_mask], node_target[node_mask]
+                    )
+
+                total_loss = (
+                    args.lambda_mask_recon * mask_recon_loss
+                    + args.lambda_node_recon * node_recon_loss
                 )
-                total_loss = args.lambda_dgi * dgi_loss_val
-                
+
                 # 累积批次损失
                 loss = total_loss
                 batch_loss += loss
+                batch_mask += mask_recon_loss
+                batch_node += node_recon_loss
 
             # 对整个batch求平均损失，然后反向传播
             avg_batch_loss = batch_loss / batch_size
+            avg_batch_mask = batch_mask / batch_size
+            avg_batch_node = batch_node / batch_size
 
             # 反向传播
             optimizer.zero_grad()
@@ -586,12 +586,16 @@ def main():
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
 
-            total_train_loss += avg_batch_loss.item()
+            total_train_loss += _scalar(avg_batch_loss)
+            total_train_mask += _scalar(avg_batch_mask)
+            total_train_node += _scalar(avg_batch_node)
             processed_train_batches += 1
         
         # ========== 验证阶段 ==========
         model.eval()
         total_val_loss = 0.0
+        total_val_mask = 0.0
+        total_val_node = 0.0
         processed_val_batches = 0
         
         with torch.no_grad():
@@ -600,6 +604,8 @@ def main():
                     continue
                 batch_size = batch['batch_size']
                 batch_loss = 0.0
+                batch_mask = 0.0
+                batch_node = 0.0
 
                 for b in range(batch_size):
                     expr_raw = batch['expr_raw'][b].to(device)
@@ -616,7 +622,7 @@ def main():
                     edge_attr_cc_input = edge_attr_cc[:, :2]  # [E_cc, 2]
 
                     # 前向传播（验证阶段不进行边mask）
-                    spot_repr, cell_repr, combined, spot_proj, cc_attention, _, _, exist_logits, rate_pred = model(
+                    spot_repr, cell_repr, combined, spot_proj, cc_attention, predicted_masked_edges, edge_mask, node_recon_pred, node_mask = model(
                         expr_raw=expr_raw,
                         cell_expr_raw=cell_expr_raw,
                         edge_index_like=edge_index_like,
@@ -624,66 +630,81 @@ def main():
                         edge_index_cc=edge_index_cc,
                         edge_attr_cc=edge_attr_cc_input,  # 不输入真实强度
                         return_attention=True,
-                        edge_mask_ratio=0.0  # 验证阶段不mask
+                        edge_mask_ratio=args.edge_mask_ratio,  # 验证阶段与训练一致
+                        node_mask_ratio=args.node_mask_ratio,
+                        mask_generator=val_mask_gen
                     )
 
-                    # 计算验证损失（DGI损失）
-                    if edge_attr_like.dim() == 1:
-                        edge_attr_like_ext = torch.cat([edge_attr_like.unsqueeze(-1), torch.full_like(edge_attr_like.unsqueeze(-1), -1)], dim=-1)
-                    else:
-                        edge_attr_like_ext = edge_attr_like
-                    edge_attr_cc_dgi = edge_attr_cc[:, :2] if edge_attr_cc.dim() > 1 and edge_attr_cc.size(1) > 2 else edge_attr_cc
-                    edge_index_combined = torch.cat([edge_index_like, edge_index_cc], dim=1)
-                    edge_attr_combined = torch.cat([edge_attr_like_ext, edge_attr_cc_dgi], dim=0)
-                    val_loss = model.compute_dgi_loss(
-                        expr_raw,
-                        cell_expr_raw,
-                        edge_index_combined,
-                        edge_attr_combined,
-                        corruption_mode=args.corruption_mode,
-                        mask_ratio=args.mask_ratio,
-                        edge_drop_mode=args.edge_drop_mode,
-                        edge_drop_rate=args.edge_drop_rate,
-                        epoch=epoch,
-                        total_epochs=args.epochs
-                    ) * args.lambda_dgi
-                    
+                    # 边mask重构（只对被mask的边）
+                    mask_recon_loss = 0.0
+                    if edge_mask is not None and edge_mask.any() and predicted_masked_edges is not None:
+                        target_scores = edge_attr_cc[:, 0][edge_mask]
+                        if target_scores.numel() > 0:
+                            mask_recon_loss = torch.nn.functional.mse_loss(predicted_masked_edges, target_scores)
+
+                    node_recon_loss = 0.0
+                    if node_recon_pred is not None and node_mask is not None and node_mask.any():
+                        node_target = torch.cat([expr_raw, cell_expr_raw], dim=0)
+                        node_recon_loss = torch.nn.functional.mse_loss(
+                            node_recon_pred[node_mask], node_target[node_mask]
+                        )
+
+                    val_loss = (
+                        args.lambda_mask_recon * mask_recon_loss
+                        + args.lambda_node_recon * node_recon_loss
+                    )
+
                     batch_loss += val_loss
-                
+                    batch_mask += mask_recon_loss
+                    batch_node += node_recon_loss
+
                 avg_batch_loss = batch_loss / batch_size
-                total_val_loss += avg_batch_loss.item()
+                avg_batch_mask = batch_mask / batch_size
+                avg_batch_node = batch_node / batch_size
+
+                total_val_loss += _scalar(avg_batch_loss)
+                total_val_mask += _scalar(avg_batch_mask)
+                total_val_node += _scalar(avg_batch_node)
                 processed_val_batches += 1
         
         # 计算epoch平均损失
         avg_train_loss = total_train_loss / processed_train_batches if processed_train_batches > 0 else 0
         avg_val_loss = total_val_loss / processed_val_batches if processed_val_batches > 0 else 0
+        avg_train_mask = total_train_mask / processed_train_batches if processed_train_batches > 0 else 0
+        avg_val_mask = total_val_mask / processed_val_batches if processed_val_batches > 0 else 0
+        avg_train_node = total_train_node / processed_train_batches if processed_train_batches > 0 else 0
+        avg_val_node = total_val_node / processed_val_batches if processed_val_batches > 0 else 0
         
         train_losses.append(avg_train_loss)
         val_losses.append(avg_val_loss)
+        train_mask_losses.append(avg_train_mask)
+        val_mask_losses.append(avg_val_mask)
+        train_node_losses.append(avg_train_node)
+        val_node_losses.append(avg_val_node)
         
         # 每个epoch结束时更新学习率调度器
         scheduler.step()
         
         # ========== 早停检查 ==========
-        if early_stop_patience > 0:
-            if avg_val_loss < best_val_loss - early_stop_min_delta:
-                best_val_loss = avg_val_loss
+        if early_stop_patience > 0 and processed_val_batches > 0:
+            # 监控指标：验证总loss
+            val_metric = avg_val_loss
+            if val_metric < best_val_metric - early_stop_min_delta:
+                best_val_metric = val_metric
                 patience_counter = 0
-                #logging.info(f"验证损失改善: {best_val_loss:.6f} (patience重置为0)")
             else:
                 patience_counter += 1
-                #logging.info(f"验证损失未改善: {avg_val_loss:.6f} vs {best_val_loss:.6f} (patience: {patience_counter}/{early_stop_patience})")
                 
             if patience_counter >= early_stop_patience:
-                logging.info(f"早停触发: 验证损失在{early_stop_patience}个epoch内未改善")
+                logging.info(f"早停触发: 验证loss在{early_stop_patience}个epoch内未改善 (best={best_val_metric:.6f}, current={val_metric:.6f})")
                 break
         
         # 更新epoch进度条（只在epoch结束时更新一次）
         epoch_pbar.set_postfix({
             'Train': f'{avg_train_loss:.4f}',
             'Val': f'{avg_val_loss:.4f}',
-            'DGI': f'{avg_train_loss:.4f}',  # DGI损失
-            'λ_DGI': f'{args.lambda_dgi:.1f}'  # DGI权重
+            'Train_Mask': f'{avg_train_mask:.4f}',
+            'Train_Node': f'{avg_train_node:.4f}',
         })
     logging.info(f"   - 评估数据集大小: {len(dataset)} spots")
     logging.info(f"   - 评估batch数量: {len(eval_dataloader)} batches（可能包含被过滤的空子图）")
@@ -727,7 +748,7 @@ def main():
                 # 模型前向传播
                 # ✅ 推理阶段也传入真实通信特征，收集的注意力才与LR信息一致
                 edge_attr_cc_input = edge_attr_cc[:, :2]
-                spot_repr, cell_repr, combined, spot_proj, cc_attention, _, _, exist_logits, rate_pred = model(
+                spot_repr, cell_repr, combined, spot_proj, cc_attention, _, _, node_recon_pred, node_mask = model(
                     expr_raw=expr_raw,
                     cell_expr_raw=cell_expr_raw,
                     edge_index_like=edge_index_like,
@@ -735,7 +756,8 @@ def main():
                     edge_index_cc=edge_index_cc,
                     edge_attr_cc=edge_attr_cc_input,
                     return_attention=True,
-                    edge_mask_ratio=0.0
+                    edge_mask_ratio=0.0,
+                    node_mask_ratio=0.0
                 )
                 
                 if cc_attention is not None:

@@ -740,7 +740,6 @@ class SpatialDeconvolutionLoss(nn.Module):
             损失字典
         """
         n_spots = attention_weights.shape[0]
-        
         # ✅ 使用全部基因重建 spot 表达: X̂_i = s_i × Σ(w_ic × R_c^full)
         # 步骤:
         # 1. 使用 celltype_expressions_full [n_cell_types, n_all_genes] (normalize 1e4 on all genes)
@@ -757,11 +756,8 @@ class SpatialDeconvolutionLoss(nn.Module):
         )  # [n_spots, n_all_genes] - 混合后的全部基因表达比例
         
         # 乘以每个 spot 的总 counts (全部基因的 raw counts): s_i × Σ(w_ic × R_c^full)
-        if batch_spot_total_counts is not None:
-            spot_counts = batch_spot_total_counts.unsqueeze(-1)  # [batch_size, 1]
-        else:
-            spot_counts = self.spot_total_counts[:n_spots].unsqueeze(-1)  # [n_spots, 1]
-        
+        spot_counts = batch_spot_total_counts.unsqueeze(-1)  # [batch_size, 1]
+
         reconstructed_spot_full = mixed_proportions_full * spot_counts  # [n_spots, n_all_genes]
         
         # 提取 marker 基因: 只在 marker 基因上计算 loss
@@ -781,13 +777,9 @@ class SpatialDeconvolutionLoss(nn.Module):
             corr = numerator / (denominator + 1e-8)
             return corr
         
-        # Normalize 到比例空间 (消除文库大小差异) - 只在 marker 基因上
-        reconstructed_norm = reconstructed_spot_marker / (reconstructed_spot_marker.sum(dim=-1, keepdim=True) + 1e-8)
-        true_norm = true_spot_expression / (true_spot_expression.sum(dim=-1, keepdim=True) + 1e-8)
-        
         # Log-transform (避免高表达基因主导)
-        reconstructed_log = torch.log1p(reconstructed_norm * 1e4)  # 乘 1e4 使 log 值更稳定
-        true_log = torch.log1p(true_norm * 1e4)
+        reconstructed_log = torch.log1p(reconstructed_spot_marker)
+        true_log = torch.log1p(true_spot_expression)
         
         pearson_corr = pearson_correlation(reconstructed_log, true_log)
         L_pearson = 1.0 - pearson_corr.mean()  # 1 - 相关系数,越小越好
@@ -810,58 +802,6 @@ class SpatialDeconvolutionLoss(nn.Module):
         # 鼓励稀疏的注意力分布（每个spot只使用少数细胞类型）
         sparsity_loss = -torch.mean(attention_weights * torch.log(attention_weights + 1e-8))
         
-        # ============ 6. Diversity Loss ============ [已禁用]
-        # 防止所有spot都使用相同的细胞类型组合
-        # 注释掉：这个损失会降低模型对真实细胞组成的拟合精度
-        diversity_loss = torch.tensor(0.0, device=attention_weights.device)
-        # # 计算全局细胞类型使用频率（所有spot的平均权重）
-        # global_celltype_usage = attention_weights.mean(dim=0)  # [n_cell_types]
-        # # 目标：每个细胞类型的全局使用率应该尽可能均匀
-        # # 使用KL散度，鼓励全局使用分布接近均匀分布
-        # n_cell_types = attention_weights.shape[1]
-        # uniform_dist = torch.ones_like(global_celltype_usage) / n_cell_types
-        # # KL(global_usage || uniform) = sum(p * log(p/q))
-        # diversity_loss = torch.sum(
-        #     global_celltype_usage * torch.log(
-        #         (global_celltype_usage + 1e-8) / (uniform_dist + 1e-8)
-        #     )
-        # )
-        
-        # ============ 7. Spatial Heterogeneity Loss ============ [已禁用]
-        # 鼓励相邻spot的细胞组成有差异，保持空间异质性
-        # 注释掉：这个损失可能导致过度的空间差异，影响重建精度
-        hetero_loss = torch.tensor(0.0, device=attention_weights.device)
-        # if edge_index is not None and edge_index.shape[1] > 0:
-        #     # 只考虑spot-spot边（节点索引 < n_spots）
-        #     spot_spot_mask = (edge_index[0] < n_spots) & (edge_index[1] < n_spots)
-        #     spot_edges = edge_index[:, spot_spot_mask]
-        #     
-        #     if spot_edges.shape[1] > 0:
-        #         # 获取边的源节点和目标节点
-        #         src_nodes = spot_edges[0]  # [num_edges]
-        #         dst_nodes = spot_edges[1]  # [num_edges]
-        #         
-        #         # 获取相邻spot的权重
-        #         src_weights = attention_weights[src_nodes]  # [num_edges, n_cell_types]
-        #         dst_weights = attention_weights[dst_nodes]  # [num_edges, n_cell_types]
-        #         
-        #         # 计算相邻spot权重的相似度（使用cosine相似度）
-        #         # 我们希望这个相似度不要太高（保持差异）
-        #         similarity = F.cosine_similarity(src_weights, dst_weights, dim=-1)  # [num_edges]
-        #         
-        #         # 异质性损失：惩罚过高的相似度
-        #         # 使用 ReLU 确保只惩罚相似度 > threshold 的情况
-        #         similarity_threshold = 0.7  # 相邻spot的相似度不应超过0.7
-        #         hetero_loss = F.relu(similarity - similarity_threshold).mean()
-        
-        # ============ 8. Global Cell Type Proportion Consistency Loss ============
-        # 确保解卷积结果的**全局**细胞类型比例与单细胞数据一致
-        # 
-        # 重要理解：
-        #   - 这是对**整个组织切片**的全局约束，不是对单个spot的约束
-        #   - 单个spot可以有不同的细胞组成（保持空间异质性）
-        #   - 但所有spots加起来的总体分布应该与单细胞数据匹配
-
         proportion_loss = torch.tensor(0.0, device=attention_weights.device)
         
         if self.sc_celltype_proportions is not None:
@@ -872,27 +812,15 @@ class SpatialDeconvolutionLoss(nn.Module):
             
             # 单细胞数据的真实比例（从聚类统计得到）
             sc_proportions = self.sc_celltype_proportions.to(attention_weights.device)  # [n_cell_types]
-            
-            # 方法1: KL散度 - 衡量两个分布的差异
+
             # KL(ST || SC) = sum(p_st * log(p_st / p_sc))
-            kl_loss = torch.sum(
+            proportion_loss = torch.sum(
                 st_predicted_proportions * torch.log(
                     (st_predicted_proportions + 1e-8) / (sc_proportions + 1e-8)
                 )
             )
-            
-            # 方法2: L2距离 - 直接衡量比例差异
-            l2_loss = torch.sum((st_predicted_proportions - sc_proportions) ** 2)
-            
-            # 方法3: L1距离 - Total Variation Distance
-            l1_loss = torch.sum(torch.abs(st_predicted_proportions - sc_proportions))
-            
-            # 使用KL散度作为主要损失（也可以组合使用）
-            proportion_loss = kl_loss
-            # 或者使用组合: proportion_loss = 0.5 * kl_loss + 0.5 * l2_loss
-        
+
         # ============ 总损失 ============
-        # 注意：已移除 diversity_loss 和 hetero_loss
         total_loss = (self.lambda_pearson * L_pearson +
                      self.lambda_mse * L_mse +
                      self.lambda_cosine * L_cosine +
@@ -1281,57 +1209,13 @@ def plot_vae_training_curves(train_losses, test_losses, recon_losses, kl_losses,
     plt.close()
 
 
-def save_vae_checkpoint(vae, label_encoder, marker_genes, genes, all_genes, 
-                       sc_clusters, resolution, cluster_prototypes, 
-                       cluster_expressions, cluster_expressions_full, 
-                       cluster_expressions_full_count, filepath, avg_cell_counts=None,
-                       cluster_cell_weights=None, cluster_to_celltype=None):
-    """Save VAE model checkpoint
-    
-    Args:
-        vae: VAE model
-        label_encoder: Label encoder
-        marker_genes: List of marker genes
-        genes: List of final genes used for training
-        all_genes: List of all genes
-        sc_clusters: SC cluster labels
-        resolution: Leiden resolution
-        cluster_prototypes: Dict of cluster prototypes (latent space centers)
-        cluster_expressions: Dict of cluster expressions (marker genes)
-        cluster_expressions_full: Dict of cluster expressions (all genes)
-        cluster_expressions_full_count: Dict of cluster expressions (all genes, count backup)
-        filepath: Path to save checkpoint
-        avg_cell_counts: Average total counts per cell (for Stage 2 cells_per_spot calculation)
-        cluster_cell_weights: Dict of cell weights for each cluster
-        cluster_to_celltype: Dict of cluster_id -> celltype_name mapping (if available)
-    """
+def save_vae_checkpoint(vae, label_encoder, marker_genes, genes, all_genes,
+                       sc_clusters, resolution, filepath, avg_cell_counts=None):
+    """Save VAE weights and basic metadata (cluster data saved separately)."""
     print("="*60)
     print(f"Saving model to: {filepath}")
-    
-    if cluster_prototypes is not None:
-        print(f"   Cluster centers: {len(cluster_prototypes)} clusters")
-    else:
-        print(f"   Warning: cluster centers missing")
-        
-    if cluster_expressions is not None:
-        print(f"   Cluster expressions (marker genes): {len(cluster_expressions)} clusters")
-    else:
-        print(f"   Warning: cluster expressions missing")
-    
-    if cluster_expressions_full is not None:
-        print(f"   Cluster expressions (all genes): {len(cluster_expressions_full)} clusters")
-    else:
-        print(f"   Warning: full gene expressions missing")
-    
-    if cluster_expressions_full_count is not None:
-        print(f"   Cluster expressions (all genes, count backup): {len(cluster_expressions_full_count)} clusters")
-    else:
-        print(f"   Warning: full gene expressions (count backup) missing")
-    
     if avg_cell_counts is not None:
         print(f"   Average cell counts: {avg_cell_counts:.1f} (for Stage 2 scale factor)")
-    
-    # ✅ Save model weights only in .pth (cluster data will be saved separately by stage1.py)
     torch.save({
         'vae_state_dict': vae.state_dict(),
         'label_encoder': label_encoder,
@@ -1346,13 +1230,6 @@ def save_vae_checkpoint(vae, label_encoder, marker_genes, genes, all_genes,
         'avg_cell_counts': avg_cell_counts
     }, filepath)
     
-    print(f"✅ Model weights saved to: {filepath}")
-    
-    # ✅ Cluster data is NOT saved here anymore!
-    # It will be saved separately by stage1.py's save_cluster_data() method to NPZ file
-    # This keeps model file pure (only weights) and cluster data separate
-
-
 def load_vae_for_inference(filepath, device):
     """Load VAE model for inference (basic loading)
     

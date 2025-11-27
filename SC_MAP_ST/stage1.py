@@ -361,14 +361,7 @@ class coEncoder:
             sc_clusters=getattr(self, 'sc_clusters', None),
             resolution=getattr(self, 'resolution', 0.5),
             all_genes=getattr(self, 'all_genes', None),
-            avg_cell_counts=getattr(self, 'avg_cell_counts', None),
-            # ✅ Don't save cluster data in PTH - will be saved separately in NPZ
-            cluster_prototypes=None,
-            cluster_expressions=None,
-            cluster_expressions_full=None,
-            cluster_expressions_full_count=None,
-            cluster_cell_weights=None,
-            cluster_to_celltype=None
+            avg_cell_counts=getattr(self, 'avg_cell_counts', None)
         )
         print(f"✅ Saved VAE model (weights only): {filepath}")
     

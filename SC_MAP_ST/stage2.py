@@ -13,6 +13,7 @@ from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.preprocessing import LabelEncoder
 import matplotlib.pyplot as plt
 import seaborn as sns
+from skimage.metrics import structural_similarity
 from typing import List, Tuple, Dict, Optional
 import argparse
 import warnings
@@ -539,8 +540,8 @@ class GATDeconvolution:
                 break
         
         # Plot training curves
-        self.plot_training_curves(train_losses, pearson_losses, mse_losses, cos_losses, 
-                                 weight_regs, sparsity_regs, diversity_losses, hetero_losses, 
+        self.plot_training_curves(train_losses, pearson_losses, mse_losses,
+                                 cos_losses, weight_regs, sparsity_regs, diversity_losses, hetero_losses, 
                                  proportion_losses, sample_name)
         
         # Save final model
@@ -708,12 +709,16 @@ class GATDeconvolution:
         print(f"   Saved cluster composition: {cluster_file}")
         
         # ============ Compute reconstruction quality (Cosine Similarity) ============
-        celltype_expr_marker = self.celltype_expressions.cpu().numpy()
-        reconstructed_marker_expr = np.dot(deconv_weights, celltype_expr_marker)
-        
-        # 使用 marker genes 对应的真实表达
+        marker_indices = [self.all_genes.index(g) for g in self.genes]
+        reconstructed_marker_expr = reconstructed_full_expr[:, marker_indices]
+
         st_marker_subset = st_adata[:, self.genes].X
         true_expr = st_marker_subset.toarray() if hasattr(st_marker_subset, 'toarray') else st_marker_subset
+
+        # Ensure pure numpy float arrays to avoid object-dtype issues
+        reconstructed_marker_expr = np.asarray(reconstructed_marker_expr, dtype=np.float64)
+        true_expr = np.asarray(true_expr, dtype=np.float64)
+
         print(f"   Using {len(self.genes)} marker genes for reconstruction quality (consistent with training objective)")
         
         # Compute cosine similarity per spot (log-normalized space)
@@ -739,19 +744,60 @@ class GATDeconvolution:
         cosine_csv = f"{self.output_dir}/{sample_name}_spot_cosine_similarity.csv"
         cosine_df.to_csv(cosine_csv, index=False)
         print(f"   Cosine similarities saved: {cosine_csv}")
+
+        # ============ Additional per-spot metrics: PCC, RMSE, JSD, SSIM ============
+        # Normalize to proportions for divergence / similarity metrics
+        reconstructed_prop = reconstructed_marker_expr / (reconstructed_marker_expr.sum(axis=1, keepdims=True) + 1e-8)
+        true_prop = true_expr / (true_expr.sum(axis=1, keepdims=True) + 1e-8)
+        reconstructed_log_prop = np.log1p(reconstructed_prop * 1e4)
+        true_log_prop = np.log1p(true_prop * 1e4)
+
+        # Pearson correlation coefficient (per spot) on log-proportions
+        pcc_values = []
+        for i in range(n_spots):
+            r = np.corrcoef(reconstructed_log_prop[i], true_log_prop[i])[0, 1]
+            if np.isnan(r):
+                r = 0.0
+            pcc_values.append(r)
+        pcc_df = pd.DataFrame({'spot_id': spot_barcodes, 'pcc': pcc_values})
+        pcc_csv = f"{self.output_dir}/{sample_name}_spot_pcc.csv"
+        pcc_df.to_csv(pcc_csv, index=False)
+        print(f"   Pearson correlations saved: {pcc_csv}")
+
+        # RMSE on log-counts (marker)
+        rmse_values = np.sqrt(np.mean((reconstructed_log - true_log) ** 2, axis=1))
+        rmse_df = pd.DataFrame({'spot_id': spot_barcodes, 'rmse': rmse_values})
+        rmse_csv = f"{self.output_dir}/{sample_name}_spot_rmse.csv"
+        rmse_df.to_csv(rmse_csv, index=False)
+        print(f"   RMSE saved: {rmse_csv}")
+
+        # Jensen-Shannon divergence on marker proportions (bounded in [0, ln2])
+        m = 0.5 * (reconstructed_prop + true_prop)
+        kl_rec = np.sum(reconstructed_prop * np.log((reconstructed_prop + 1e-8) / (m + 1e-8)), axis=1)
+        kl_true = np.sum(true_prop * np.log((true_prop + 1e-8) / (m + 1e-8)), axis=1)
+        jsd_values = 0.5 * (kl_rec + kl_true)
+        jsd_df = pd.DataFrame({'spot_id': spot_barcodes, 'jsd': jsd_values})
+        jsd_csv = f"{self.output_dir}/{sample_name}_spot_jsd.csv"
+        jsd_df.to_csv(jsd_csv, index=False)
+        print(f"   JSD saved: {jsd_csv}")
+
+        # Structural Similarity (SSIM) on marker proportions (in [0,1])
+        ssim_values = []
+        for i in range(n_spots):
+            rec_vec = reconstructed_prop[i].astype(np.float64)
+            true_vec = true_prop[i].astype(np.float64)
+            ssim_score = structural_similarity(true_vec, rec_vec, data_range=1.0)
+            if np.isnan(ssim_score):
+                ssim_score = 0.0
+            ssim_values.append(ssim_score)
+        ssim_df = pd.DataFrame({'spot_id': spot_barcodes, 'ssim': ssim_values})
+        ssim_csv = f"{self.output_dir}/{sample_name}_spot_ssim.csv"
+        ssim_df.to_csv(ssim_csv, index=False)
+        print(f"   SSIM saved: {ssim_csv}")
         
         # Plot reconstruction quality curve (sorted by similarity)
         self.plot_reconstruction_quality_curve(cosine_similarities, sample_name)
         
-        # Note: celltype-cluster mapping is now saved in Stage 1 NPZ file
-        # train.py should load it directly from the NPZ file
-        if self.cluster_to_celltype is None:
-            print("\n⚠️ Warning: Celltype mapping not found in Stage 1 NPZ file.")
-            print("   train.py may need to handle clusters without celltype names.")
-        else:
-            print(f"\n✅ Celltype mapping available: {len(self.cluster_to_celltype)} clusters")
-            print("   train.py will load this mapping from Stage 1 NPZ file.")
-    
     def plot_reconstruction_quality_curve(self, cosine_similarities, sample_name):
         """Plot reconstruction quality curve (sorted by cosine similarity)
         
@@ -823,10 +869,10 @@ class GATDeconvolution:
         print(f"      Range: [{min_sim:.4f}, {max_sim:.4f}]")
         print(f"      Spots with similarity > 0.8: {np.sum(cosine_similarities > 0.8)} ({100*np.sum(cosine_similarities > 0.8)/n_spots:.1f}%)")
     
-    def plot_training_curves(self, train_losses, pearson_losses, mse_losses, cos_losses, 
-                           weight_regs, sparsity_regs, diversity_losses, hetero_losses, 
+    def plot_training_curves(self, train_losses, pearson_losses, mse_losses,
+                           cos_losses, weight_regs, sparsity_regs, diversity_losses, hetero_losses, 
                            proportion_losses, sample_name):
-        """Plot simplified training curves: 3 subplots in 1 figure"""
+        """Plot simplified training curves"""
         fig, axes = plt.subplots(1, 3, figsize=(18, 5))
         
         epochs = range(1, len(train_losses) + 1)
@@ -841,17 +887,21 @@ class GATDeconvolution:
         # 2. Cosine + Pearson
         axes[1].plot(epochs, cos_losses, 'red', label='Cosine', linewidth=2.5)
         axes[1].plot(epochs, pearson_losses, 'orange', label='Pearson', linewidth=2.5)
-        axes[1].set_title('Cosine & Pearson Loss', fontsize=14, fontweight='bold')
+        axes[1].set_title('Cosine & Pearson', fontsize=14, fontweight='bold')
         axes[1].set_xlabel('Epochs', fontsize=12)
         axes[1].set_ylabel('Loss', fontsize=12)
         axes[1].legend(fontsize=11)
         axes[1].grid(True, alpha=0.3, linestyle='--')
         
-        # 3. MSE loss
-        axes[2].plot(epochs, mse_losses, 'green', linewidth=2.5)
-        axes[2].set_title('MSE Loss', fontsize=14, fontweight='bold')
+        # 3. MSE + Regularizers
+        axes[2].plot(epochs, mse_losses, 'green', label='MSE', linewidth=2.5)
+        axes[2].plot(epochs, weight_regs, 'brown', label='Weight Reg', linewidth=2.5)
+        axes[2].plot(epochs, sparsity_regs, 'gray', label='Sparsity', linewidth=2.5)
+        axes[2].plot(epochs, proportion_losses, 'olive', label='Proportion', linewidth=2.5)
+        axes[2].set_title('MSE & Regularizers', fontsize=14, fontweight='bold')
         axes[2].set_xlabel('Epochs', fontsize=12)
         axes[2].set_ylabel('Loss', fontsize=12)
+        axes[2].legend(fontsize=11)
         axes[2].grid(True, alpha=0.3, linestyle='--')
         
         plt.suptitle(f'GAT Deconvolution Training - {sample_name}', fontsize=16, fontweight='bold', y=1.02)
@@ -917,8 +967,7 @@ def main():
                        help='Weight regularization weight')
     parser.add_argument('--loss_lambda_sparse', type=float, default=0.01,
                        help='Sparsity regularization weight (Shannon entropy)')
-    # 已移除: --loss_lambda_diversity (已禁用)
-    # 已移除: --loss_lambda_hetero (已禁用)
+
     parser.add_argument('--loss_lambda_proportion', type=float, default=1.0,
                        help='Global cell type proportion consistency loss weight (matches SC cluster distribution)')
     

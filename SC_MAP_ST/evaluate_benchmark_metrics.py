@@ -2,6 +2,7 @@ import argparse
 import numpy as np
 import pandas as pd
 import scanpy as sc
+import matplotlib.pyplot as plt
 from typing import List
 
 
@@ -133,11 +134,28 @@ def compute_metrics(gt_mat: np.ndarray, pred_mat: np.ndarray, genes):
     return pd.DataFrame(records)
 
 
+def save_boxplots(metrics_df: pd.DataFrame, output_csv: str, title: str = "Metrics Boxplot"):
+    """Save boxplots for available metric columns."""
+    metric_cols = [col for col in ['pcc', 'ssim', 'rmse', 'js'] if col in metrics_df.columns]
+    if not metric_cols:
+        return
+    data = [metrics_df[col].dropna() for col in metric_cols]
+    fig, ax = plt.subplots(figsize=(8, 6))
+    ax.boxplot(data, labels=metric_cols, showfliers=False)
+    ax.set_ylabel("Score")
+    ax.set_title(title)
+    plt.tight_layout()
+    png_path = output_csv.rsplit('.', 1)[0] + "_boxplot.png"
+    plt.savefig(png_path, dpi=300, bbox_inches='tight')
+    plt.close(fig)
+    print(f"Boxplot saved to {png_path}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Benchmark metrics for reconstructed expression.")
-    parser.add_argument("--reconstructed_csv", required=True,
+    parser.add_argument("--reconstructed_csv", required=False,
                         help="Path to reconstructed all-genes CSV (spots x genes).")
-    parser.add_argument("--ground_truth_h5ad", required=True,
+    parser.add_argument("--ground_truth_h5ad", required=False,
                         help="Path to ground truth ST h5ad.")
     parser.add_argument("--output_csv", default="benchmark_metrics.csv",
                         help="Path to save per-gene metrics CSV.")
@@ -145,10 +163,60 @@ def main():
                         help="Number of highly variable genes to evaluate (default: 1000).")
     parser.add_argument("--gene_list", type=str, default=None,
                         help="Optional path to a gene list (one gene per line). If provided, use these genes (intersected with shared genes) instead of HVG selection.")
+    parser.add_argument("--composition_pred_csv", type=str, default=None,
+                        help="Predicted cell composition CSV (spots x celltypes). If provided with --composition_true_csv, compute metrics on compositions instead of gene expression.")
+    parser.add_argument("--composition_true_csv", type=str, default=None,
+                        help="Ground truth cell composition CSV (spots x celltypes).")
     args = parser.parse_args()
 
+    # ============ Composition mode ============
+    if args.composition_pred_csv and args.composition_true_csv:
+        pred_comp = pd.read_csv(args.composition_pred_csv, index_col=0)
+        true_comp = pd.read_csv(args.composition_true_csv, index_col=0)
+
+        shared_spots = pred_comp.index.intersection(true_comp.index)
+        if len(shared_spots) == 0:
+            raise ValueError("No overlapping spots between composition CSVs.")
+        pred_comp = pred_comp.loc[shared_spots]
+        true_comp = true_comp.loc[shared_spots]
+
+        shared_cols = [c for c in true_comp.columns if c in pred_comp.columns]
+        if len(shared_cols) == 0:
+            raise ValueError("No overlapping celltype columns between composition CSVs.")
+        pred_comp = pred_comp[shared_cols].astype(float)
+        true_comp = true_comp[shared_cols].astype(float)
+
+        pred_comp = pred_comp.replace([np.inf, -np.inf], np.nan).fillna(0)
+        true_comp = true_comp.replace([np.inf, -np.inf], np.nan).fillna(0)
+
+        # Row-normalize true composition to proportions (handle count-style inputs)
+        true_row_sum = true_comp.sum(axis=1)
+        true_row_sum[true_row_sum == 0] = 1.0
+        true_comp = true_comp.div(true_row_sum, axis=0)
+
+        # Pred is assumed already normalized; warn if not close to 1
+        pred_row_sum = pred_comp.sum(axis=1)
+        if not np.allclose(pred_row_sum.values, 1.0, atol=1e-3):
+            print("⚠️ Warning: predicted composition rows do not sum to 1 (max diff "
+                  f"{np.max(np.abs(pred_row_sum.values - 1.0)):.4f}). Using provided values without renorm.")
+
+        metrics_df = compute_metrics(true_comp.values, pred_comp.values, list(shared_cols))
+        metrics_df.to_csv(args.output_csv, index=False)
+
+        print(f"[Composition mode] Spots aligned: {pred_comp.shape[0]}, Celltypes evaluated: {len(shared_cols)}")
+        print(f"Mean PCC: {np.nanmean(metrics_df['pcc']):.4f}")
+        print(f"Mean SSIM: {np.nanmean(metrics_df['ssim']):.4f}")
+        print(f"Mean RMSE: {metrics_df['rmse'].mean():.4f}")
+        print(f"Mean JS: {metrics_df['js'].mean():.4f}")
+        print(f"Per-celltype metrics saved to {args.output_csv}")
+        save_boxplots(metrics_df, args.output_csv, title="Composition Metrics")
+        return
+
+    # ============ Expression mode ============
+    if not args.reconstructed_csv or not args.ground_truth_h5ad:
+        raise ValueError("Provide --reconstructed_csv and --ground_truth_h5ad for expression evaluation, or both composition CSVs for composition mode.")
+
     recon_df = pd.read_csv(args.reconstructed_csv, index_col=0)
-  
     gt_adata = sc.read_h5ad(args.ground_truth_h5ad)
 
     gt_df, pred_df, genes = align_data(recon_df, gt_adata)
@@ -179,6 +247,7 @@ def main():
     print(f"Mean RMSE: {metrics_df['rmse'].mean():.4f}")
     print(f"Mean JS: {metrics_df['js'].mean():.4f}")
     print(f"Per-gene metrics saved to {args.output_csv}")
+    save_boxplots(metrics_df, args.output_csv, title="Expression Metrics")
 
 
 if __name__ == "__main__":

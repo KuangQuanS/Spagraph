@@ -491,7 +491,8 @@ class HeterogeneousGATDeconvolution(nn.Module):
     def build_heterogeneous_graph(self, 
                                 spot_embeddings: torch.Tensor,
                                 spatial_coords: torch.Tensor,
-                                celltype_prototypes: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+                                celltype_prototypes: torch.Tensor,
+                                use_embedding_knn: bool = False) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """构建异构图：Spot节点 + CellType节点
         
         注意：celltype_prototypes参数用于计算Spot-CellType边的相似度（在原始VAE embedding空间）
@@ -515,26 +516,41 @@ class HeterogeneousGATDeconvolution(nn.Module):
         edge_indices = []
         edge_attrs = []
         
-        # 2.1 Spot-Spot边（基于空间距离的KNN）
-        if len(spatial_coords) > 1:
-            # 计算KNN
-            coords_np = spatial_coords.detach().cpu().numpy()
-            nbrs = NearestNeighbors(n_neighbors=min(self.k_spatial+1, len(coords_np))).fit(coords_np)
-            distances, indices = nbrs.kneighbors(coords_np)
-            
-            for i in range(len(indices)):
-                for j in range(1, len(indices[i])):  # 跳过自己（第0个）
-                    neighbor_idx = indices[i][j]
-                    distance = distances[i][j]
-                    
-                    # 转换为相似度权重
-                    weight = np.exp(-distance / np.std(distances))
-                    
-                    # 双向边
-                    edge_indices.append([i, neighbor_idx])
-                    edge_attrs.append([weight])
-                    edge_indices.append([neighbor_idx, i])
-                    edge_attrs.append([weight])
+        # 2.1 Spot-Spot边（空间KNN或嵌入KNN）
+        if n_spots > 1:
+            if not use_embedding_knn and spatial_coords is not None and len(spatial_coords) > 1:
+                coords_np = spatial_coords.detach().cpu().numpy()
+                nbrs = NearestNeighbors(n_neighbors=min(self.k_spatial+1, len(coords_np))).fit(coords_np)
+                distances, indices = nbrs.kneighbors(coords_np)
+                
+                for i in range(len(indices)):
+                    for j in range(1, len(indices[i])):  # 跳过自己（第0个）
+                        neighbor_idx = indices[i][j]
+                        distance = distances[i][j]
+                        
+                        # 转换为相似度权重
+                        weight = np.exp(-distance / (np.std(distances) + 1e-8))
+                        
+                        # 双向边
+                        edge_indices.append([i, neighbor_idx])
+                        edge_attrs.append([weight])
+                        edge_indices.append([neighbor_idx, i])
+                        edge_attrs.append([weight])
+            else:
+                # 基于spot embedding的KNN（使用余弦相似度）
+                spot_np = spot_embeddings.detach().cpu().numpy()
+                nbrs = NearestNeighbors(n_neighbors=min(self.k_spatial+1, len(spot_np)), metric='cosine').fit(spot_np)
+                distances, indices = nbrs.kneighbors(spot_np)
+                # cosine metric gives distance = 1 - cosine_sim
+                for i in range(len(indices)):
+                    for j in range(1, len(indices[i])):
+                        neighbor_idx = indices[i][j]
+                        distance = distances[i][j]
+                        weight = np.exp(-(distance) / (np.std(distances) + 1e-8))
+                        edge_indices.append([i, neighbor_idx])
+                        edge_attrs.append([weight])
+                        edge_indices.append([neighbor_idx, i])
+                        edge_attrs.append([weight])
         
         # 2.2 Spot-CellType边（基于KNN，每个spot连接k个最近的celltype）
         # 在原始VAE embedding空间计算相似度（更准确地反映语义相似性）
@@ -577,7 +593,8 @@ class HeterogeneousGATDeconvolution(nn.Module):
     def forward(self, 
                spot_embeddings: torch.Tensor,
                spatial_coords: torch.Tensor,
-               celltype_prototypes: torch.Tensor) -> Dict[str, torch.Tensor]:
+               celltype_prototypes: torch.Tensor,
+               use_embedding_knn: bool = False) -> Dict[str, torch.Tensor]:
         """Forward pass"""
         n_spots = spot_embeddings.shape[0]
         n_cell_types = celltype_prototypes.shape[0]
@@ -585,7 +602,7 @@ class HeterogeneousGATDeconvolution(nn.Module):
         
         # 1. Build heterogeneous graph
         edge_index, edge_attr, node_features = self.build_heterogeneous_graph(
-            spot_embeddings, spatial_coords, celltype_prototypes
+            spot_embeddings, spatial_coords, celltype_prototypes, use_embedding_knn=use_embedding_knn
         )
         
         # 2. Create sparse mask: which spot-celltype pairs are connected in the graph
@@ -738,25 +755,23 @@ class SpatialDeconvolutionLoss(nn.Module):
             损失字典
         """
         n_spots = attention_weights.shape[0]
-        # ✅ 使用全部基因重建 spot 表达: X̂_i = s_i × Σ(w_ic × R_c^full)
-        # 步骤:
-        # 1. 使用 celltype_expressions_full [n_cell_types, n_all_genes] (normalize 1e4 on all genes)
-        # 2. 重建全部基因的 spot 表达
-        # 3. 提取 marker 基因用于计算 loss
-        
-        # 将 celltype_expressions_full 从 1e4 scale 转换为 sum=1 的比例
-        celltype_expr_full_normalized = self.celltype_expressions_full / 1e4  # [n_cell_types, n_all_genes]
-        
-        # 计算混合比例 (全部基因): Σ(w_ic × R_c^full)
-        mixed_proportions_full = torch.matmul(
-            attention_weights,                  # [n_spots, n_cell_types]
-            celltype_expr_full_normalized       # [n_cell_types, n_all_genes]
-        )  # [n_spots, n_all_genes] - 混合后的全部基因表达比例
-        
-        # 乘以每个 spot 的总 counts (全部基因的 raw counts): s_i × Σ(w_ic × R_c^full)
-        spot_counts = batch_spot_total_counts.unsqueeze(-1)  # [batch_size, 1]
+        if batch_spot_total_counts is None:
+            batch_spot_total_counts = self.spot_total_counts[:n_spots]
+        # ✅ 使用全部基因重建 spot 表达: X̂_i = scale_i × Σ(w_ic × R_c^full)
+        # 1) 使用原始尺度的 celltype_expressions_full [n_cell_types, n_all_genes]
+        # 2) 线性混合得到预估表达
+        # 3) 重新按 spot_total_counts 归一，匹配实际文库大小
+        mixed_expr_full = torch.matmul(
+            attention_weights,               # [n_spots, n_cell_types]
+            self.celltype_expressions_full   # [n_cell_types, n_all_genes]
+        )  # [n_spots, n_all_genes]
 
-        reconstructed_spot_full = mixed_proportions_full * spot_counts  # [n_spots, n_all_genes]
+        # scale: 使重建后的总 counts 与真实 spot_total_counts 对齐
+        spot_counts = batch_spot_total_counts.unsqueeze(-1)  # [batch_size, 1]
+        mixed_totals = mixed_expr_full.sum(dim=1, keepdim=True)  # [batch_size, 1]
+        scale = spot_counts / (mixed_totals + 1e-8)
+
+        reconstructed_spot_full = mixed_expr_full * scale  # [n_spots, n_all_genes]
         
         # 提取 marker 基因: 只在 marker 基因上计算 loss
         reconstructed_spot_marker = reconstructed_spot_full[:, self.marker_gene_indices]  # [n_spots, n_marker_genes]

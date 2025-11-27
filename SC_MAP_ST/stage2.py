@@ -78,6 +78,7 @@ class GATDeconvolution:
         self.celltype_expressions = None
         self.cluster_to_celltype = None  # Mapping from cluster index to celltype name
         self.celltype_key = None  # Track which celltype column was used
+        self.use_embedding_knn = False  # If True, build spot KNN with embeddings when spatial coords missing
         
         # Graph construction parameters
         self.k_spatial = 20
@@ -380,7 +381,8 @@ class GATDeconvolution:
             gat_outputs = self.gat_model(
                 spot_embeddings=spot_embeddings,
                 spatial_coords=batch_spatial_coords,
-                celltype_prototypes=self.celltype_prototypes
+                celltype_prototypes=self.celltype_prototypes,
+                use_embedding_knn=self.use_embedding_knn
             )
             
             # Compute loss (using raw count data)
@@ -411,7 +413,7 @@ class GATDeconvolution:
         return epoch_losses
     
     def train_gat_deconvolution(self, 
-                               st_data_normalized: np.ndarray,  # For VAE embedding (sum=1)
+                               st_data_normalized: np.ndarray,  # For VAE embedding (match Stage 1 input; now raw counts)
                                st_data_raw: np.ndarray,         # For loss calculation (raw counts)
                                spatial_coords: np.ndarray,
                                sample_name: str,
@@ -470,7 +472,7 @@ class GATDeconvolution:
         patience_pearson = 0
         patience_mse = 0
         patience_cosine = 0
-        patience = 15  # 每个损失的独立 patience
+        patience = 30  # 每个损失的独立 patience
         
         pbar = tqdm(range(n_epochs), desc="GAT Training", unit="epoch")
         for epoch in pbar:
@@ -594,7 +596,8 @@ class GATDeconvolution:
             gat_outputs = self.gat_model(
                 spot_embeddings=spot_embeddings,
                 spatial_coords=spatial_coords,
-                celltype_prototypes=self.celltype_prototypes
+                celltype_prototypes=self.celltype_prototypes,
+                use_embedding_knn=self.use_embedding_knn
             )
             
             # Get prediction results
@@ -623,19 +626,20 @@ class GATDeconvolution:
         spot_barcodes = list(st_adata.obs.index)
         
         # Full gene expression matrix (use count version with spot_total_counts)
+        if self.spot_total_counts is None:
+            raise ValueError("spot_total_counts not set; cannot reconstruct expressions without spot totals.")
+        reconstructed_full_expr = None
         if self.celltype_expressions_full is not None and all(expr is not None for expr in self.celltype_expressions_full):
             print("   Reconstructing all gene expression...")
             celltype_expr_full = np.array(self.celltype_expressions_full)
             
-            # ✅ 使用新公式: X̂_i = s_i × Σ(w_ic × R_c)
-            # celltype_expr_full 来自 Stage 1 (normalize 1e4)
-            # 需要除以 1e4 转换为 sum≈1
-            celltype_expr_full_normalized = celltype_expr_full / 1e4
-            
-            mixed_proportions_full = np.dot(deconv_weights, celltype_expr_full_normalized)  # [n_spots, n_all_genes]
+            # 使用原始/计数尺度的 cluster 表达，先线性混合，再按 spot 总计归一到真实 total counts
+            mixed_expr_full = np.dot(deconv_weights, celltype_expr_full)  # [n_spots, n_all_genes]
             
             spot_total_full = self.spot_total_counts[:len(spot_barcodes)]
-            reconstructed_full_expr = mixed_proportions_full * spot_total_full[:, np.newaxis]
+            mixed_totals = mixed_expr_full.sum(axis=1)
+            scale = spot_total_full / (mixed_totals + 1e-8)
+            reconstructed_full_expr = mixed_expr_full * scale[:, np.newaxis]
             
             # Get full gene names
             if self.all_genes is not None:
@@ -719,44 +723,54 @@ class GATDeconvolution:
         print(f"   Saved cluster composition: {cluster_file}")
         
         # ============ Compute reconstruction quality (Cosine Similarity) ============
-        marker_indices = [self.all_genes.index(g) for g in self.genes]
-        reconstructed_marker_expr = reconstructed_full_expr[:, marker_indices]
+        marker_indices = None
+        if reconstructed_full_expr is not None and self.all_genes is not None:
+            try:
+                marker_indices = [self.all_genes.index(g) for g in self.genes]
+            except ValueError:
+                print("   ⚠️ Marker genes not fully found in all_genes list, skipping reconstruction quality.")
+                marker_indices = None
 
-        st_marker_subset = st_adata[:, self.genes].X
-        true_expr = st_marker_subset.toarray() if hasattr(st_marker_subset, 'toarray') else st_marker_subset
+        if reconstructed_full_expr is not None and marker_indices is not None:
+            reconstructed_marker_expr = reconstructed_full_expr[:, marker_indices]
 
-        # Ensure pure numpy float arrays to avoid object-dtype issues
-        reconstructed_marker_expr = np.asarray(reconstructed_marker_expr, dtype=np.float64)
-        true_expr = np.asarray(true_expr, dtype=np.float64)
+            st_marker_subset = st_adata[:, self.genes].X
+            true_expr = st_marker_subset.toarray() if hasattr(st_marker_subset, 'toarray') else st_marker_subset
 
-        print(f"   Using {len(self.genes)} marker genes for reconstruction quality (consistent with training objective)")
-        
-        # Compute cosine similarity per spot (log-normalized space)
-        reconstructed_log = np.log1p(reconstructed_marker_expr)
-        true_log = np.log1p(true_expr)
-        
-        cosine_similarities = []
-        for i in range(n_spots):
-            rec = reconstructed_log[i]
-            true = true_log[i]
+            # Ensure pure numpy float arrays to avoid object-dtype issues
+            reconstructed_marker_expr = np.asarray(reconstructed_marker_expr, dtype=np.float64)
+            true_expr = np.asarray(true_expr, dtype=np.float64)
+
+            print(f"   Using {len(self.genes)} marker genes for reconstruction quality (consistent with training objective)")
             
-            # Cosine similarity
-            cos_sim = np.dot(rec, true) / (np.linalg.norm(rec) * np.linalg.norm(true) + 1e-8)
-            cosine_similarities.append(cos_sim)
-        
-        cosine_similarities = np.array(cosine_similarities)
-        
-        # Save cosine similarities to CSV
-        cosine_df = pd.DataFrame({
-            'spot_id': spot_barcodes,
-            'cosine_similarity': cosine_similarities
-        })
-        cosine_csv = f"{self.output_dir}/{sample_name}_spot_cosine_similarity.csv"
-        cosine_df.to_csv(cosine_csv, index=False)
-        print(f"   Cosine similarities saved: {cosine_csv}")
+            # Compute cosine similarity per spot (log-normalized space)
+            reconstructed_log = np.log1p(reconstructed_marker_expr)
+            true_log = np.log1p(true_expr)
+            
+            cosine_similarities = []
+            for i in range(n_spots):
+                rec = reconstructed_log[i]
+                true = true_log[i]
+                
+                # Cosine similarity
+                cos_sim = np.dot(rec, true) / (np.linalg.norm(rec) * np.linalg.norm(true) + 1e-8)
+                cosine_similarities.append(cos_sim)
+            
+            cosine_similarities = np.array(cosine_similarities)
+            
+            # Save cosine similarities to CSV
+            cosine_df = pd.DataFrame({
+                'spot_id': spot_barcodes,
+                'cosine_similarity': cosine_similarities
+            })
+            cosine_csv = f"{self.output_dir}/{sample_name}_spot_cosine_similarity.csv"
+            cosine_df.to_csv(cosine_csv, index=False)
+            print(f"   Cosine similarities saved: {cosine_csv}")
 
-        # Plot reconstruction quality curve (sorted by similarity)
-        self.plot_reconstruction_quality_curve(cosine_similarities, sample_name)
+            # Plot reconstruction quality curve (sorted by similarity)
+            self.plot_reconstruction_quality_curve(cosine_similarities, sample_name)
+        else:
+            print("   Skipping reconstruction quality metrics (no reconstructed matrix).")
         
     def plot_reconstruction_quality_curve(self, cosine_similarities, sample_name):
         """Plot reconstruction quality curve (sorted by cosine similarity)
@@ -924,11 +938,11 @@ def main():
                        help='MSE reconstruction loss weight')
     parser.add_argument('--loss_lambda_pearson', type=float, default=1,
                        help='Pearson correlation loss weight')
-    parser.add_argument('--loss_lambda_cosine', type=float, default=2,
+    parser.add_argument('--loss_lambda_cosine', type=float, default=1,
                        help='Cosine similarity loss weight')
     parser.add_argument('--loss_lambda_gene_pearson', type=float, default=1,
                        help='Gene-level Pearson loss weight (across spots)')
-    parser.add_argument('--loss_lambda_gene_cosine', type=float, default=2,
+    parser.add_argument('--loss_lambda_gene_cosine', type=float, default=1,
                        help='Gene-level Cosine loss weight (across spots)')
     parser.add_argument('--loss_lambda_reg', type=float, default=0.5,
                        help='Weight regularization weight')
@@ -1006,20 +1020,25 @@ def main():
     print(f"Loading ST data: {args.st_file}")
     st_adata = sc.read_h5ad(args.st_file)
     st_adata.var_names_make_unique()  # Handle duplicate gene names
-
+    sc.pp.normalize_total(st_adata, target_sum=1e4)
     # Check spatial coordinates
     if 'spatial' not in st_adata.obsm:
-        raise ValueError(f"ST data file {args.st_file} missing spatial coordinates! ST data must contain 'spatial' coordinates (adata.obsm['spatial']).")
+        print(f"⚠️  ST data file {args.st_file} missing spatial coordinates. Falling back to embedding-based KNN for spot graph.")
+        spatial_coords = np.zeros((st_adata.n_obs, 2), dtype=float)
+        trainer.use_embedding_knn = True
+    else:
+        spatial_coords = st_adata.obsm['spatial']
+        trainer.use_embedding_knn = False
     
     # ✅ 计算全部基因的 spot total counts (用于重建时的 scaling)
-    # 必须在全部基因上计算，因为 celltype_expressions_full 是在全部基因上 normalize 1e4 的
+    # 使用 Stage 1 的 all_genes 列表，按原始计数尺度
     if trainer.all_genes is None:
         raise ValueError("all_genes not found in Stage 1 checkpoint! Please retrain Stage 1.")
     
     # Filter ST to all_genes (used in Stage 1)
     st_all_genes_subset = st_adata[:, [g for g in trainer.all_genes if g in st_adata.var_names]].copy()
     st_all_genes_raw = st_all_genes_subset.X.toarray() if hasattr(st_all_genes_subset.X, 'toarray') else st_all_genes_subset.X
-    spot_total_counts = st_all_genes_raw.sum(axis=1)  # Shape: [n_spots] - sum over ALL genes
+    spot_total_counts = np.asarray(st_all_genes_raw.sum(axis=1)).ravel()  # Shape: [n_spots] - sum over ALL genes
     print(f"ST spot total counts (all {len(trainer.all_genes)} genes): min={spot_total_counts.min():.1f}, max={spot_total_counts.max():.1f}, mean={spot_total_counts.mean():.1f}")
     
     # Extract ST marker genes (for loss calculation)
@@ -1028,23 +1047,20 @@ def main():
     
     # ✅ 保存原始 raw counts (marker genes only, 用于计算 loss)
     st_X_raw = st_subset.X.toarray() if hasattr(st_subset.X, 'toarray') else st_subset.X
+
+    # Stage 1 now uses raw counts; feed raw counts to the encoder for embedding
+    st_X_embed = st_X_raw.copy()
     
-    sc.pp.normalize_total(st_subset, target_sum=1e4)
-    st_X_normalized = st_subset.X.toarray() if hasattr(st_subset.X, 'toarray') else st_subset.X
-    
-    # Extract spatial coordinates
-    spatial_coords = st_adata.obsm['spatial']
-    
-    print(f"ST data: normalized (1e4)={st_X_normalized.shape} (for embedding), raw={st_X_raw.shape} (for loss)")
+    print(f"ST data: embedding(raw)={st_X_embed.shape}, raw_for_loss={st_X_raw.shape}")
     
     # ✅ No need for cells_per_spot with this approach!
     # We use spot_total_counts as scaling factor directly
     print("\n" + "="*60)
     print("Using NEW scaling approach:")
-    print("  - SC clusters: normalized to sum=1 (proportion vectors)")
+    print("  - SC cluster expressions: use raw/count-scale averages from Stage 1")
     print("  - ST spots: raw counts")
-    print("  - Scaling: spot_total_counts × (weighted_cluster_proportions)")
-    print("  - Formula: X̂_i = s_i × Σ(w_ic × R_c)")
+    print("  - Scaling: reconstruct mixture then rescale to match spot total counts")
+    print("  - Formula: X̂_i = scale_i × Σ(w_ic × R_c), scale_i matches spot_total_counts")
     print("="*60 + "\n")
     
     # Build GAT model and loss function
@@ -1072,8 +1088,8 @@ def main():
     print("Starting GAT deconvolution training...")
     
     trainer.train_gat_deconvolution(
-        st_data_normalized=st_X_normalized,  # For VAE embedding
-        st_data_raw=st_X_raw,                # For loss calculation
+        st_data_normalized=st_X_embed,  # For VAE embedding (now raw)
+        st_data_raw=st_X_raw,           # For loss calculation
         spatial_coords=spatial_coords,
         sample_name=sample_name,
         st_adata=st_adata,

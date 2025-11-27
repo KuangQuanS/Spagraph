@@ -187,22 +187,21 @@ class coEncoder:
                 marker_selection_method=marker_selection_method
             )
         
-        # 1.1 Augment marker genes with top HVGs from ST (union)
-        print("Augmenting markers with top ST HVGs (default top 1000)...")
-        st_hvg = st_adata.copy()
-        sc.pp.normalize_total(st_hvg, target_sum=1e4)
-        sc.pp.log1p(st_hvg)
-        sc.pp.highly_variable_genes(st_hvg, n_top_genes=min(1000, st_hvg.shape[1]), flavor='seurat')
-        st_hvg_genes = list(st_hvg.var.index[st_hvg.var['highly_variable']])
-        print(f"   ST HVGs selected: {len(st_hvg_genes)}")
+        # 1.1 Augment marker genes with top ST HVGs (union) - disabled
+        # print("Augmenting markers with top ST HVGs (default top 1000)...")
+        # st_hvg = st_adata.copy()
+        # sc.pp.normalize_total(st_hvg, target_sum=1e4)
+        # sc.pp.log1p(st_hvg)
+        # sc.pp.highly_variable_genes(st_hvg, n_top_genes=min(1000, st_hvg.shape[1]), flavor='seurat')
+        # st_hvg_genes = list(st_hvg.var.index[st_hvg.var['highly_variable']])
+        # print(f"   ST HVGs selected: {len(st_hvg_genes)}")
 
-        # Union while preserving marker order first
-        combined_genes = list(self.marker_genes)
-        for g in st_hvg_genes:
-            if g not in combined_genes:
-                combined_genes.append(g)
-        self.marker_genes = combined_genes
-        print(f"   Combined marker+HVG genes: {len(self.marker_genes)}")
+        # combined_genes = list(self.marker_genes)
+        # for g in st_hvg_genes:
+        #     if g not in combined_genes:
+        #         combined_genes.append(g)
+        # self.marker_genes = combined_genes
+        # print(f"   Combined marker+HVG genes: {len(self.marker_genes)}")
         
         # Save clustered adata for annotation
         self.sc_adata_clustered = sc_adata_clustered

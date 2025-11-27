@@ -329,7 +329,7 @@ class GATDeconvolution:
             spot_total_counts=self.spot_total_counts,
             celltype_expressions_full=celltype_expr_full,
             marker_gene_indices=marker_gene_indices
-        )
+        ).to(self.device)  # ✅ Move loss function to device
         
         gat_params = sum(p.numel() for p in self.gat_model.parameters())
         print(f"GAT parameters: {gat_params:,}")

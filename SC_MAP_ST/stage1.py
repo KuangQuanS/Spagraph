@@ -142,7 +142,7 @@ class coEncoder:
 
     def prepare_marker_gene_data(self, sc_adata: ad.AnnData, st_adata: ad.AnnData, 
                                top_n_per_type: int = 100, resolution: float = 0.5,
-                               precomputed_marker_file: str = None) -> Tuple:
+                               precomputed_marker_file: str = None, marker_selection_method: str = 'l1') -> Tuple:
         """Prepare training data based on marker genes
         
         Args:
@@ -153,6 +153,7 @@ class coEncoder:
             precomputed_marker_file: Path to precomputed marker genes file.
                                    If provided, will load marker genes directly from this file
                                    instead of computing them from scratch.
+            marker_selection_method: Method for marker gene selection ('l1', 'variance', 'correlation')
         """
 
         # 1. Compute clusters and marker genes  
@@ -182,7 +183,8 @@ class coEncoder:
                 sc_adata.copy(), 
                 top_n=top_n_per_type, 
                 resolution=resolution,
-                save_path=cluster_save_path
+                save_path=cluster_save_path,
+                marker_selection_method=marker_selection_method
             )
         
         # Save clustered adata for annotation
@@ -460,7 +462,7 @@ class coEncoder:
     def run_stage1_training(self, top_n_per_type=100, resolution=0.5, batch_size=256, n_epochs=100, 
                            lr=1e-3, beta=1.0, hidden_dims=[512, 256], latent_dim=128, loss_type='mse', 
                            lambda_mmd=0.0, pretrained_path=None, precomputed_marker_file=None, use_dual_decoder=False,
-                           aggregation_method='weighted'):
+                           aggregation_method='weighted', marker_selection_method='l1'):
         """Run stage 1 training: VAE on SC + ST with marker genes
         
         Args:
@@ -483,6 +485,7 @@ class coEncoder:
                 - 'mean': Simple average (fast, basic)
                 - 'median': Median aggregation (robust to outliers)
                 - 'weighted': Weighted average with UMI, representativeness, and marker activity (recommended)
+            marker_selection_method: Method for marker gene selection ('l1', 'variance', 'correlation')
         """
         print("="*60)
         print("Stage 1 Training: VAE (SC + ST, Marker Genes)")
@@ -512,7 +515,7 @@ class coEncoder:
         # 2. Prepare data based on marker genes (with test split for early stopping)
         train_X, test_X, train_modality, test_modality, y_train, y_test, sc_X_final, sc_X_full_all_count, sc_all_labels = self.prepare_marker_gene_data(
             sc_adata, st_adata, top_n_per_type=top_n_per_type, resolution=resolution, 
-            precomputed_marker_file=precomputed_marker_file
+            precomputed_marker_file=precomputed_marker_file, marker_selection_method=marker_selection_method
         )
         
         # 3. Build or load VAE
@@ -708,10 +711,14 @@ def main():
     parser.add_argument('--precomputed_marker_file', type=str, default=None,
                        help='Path to precomputed marker genes file. If provided, '
                             'marker genes will be loaded directly from this file instead of computing them.')
-    parser.add_argument('--aggregation_method', type=str, default='weighted', 
+    parser.add_argument('--aggregation_method', type=str, default='mean', 
                        choices=['mean', 'median', 'weighted'],
                        help='Cluster aggregation method: mean (simple average), median (robust to outliers), '
                             'weighted (UMI+representativeness+marker activity, recommended)')
+    parser.add_argument('--marker_selection_method', type=str, default='l1', 
+                       choices=['l1', 'variance', 'correlation'],
+                       help='Method for marker gene selection: l1 (L1-regularized logistic regression), '
+                            'variance (variance threshold), correlation (correlation-based filtering)')
     
     # Device argument
     parser.add_argument('--device', type=str, default=None,
@@ -743,7 +750,8 @@ def main():
         pretrained_path=args.pretrained_path,
         precomputed_marker_file=args.precomputed_marker_file,
         use_dual_decoder=args.use_dual_decoder,
-        aggregation_method=args.aggregation_method
+        aggregation_method=args.aggregation_method,
+        marker_selection_method=args.marker_selection_method
     )
     
 if __name__ == "__main__":

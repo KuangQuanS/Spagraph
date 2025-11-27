@@ -39,7 +39,8 @@ def compute_clusters_and_marker_genes(adata,
                                      top_n: int = 100, 
                                      min_fold_change: float = 1.5, 
                                      resolution: float = 0.5, 
-                                     save_path: Optional[str] = None) -> Tuple[List[str], pd.Series, sc.AnnData]:
+                                     save_path: Optional[str] = None,
+                                     marker_selection_method: str = 'l1') -> Tuple[List[str], pd.Series, sc.AnnData]:
     """
     Compute clusters and extract top marker genes for each cluster
     
@@ -49,6 +50,10 @@ def compute_clusters_and_marker_genes(adata,
         min_fold_change: Minimum fold change for marker selection
         resolution: Leiden clustering resolution
         save_path: Path to save marker genes (optional)
+        marker_selection_method: Method for final marker gene selection
+            - 'l1': Use L1-regularized logistic regression (Lasso)
+            - 'variance': Use variance threshold filtering
+            - 'correlation': Use correlation-based filtering
     
     Returns:
         marker_genes: List of marker genes
@@ -120,34 +125,79 @@ def compute_clusters_and_marker_genes(adata,
                 if len(selected_genes) >= top_n:
                     break
             
-            # Apply Lasso regression for further selection
+            # Apply marker selection method
             if len(selected_genes) > 0:
-                sub_adata = adata_full[:, selected_genes].copy()
-                y = (adata_full.obs['leiden'] == cluster).astype(int)
-                X = sub_adata.X
-                if hasattr(X, 'toarray'):
-                    X = X.toarray()
-                
-                X_scaled = X
-                
-                clf = LogisticRegression(
-                    C=1,
-                    penalty='l1',
-                    solver='saga',
-                    class_weight='balanced',
-                    max_iter=2000,
-                    n_jobs=-1
-                )
+                if marker_selection_method == 'l1':
+                    # Apply Lasso regression for further selection
+                    sub_adata = adata_full[:, selected_genes].copy()
+                    y = (adata_full.obs['leiden'] == cluster).astype(int)
+                    X = sub_adata.X
+                    if hasattr(X, 'toarray'):
+                        X = X.toarray()
+                    
+                    X_scaled = X
+                    
+                    clf = LogisticRegression(
+                        C=1,
+                        penalty='l1',
+                        solver='saga',
+                        class_weight='balanced',
+                        max_iter=2000,
+                        n_jobs=-1
+                    )
 
-                clf.fit(X_scaled, y)
-                coef = clf.coef_.ravel()
+                    clf.fit(X_scaled, y)
+                    coef = clf.coef_.ravel()
+                    
+                    final_selected_genes = [g for g, c in zip(selected_genes, coef) if abs(c) > 1e-5]
+                    final_selected_genes = sorted(final_selected_genes, key=lambda g: abs(coef[selected_genes.index(g)]), reverse=True)
+                    
+                    print(f"   {cluster}: {len(selected_genes)} -> {len(final_selected_genes)} (after L1)")
+                    
+                elif marker_selection_method == 'variance':
+                    # Apply variance threshold filtering
+                    sub_adata = adata_full[:, selected_genes].copy()
+                    X = sub_adata.X
+                    if hasattr(X, 'toarray'):
+                        X = X.toarray()
+                    
+                    # Calculate variance for each gene
+                    variances = np.var(X, axis=0)
+                    # Select top genes by variance
+                    top_indices = np.argsort(variances)[-min(len(selected_genes), top_n):]
+                    final_selected_genes = [selected_genes[i] for i in top_indices]
+                    
+                    print(f"   {cluster}: {len(selected_genes)} -> {len(final_selected_genes)} (after variance)")
+                    
+                elif marker_selection_method == 'correlation':
+                    # Apply correlation-based filtering
+                    sub_adata = adata_full[:, selected_genes].copy()
+                    X = sub_adata.X
+                    if hasattr(X, 'toarray'):
+                        X = X.toarray()
+                    
+                    # Calculate correlation with cluster membership
+                    y = (adata_full.obs['leiden'] == cluster).astype(int)
+                    correlations = []
+                    for i in range(X.shape[1]):
+                        corr = np.corrcoef(X[:, i], y)[0, 1]
+                        if not np.isnan(corr):
+                            correlations.append(abs(corr))
+                        else:
+                            correlations.append(0)
+                    
+                    # Select genes with highest absolute correlation
+                    top_indices = np.argsort(correlations)[-min(len(selected_genes), top_n):]
+                    final_selected_genes = [selected_genes[i] for i in top_indices]
+                    
+                    print(f"   {cluster}: {len(selected_genes)} -> {len(final_selected_genes)} (after correlation)")
+                    
+                else:
+                    raise ValueError(f"Unknown marker_selection_method: {marker_selection_method}. "
+                                   f"Choose from 'l1', 'variance', or 'correlation'")
                 
-                lasso_selected_genes = [g for g, c in zip(selected_genes, coef) if abs(c) > 1e-5]
-                lasso_selected_genes = sorted(lasso_selected_genes, key=lambda g: abs(coef[selected_genes.index(g)]), reverse=True)
-                
-                lasso_selected[cluster] = lasso_selected_genes
-                marker_genes.update(lasso_selected_genes)
-                print(f"   {cluster}: {len(selected_genes)} -> {len(lasso_selected_genes)} (after Lasso)")
+                lasso_selected[cluster] = final_selected_genes
+                marker_genes.update(final_selected_genes)
             else:
                 lasso_selected[cluster] = []
                 print(f"   {cluster}: 0 genes")

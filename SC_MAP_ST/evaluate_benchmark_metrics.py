@@ -148,6 +148,7 @@ def main():
     args = parser.parse_args()
 
     recon_df = pd.read_csv(args.reconstructed_csv, index_col=0)
+  
     gt_adata = sc.read_h5ad(args.ground_truth_h5ad)
 
     gt_df, pred_df, genes = align_data(recon_df, gt_adata)

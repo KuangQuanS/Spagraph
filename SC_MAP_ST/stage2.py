@@ -922,13 +922,13 @@ def main():
     # Loss function arguments
     parser.add_argument('--loss_lambda_mse', type=float, default=0.1,
                        help='MSE reconstruction loss weight')
-    parser.add_argument('--loss_lambda_pearson', type=float, default=0,
+    parser.add_argument('--loss_lambda_pearson', type=float, default=1,
                        help='Pearson correlation loss weight')
-    parser.add_argument('--loss_lambda_cosine', type=float, default=5,
+    parser.add_argument('--loss_lambda_cosine', type=float, default=2,
                        help='Cosine similarity loss weight')
-    parser.add_argument('--loss_lambda_gene_pearson', type=float, default=0,
+    parser.add_argument('--loss_lambda_gene_pearson', type=float, default=1,
                        help='Gene-level Pearson loss weight (across spots)')
-    parser.add_argument('--loss_lambda_gene_cosine', type=float, default=5,
+    parser.add_argument('--loss_lambda_gene_cosine', type=float, default=2,
                        help='Gene-level Cosine loss weight (across spots)')
     parser.add_argument('--loss_lambda_reg', type=float, default=0.5,
                        help='Weight regularization weight')
@@ -1029,7 +1029,6 @@ def main():
     # ✅ 保存原始 raw counts (marker genes only, 用于计算 loss)
     st_X_raw = st_subset.X.toarray() if hasattr(st_subset.X, 'toarray') else st_subset.X
     
-    # ✅ Normalize ST data for VAE embedding (consistent with Stage 1 training: 1e4)
     sc.pp.normalize_total(st_subset, target_sum=1e4)
     st_X_normalized = st_subset.X.toarray() if hasattr(st_subset.X, 'toarray') else st_subset.X
     

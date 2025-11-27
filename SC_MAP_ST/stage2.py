@@ -13,7 +13,6 @@ from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.preprocessing import LabelEncoder
 import matplotlib.pyplot as plt
 import seaborn as sns
-from skimage.metrics import structural_similarity
 from typing import List, Tuple, Dict, Optional
 import argparse
 import warnings
@@ -235,7 +234,7 @@ class GATDeconvolution:
        
     def build_gat_model(self, n_cell_types: int, gat_hidden_dim=64, gat_layers=3, 
                        gat_heads=4, dropout=0.1, loss_lambda_pearson=1.0, loss_lambda_mse=1.0,
-                       loss_lambda_cosine=1.0, 
+                       loss_lambda_cosine=1.0, loss_lambda_gene_pearson=0.0, loss_lambda_gene_cosine=0.0,
                        loss_lambda_reg=0.5, loss_lambda_sparse=0.01,
                        loss_lambda_proportion=1.0, spot_total_counts=None):
         """Build GAT deconvolution model
@@ -264,7 +263,7 @@ class GATDeconvolution:
             self.spot_total_counts = None
             
         print(f"Loss weights: λ_pearson={loss_lambda_pearson}, λ_mse={loss_lambda_mse}, "
-              f"λ_cosine={loss_lambda_cosine}, "
+              f"λ_cosine={loss_lambda_cosine}, λ_gene_pearson={loss_lambda_gene_pearson}, λ_gene_cosine={loss_lambda_gene_cosine}, "
               f"λ_reg={loss_lambda_reg}, λ_sparse={loss_lambda_sparse}, "
               f"λ_proportion={loss_lambda_proportion}")
         
@@ -323,6 +322,8 @@ class GATDeconvolution:
             lambda_pearson=loss_lambda_pearson,
             lambda_mse=loss_lambda_mse,
             lambda_cosine=loss_lambda_cosine,
+            lambda_gene_pearson=loss_lambda_gene_pearson,
+            lambda_gene_cosine=loss_lambda_gene_cosine,
             lambda_reg=loss_lambda_reg,
             lambda_sparse=loss_lambda_sparse,
             lambda_proportion=loss_lambda_proportion,
@@ -346,6 +347,8 @@ class GATDeconvolution:
             'pearson_loss': 0.0,
             'mse_loss': 0.0,
             'cosine_loss': 0.0,
+            'gene_pearson_loss': 0.0,
+            'gene_cosine_loss': 0.0,
             'weight_reg': 0.0,
             'sparsity_loss': 0.0,
             'proportion_loss': 0.0
@@ -451,6 +454,8 @@ class GATDeconvolution:
         pearson_losses = []
         mse_losses = []
         cos_losses = []
+        gene_pearson_losses = []
+        gene_cosine_losses = []
         weight_regs = []
         sparsity_regs = []
         diversity_losses = []
@@ -465,7 +470,7 @@ class GATDeconvolution:
         patience_pearson = 0
         patience_mse = 0
         patience_cosine = 0
-        patience = 10  # 每个损失的独立 patience
+        patience = 15  # 每个损失的独立 patience
         
         pbar = tqdm(range(n_epochs), desc="GAT Training", unit="epoch")
         for epoch in pbar:
@@ -481,6 +486,8 @@ class GATDeconvolution:
             pearson_losses.append(epoch_losses['pearson_loss'])
             mse_losses.append(epoch_losses['mse_loss'])
             cos_losses.append(epoch_losses['cosine_loss'])
+            gene_pearson_losses.append(epoch_losses.get('gene_pearson_loss', 0.0))
+            gene_cosine_losses.append(epoch_losses.get('gene_cosine_loss', 0.0))
             weight_regs.append(epoch_losses['weight_reg'])
             sparsity_regs.append(epoch_losses.get('sparsity_loss', 0.0))
             diversity_losses.append(0.0)  # 已禁用
@@ -521,9 +528,11 @@ class GATDeconvolution:
             # Update progress bar
             pbar.set_postfix({
                 'Total': f'{avg_total_loss:.4f}',
-                'Pearson': f'{current_pearson:.4f}',
                 'MSE': f'{current_mse:.4f}',
-                'Cosine': f'{current_cosine:.4f}',
+                'Spot_Cosine': f'{current_cosine:.4f}',
+                'Gene_Cosine': f"{epoch_losses.get('gene_cosine_loss', 0.0):.4f}",
+                'Pearson': f'{current_pearson:.4f}',
+                'Gene_Pearson': f"{epoch_losses.get('gene_pearson_loss', 0.0):.4f}",
                 'P_pat': patience_pearson,  # Patience counter
                 'M_pat': patience_mse,
                 'C_pat': patience_cosine
@@ -541,7 +550,8 @@ class GATDeconvolution:
         
         # Plot training curves
         self.plot_training_curves(train_losses, pearson_losses, mse_losses,
-                                 cos_losses, weight_regs, sparsity_regs, diversity_losses, hetero_losses, 
+                                 cos_losses, gene_pearson_losses, gene_cosine_losses,
+                                 weight_regs, sparsity_regs, diversity_losses, hetero_losses, 
                                  proportion_losses, sample_name)
         
         # Save final model
@@ -745,56 +755,6 @@ class GATDeconvolution:
         cosine_df.to_csv(cosine_csv, index=False)
         print(f"   Cosine similarities saved: {cosine_csv}")
 
-        # ============ Additional per-spot metrics: PCC, RMSE, JSD, SSIM ============
-        # Normalize to proportions for divergence / similarity metrics
-        reconstructed_prop = reconstructed_marker_expr / (reconstructed_marker_expr.sum(axis=1, keepdims=True) + 1e-8)
-        true_prop = true_expr / (true_expr.sum(axis=1, keepdims=True) + 1e-8)
-        reconstructed_log_prop = np.log1p(reconstructed_prop * 1e4)
-        true_log_prop = np.log1p(true_prop * 1e4)
-
-        # Pearson correlation coefficient (per spot) on log-proportions
-        pcc_values = []
-        for i in range(n_spots):
-            r = np.corrcoef(reconstructed_log_prop[i], true_log_prop[i])[0, 1]
-            if np.isnan(r):
-                r = 0.0
-            pcc_values.append(r)
-        pcc_df = pd.DataFrame({'spot_id': spot_barcodes, 'pcc': pcc_values})
-        pcc_csv = f"{self.output_dir}/{sample_name}_spot_pcc.csv"
-        pcc_df.to_csv(pcc_csv, index=False)
-        print(f"   Pearson correlations saved: {pcc_csv}")
-
-        # RMSE on log-counts (marker)
-        rmse_values = np.sqrt(np.mean((reconstructed_log - true_log) ** 2, axis=1))
-        rmse_df = pd.DataFrame({'spot_id': spot_barcodes, 'rmse': rmse_values})
-        rmse_csv = f"{self.output_dir}/{sample_name}_spot_rmse.csv"
-        rmse_df.to_csv(rmse_csv, index=False)
-        print(f"   RMSE saved: {rmse_csv}")
-
-        # Jensen-Shannon divergence on marker proportions (bounded in [0, ln2])
-        m = 0.5 * (reconstructed_prop + true_prop)
-        kl_rec = np.sum(reconstructed_prop * np.log((reconstructed_prop + 1e-8) / (m + 1e-8)), axis=1)
-        kl_true = np.sum(true_prop * np.log((true_prop + 1e-8) / (m + 1e-8)), axis=1)
-        jsd_values = 0.5 * (kl_rec + kl_true)
-        jsd_df = pd.DataFrame({'spot_id': spot_barcodes, 'jsd': jsd_values})
-        jsd_csv = f"{self.output_dir}/{sample_name}_spot_jsd.csv"
-        jsd_df.to_csv(jsd_csv, index=False)
-        print(f"   JSD saved: {jsd_csv}")
-
-        # Structural Similarity (SSIM) on marker proportions (in [0,1])
-        ssim_values = []
-        for i in range(n_spots):
-            rec_vec = reconstructed_prop[i].astype(np.float64)
-            true_vec = true_prop[i].astype(np.float64)
-            ssim_score = structural_similarity(true_vec, rec_vec, data_range=1.0)
-            if np.isnan(ssim_score):
-                ssim_score = 0.0
-            ssim_values.append(ssim_score)
-        ssim_df = pd.DataFrame({'spot_id': spot_barcodes, 'ssim': ssim_values})
-        ssim_csv = f"{self.output_dir}/{sample_name}_spot_ssim.csv"
-        ssim_df.to_csv(ssim_csv, index=False)
-        print(f"   SSIM saved: {ssim_csv}")
-        
         # Plot reconstruction quality curve (sorted by similarity)
         self.plot_reconstruction_quality_curve(cosine_similarities, sample_name)
         
@@ -870,7 +830,8 @@ class GATDeconvolution:
         print(f"      Spots with similarity > 0.8: {np.sum(cosine_similarities > 0.8)} ({100*np.sum(cosine_similarities > 0.8)/n_spots:.1f}%)")
     
     def plot_training_curves(self, train_losses, pearson_losses, mse_losses,
-                           cos_losses, weight_regs, sparsity_regs, diversity_losses, hetero_losses, 
+                           cos_losses, gene_pearson_losses, gene_cosine_losses,
+                           weight_regs, sparsity_regs, diversity_losses, hetero_losses, 
                            proportion_losses, sample_name):
         """Plot simplified training curves"""
         fig, axes = plt.subplots(1, 3, figsize=(18, 5))
@@ -887,7 +848,9 @@ class GATDeconvolution:
         # 2. Cosine + Pearson
         axes[1].plot(epochs, cos_losses, 'red', label='Cosine', linewidth=2.5)
         axes[1].plot(epochs, pearson_losses, 'orange', label='Pearson', linewidth=2.5)
-        axes[1].set_title('Cosine & Pearson', fontsize=14, fontweight='bold')
+        axes[1].plot(epochs, gene_cosine_losses, 'purple', label='Gene Cos', linewidth=2.0, linestyle='--')
+        axes[1].plot(epochs, gene_pearson_losses, 'brown', label='Gene PCC', linewidth=2.0, linestyle='--')
+        axes[1].set_title('Cosine & Pearson (spot/gene)', fontsize=14, fontweight='bold')
         axes[1].set_xlabel('Epochs', fontsize=12)
         axes[1].set_ylabel('Loss', fontsize=12)
         axes[1].legend(fontsize=11)
@@ -939,13 +902,13 @@ def main():
                        help='Dropout rate')
     
     # Clustering arguments
-    parser.add_argument('--resolution', type=float, default=0.5,
+    parser.add_argument('--resolution', type=float, default=2,
                        help='Leiden clustering resolution')
     
     # Graph construction arguments
-    parser.add_argument('--k_spatial', type=int, default=6,
+    parser.add_argument('--k_spatial', type=int, default=10,
                        help='Number of spatial neighbors (KNN)')
-    parser.add_argument('--k_celltype', type=int, default=10,
+    parser.add_argument('--k_celltype', type=int, default=20,
                        help='Number of nearest celltypes per spot (KNN)')
     
     # Training arguments
@@ -957,12 +920,16 @@ def main():
                        help='Batch size')
     
     # Loss function arguments
-    parser.add_argument('--loss_lambda_pearson', type=float, default=1.0,
-                       help='Pearson correlation loss weight')
-    parser.add_argument('--loss_lambda_mse', type=float, default=1.0,
+    parser.add_argument('--loss_lambda_mse', type=float, default=0.1,
                        help='MSE reconstruction loss weight')
-    parser.add_argument('--loss_lambda_cosine', type=float, default=1.0,
+    parser.add_argument('--loss_lambda_pearson', type=float, default=0,
+                       help='Pearson correlation loss weight')
+    parser.add_argument('--loss_lambda_cosine', type=float, default=5,
                        help='Cosine similarity loss weight')
+    parser.add_argument('--loss_lambda_gene_pearson', type=float, default=0,
+                       help='Gene-level Pearson loss weight (across spots)')
+    parser.add_argument('--loss_lambda_gene_cosine', type=float, default=5,
+                       help='Gene-level Cosine loss weight (across spots)')
     parser.add_argument('--loss_lambda_reg', type=float, default=0.5,
                        help='Weight regularization weight')
     parser.add_argument('--loss_lambda_sparse', type=float, default=0.01,
@@ -972,7 +939,7 @@ def main():
                        help='Global cell type proportion consistency loss weight (matches SC cluster distribution)')
     
     # Spot composition argument
-    parser.add_argument('--cells_per_spot', type=float, default=None,
+    parser.add_argument('--cells_per_spot', type=float, default=10,
                        help='Average number of cells per spot (default: auto-calculate from data, or 10.0 for Visium if auto-calc fails)')
     
     # Weight thresholding argument
@@ -1093,6 +1060,8 @@ def main():
         loss_lambda_pearson=args.loss_lambda_pearson,
         loss_lambda_mse=args.loss_lambda_mse,
         loss_lambda_cosine=args.loss_lambda_cosine,
+        loss_lambda_gene_pearson=args.loss_lambda_gene_pearson,
+        loss_lambda_gene_cosine=args.loss_lambda_gene_cosine,
         loss_lambda_reg=args.loss_lambda_reg,
         loss_lambda_sparse=args.loss_lambda_sparse,
         loss_lambda_proportion=args.loss_lambda_proportion,

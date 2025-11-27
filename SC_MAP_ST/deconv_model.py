@@ -546,11 +546,6 @@ class HeterogeneousGATDeconvolution(nn.Module):
         # 对于每个spot，找到最相似的k个celltype
         k_neighbors = min(self.k_celltype, n_cell_types)  # 防止k超过celltype数量
         
-        # Warning if k_celltype exceeds actual number of celltypes
-        if self.k_celltype > n_cell_types:
-            print(f"[WARNING] k_celltype ({self.k_celltype}) > n_cell_types ({n_cell_types}), "
-                  f"using k_neighbors={k_neighbors} (all celltypes will be connected)")
-        
         for spot_idx in range(n_spots):
             # 获取该spot与所有celltype的相似度
             similarities = similarity_matrix[spot_idx]
@@ -666,7 +661,7 @@ class HeterogeneousGATDeconvolution(nn.Module):
 class SpatialDeconvolutionLoss(nn.Module):
     """空间解卷积损失函数
     
-    L_total = λ_pearson·L_pearson + λ_mse·L_mse + λ_cosine·L_cosine + λ_reg·L_reg + λ_sparse·L_sparse + λ_proportion·L_proportion
+    L_total = λ_pearson·L_pearson + λ_mse·L_mse + λ_cosine·L_cosine + λ_reg·L_reg + λ_sparse·L_sparse + λ_proportion·L_proportion + λ_gene_pearson·L_gene_pearson + λ_gene_cosine·L_gene_cosine
     
     其中：
     - L_pearson: Pearson相关系数损失(基因表达相关性)
@@ -680,6 +675,7 @@ class SpatialDeconvolutionLoss(nn.Module):
     """
     
     def __init__(self, lambda_pearson=1.0, lambda_mse=1.0, lambda_cosine=1.0, 
+                 lambda_gene_pearson=0.0, lambda_gene_cosine=0.0,
                  lambda_reg=0.5, lambda_sparse=0.01,
                  lambda_proportion=1.0, sc_celltype_proportions=None, spot_total_counts=None,
                  celltype_expressions_full=None, marker_gene_indices=None):
@@ -687,6 +683,8 @@ class SpatialDeconvolutionLoss(nn.Module):
         self.lambda_pearson = lambda_pearson      # Pearson损失权重
         self.lambda_mse = lambda_mse              # MSE损失权重
         self.lambda_cosine = lambda_cosine        # Cosine损失权重
+        self.lambda_gene_pearson = lambda_gene_pearson  # 基因维度Pearson权重
+        self.lambda_gene_cosine = lambda_gene_cosine    # 基因维度Cosine权重
         self.lambda_reg = lambda_reg              # 权重正则化权重
         self.lambda_sparse = lambda_sparse        # 稀疏性正则化权重
         self.lambda_proportion = lambda_proportion  # 细胞类型比例一致性权重
@@ -801,7 +799,22 @@ class SpatialDeconvolutionLoss(nn.Module):
         # ============ 5. Sparsity Regularization Loss ============
         # 鼓励稀疏的注意力分布（每个spot只使用少数细胞类型）
         sparsity_loss = -torch.mean(attention_weights * torch.log(attention_weights + 1e-8))
-        
+
+        # ============ 6. 基因维度 Pearson/Cosine（跨 spot） ============
+        gene_pearson_loss = torch.tensor(0.0, device=attention_weights.device)
+        gene_cosine_loss = torch.tensor(0.0, device=attention_weights.device)
+        if reconstructed_log.shape[0] > 1:  # 至少两个spot才有意义
+            rec_T = reconstructed_log.transpose(0, 1)  # [n_genes, batch]
+            true_T = true_log.transpose(0, 1)
+            rec_centered = rec_T - rec_T.mean(dim=1, keepdim=True)
+            true_centered = true_T - true_T.mean(dim=1, keepdim=True)
+            num = (rec_centered * true_centered).sum(dim=1)
+            denom = torch.sqrt((rec_centered.pow(2).sum(dim=1)) * (true_centered.pow(2).sum(dim=1)) + 1e-8)
+            gene_corr = num / (denom + 1e-8)
+            gene_pearson_loss = 1.0 - gene_corr.mean()
+            gene_cos = F.cosine_similarity(rec_T, true_T, dim=1)
+            gene_cosine_loss = 1.0 - gene_cos.mean()
+
         proportion_loss = torch.tensor(0.0, device=attention_weights.device)
         
         if self.sc_celltype_proportions is not None:
@@ -824,15 +837,19 @@ class SpatialDeconvolutionLoss(nn.Module):
         total_loss = (self.lambda_pearson * L_pearson +
                      self.lambda_mse * L_mse +
                      self.lambda_cosine * L_cosine +
+                     self.lambda_gene_pearson * gene_pearson_loss +
+                     self.lambda_gene_cosine * gene_cosine_loss +
                      self.lambda_reg * weight_sum_loss +
                      self.lambda_sparse * sparsity_loss +
                      self.lambda_proportion * proportion_loss)
-        
+
         return {
             'total_loss': total_loss,
             'pearson_loss': L_pearson,
             'mse_loss': L_mse,
             'cosine_loss': L_cosine,
+            'gene_pearson_loss': gene_pearson_loss,
+            'gene_cosine_loss': gene_cosine_loss,
             'weight_reg': weight_sum_loss,
             'sparsity_loss': sparsity_loss,
             'proportion_loss': proportion_loss

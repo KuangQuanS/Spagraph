@@ -246,7 +246,7 @@ class coEncoder:
         print(f"   Number of clusters: {len(self.label_encoder.classes_)}")
 
         # ST
-        sc.pp.normalize_total(st_adata, target_sum=1e4)
+        # sc.pp.normalize_total(st_adata, target_sum=1e4)
         print(f" ST data (all genes): min={st_adata.X.min():.2f}, max={st_adata.X.max():.2f}, genes={st_adata.shape[1]}")
     
         available_genes = [g for g in self.marker_genes if g in st_adata.var.index]
@@ -272,18 +272,18 @@ class coEncoder:
         
         # 5. Split data for training (with test set for early stopping)
         sc_train, sc_test, y_train, y_test = train_test_split(
-            sc_X_final, sc_y, test_size=0.1, stratify=sc_y, random_state=42
+            sc_X_final, sc_y, test_size=0.01, stratify=sc_y, random_state=42
         )
         
         # Split full gene SC data with same indices
-        sc_train_indices = np.arange(len(sc_X_final))
+        # sc_train_indices = np.arange(len(sc_X_final))
 
-        sc_train_idx, sc_test_idx = train_test_split(
-            sc_train_indices, test_size=0.1, stratify=sc_y, random_state=42
-        )
+        # sc_train_idx, sc_test_idx = train_test_split(
+        #     sc_train_indices, test_size=0.01, stratify=sc_y, random_state=42
+        # )
         
         st_train, st_test = train_test_split(
-            st_X_final, test_size=0.1, random_state=42
+            st_X_final, test_size=0.01, random_state=42
         )
         
         # 6. Combine train and test sets
@@ -640,7 +640,7 @@ class coEncoder:
                 major_celltype = celltype_counts.index[0]
                 total_cells = celltype_counts.sum()
                 cluster_to_celltype[str(cluster_id)] = major_celltype
-                print(f"   Cluster {cluster_id} -> {major_celltype} ({celltype_counts.iloc[0]}/{total_cells} cells)")
+                #print(f"   Cluster {cluster_id} -> {major_celltype} ({celltype_counts.iloc[0]}/{total_cells} cells)")
             self.cluster_to_celltype = cluster_to_celltype
         else:
             print("="*60)
@@ -707,11 +707,11 @@ def main():
                        help='Number of epochs')
     parser.add_argument('--lr', type=float, default=5e-4,
                        help='Learning rate')
-    parser.add_argument('--beta', type=float, default=1.0,
+    parser.add_argument('--beta', type=float, default=0.1,
                        help='KL divergence weight (beta-VAE)')
-    parser.add_argument('--loss_type', type=str, default='mse', choices=['mse', 'zinb'],
+    parser.add_argument('--loss_type', type=str, default='zinb', choices=['mse', 'zinb'],
                        help='Reconstruction loss type: mse (default) or zinb')
-    parser.add_argument('--lambda_mmd', type=float, default=0.0,
+    parser.add_argument('--lambda_mmd', type=float, default=1.0,
                        help='MMD loss weight for modality alignment (0=disabled, 1.0=recommended)')
     parser.add_argument('--use_dual_decoder', type=bool, default=True,
                        help='Use DualDecoderVAE with separate SC/ST decoders for better modality alignment')

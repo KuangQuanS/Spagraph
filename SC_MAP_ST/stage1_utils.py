@@ -276,7 +276,7 @@ def compute_cluster_centers_and_expressions(
             cluster_expr_full = np.mean(cluster_full_data, axis=0)
             cluster_cell_weights[cluster_id] = None
             
-            print(f"      Cluster {cluster_id}: {n_cells} cells (mean aggregation)")
+            #print(f"      Cluster {cluster_id}: {n_cells} cells (mean aggregation)")
             
         elif aggregation_method == 'median':
             # Median aggregation
@@ -285,7 +285,7 @@ def compute_cluster_centers_and_expressions(
             cluster_expr_full = np.median(cluster_full_data, axis=0)
             cluster_cell_weights[cluster_id] = None
             
-            print(f"      Cluster {cluster_id}: {n_cells} cells (median aggregation)")
+            #print(f"      Cluster {cluster_id}: {n_cells} cells (median aggregation)")
             
         elif aggregation_method == 'weighted':
             # Weighted aggregation
@@ -324,9 +324,9 @@ def compute_cluster_centers_and_expressions(
             cluster_expression = np.sum(cluster_data * w_combined[:, np.newaxis], axis=0)
             cluster_expr_full = np.sum(cluster_full_data * w_combined[:, np.newaxis], axis=0)
             
-            print(f"      Cluster {cluster_id}: {n_cells} cells, "
-                  f"weight_range=[{w_combined.min():.4f}, {w_combined.max():.4f}], "
-                  f"top_weight_ratio={w_combined.max()/w_combined.mean():.2f}x")
+            # print(f"      Cluster {cluster_id}: {n_cells} cells, "
+            #       f"weight_range=[{w_combined.min():.4f}, {w_combined.max():.4f}], "
+            #       f"top_weight_ratio={w_combined.max()/w_combined.mean():.2f}x")
         else:
             raise ValueError(f"Unknown aggregation method: {aggregation_method}. "
                            f"Choose from 'mean', 'median', or 'weighted'")

@@ -472,7 +472,7 @@ class GATDeconvolution:
         patience_pearson = 0
         patience_mse = 0
         patience_cosine = 0
-        patience = 30  # 每个损失的独立 patience
+        patience = 200  # 每个损失的独立 patience
         
         pbar = tqdm(range(n_epochs), desc="GAT Training", unit="epoch")
         for epoch in pbar:
@@ -934,15 +934,15 @@ def main():
                        help='Batch size')
     
     # Loss function arguments
-    parser.add_argument('--loss_lambda_mse', type=float, default=0.1,
+    parser.add_argument('--loss_lambda_mse', type=float, default=0.01,
                        help='MSE reconstruction loss weight')
     parser.add_argument('--loss_lambda_pearson', type=float, default=1,
                        help='Pearson correlation loss weight')
-    parser.add_argument('--loss_lambda_cosine', type=float, default=1,
+    parser.add_argument('--loss_lambda_cosine', type=float, default=2,
                        help='Cosine similarity loss weight')
     parser.add_argument('--loss_lambda_gene_pearson', type=float, default=1,
                        help='Gene-level Pearson loss weight (across spots)')
-    parser.add_argument('--loss_lambda_gene_cosine', type=float, default=1,
+    parser.add_argument('--loss_lambda_gene_cosine', type=float, default=2,
                        help='Gene-level Cosine loss weight (across spots)')
     parser.add_argument('--loss_lambda_reg', type=float, default=0.5,
                        help='Weight regularization weight')
@@ -957,7 +957,7 @@ def main():
                        help='Average number of cells per spot (default: auto-calculate from data, or 10.0 for Visium if auto-calc fails)')
     
     # Weight thresholding argument
-    parser.add_argument('--weight_threshold', type=float, default=0.01,
+    parser.add_argument('--weight_threshold', type=float, default=0.0001,
                        help='Weight threshold for sparsification (default 0.01, i.e., 1%)')
     
     # Device argument
@@ -1020,7 +1020,7 @@ def main():
     print(f"Loading ST data: {args.st_file}")
     st_adata = sc.read_h5ad(args.st_file)
     st_adata.var_names_make_unique()  # Handle duplicate gene names
-    sc.pp.normalize_total(st_adata, target_sum=1e4)
+    # sc.pp.normalize_total(st_adata, target_sum=1e4)
     # Check spatial coordinates
     if 'spatial' not in st_adata.obsm:
         print(f"⚠️  ST data file {args.st_file} missing spatial coordinates. Falling back to embedding-based KNN for spot graph.")

@@ -1095,7 +1095,7 @@ def train_vae(vae, train_X, test_X, train_modality, test_modality, device,
     
     best_loss = float('inf')
     patience_counter = 0
-    patience = 20
+    patience = 200
     
     pbar = tqdm(range(n_epochs), desc="VAE Training", unit="epoch")
     for epoch in pbar:

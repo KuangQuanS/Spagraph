@@ -847,41 +847,21 @@ class GATDeconvolution:
                            cos_losses, gene_pearson_losses, gene_cosine_losses,
                            weight_regs, sparsity_regs, diversity_losses, hetero_losses, 
                            proportion_losses, sample_name):
-        """Plot simplified training curves"""
-        fig, axes = plt.subplots(1, 3, figsize=(18, 5))
-        
-        epochs = range(1, len(train_losses) + 1)
-        
-        # 1. Total loss
-        axes[0].plot(epochs, train_losses, 'b-', linewidth=2.5)
-        axes[0].set_title('Total Loss', fontsize=14, fontweight='bold')
-        axes[0].set_xlabel('Epochs', fontsize=12)
-        axes[0].set_ylabel('Loss', fontsize=12)
-        axes[0].grid(True, alpha=0.3, linestyle='--')
-        
-        # 2. Cosine + Pearson
-        axes[1].plot(epochs, cos_losses, 'red', label='Cosine', linewidth=2.5)
-        axes[1].plot(epochs, pearson_losses, 'orange', label='Pearson', linewidth=2.5)
-        axes[1].plot(epochs, gene_cosine_losses, 'purple', label='Gene Cos', linewidth=2.0, linestyle='--')
-        axes[1].plot(epochs, gene_pearson_losses, 'brown', label='Gene PCC', linewidth=2.0, linestyle='--')
-        axes[1].set_title('Cosine & Pearson (spot/gene)', fontsize=14, fontweight='bold')
-        axes[1].set_xlabel('Epochs', fontsize=12)
-        axes[1].set_ylabel('Loss', fontsize=12)
-        axes[1].legend(fontsize=11)
-        axes[1].grid(True, alpha=0.3, linestyle='--')
-        
-        # 3. MSE + Regularizers
-        axes[2].plot(epochs, mse_losses, 'green', label='MSE', linewidth=2.5)
-        axes[2].plot(epochs, weight_regs, 'brown', label='Weight Reg', linewidth=2.5)
-        axes[2].plot(epochs, sparsity_regs, 'gray', label='Sparsity', linewidth=2.5)
-        axes[2].plot(epochs, proportion_losses, 'olive', label='Proportion', linewidth=2.5)
-        axes[2].set_title('MSE & Regularizers', fontsize=14, fontweight='bold')
-        axes[2].set_xlabel('Epochs', fontsize=12)
-        axes[2].set_ylabel('Loss', fontsize=12)
-        axes[2].legend(fontsize=11)
-        axes[2].grid(True, alpha=0.3, linestyle='--')
-        
-        plt.suptitle(f'GAT Deconvolution Training - {sample_name}', fontsize=16, fontweight='bold', y=1.02)
+        """Plot training curves (single panel, excluding total loss)."""
+        epochs = range(1, len(pearson_losses) + 1)
+        fig, ax = plt.subplots(figsize=(10, 6))
+
+        ax.plot(epochs, cos_losses, color='#d62728', label='Cosine', linewidth=2.2)
+        ax.plot(epochs, pearson_losses, color='#ff7f0e', label='Pearson', linewidth=2.2)
+        ax.plot(epochs, mse_losses, color='#2ca02c', label='MSE (log space)', linewidth=2.0)
+        ax.plot(epochs, proportion_losses, color='#bcbd22', label='Proportion', linewidth=1.8)
+
+        ax.set_title(f'GAT Deconvolution Losses - {sample_name}', fontsize=15, fontweight='bold')
+        ax.set_xlabel('Epochs', fontsize=12)
+        ax.set_ylabel('Loss', fontsize=12)
+        ax.grid(True, alpha=0.3, linestyle='--')
+        ax.legend(fontsize=10, ncol=2)
+
         plt.tight_layout()
         plt.savefig(f"{self.output_dir}/gat_training_curves_{sample_name}.png", dpi=300, bbox_inches='tight')
         plt.close()
@@ -934,22 +914,22 @@ def main():
                        help='Batch size')
     
     # Loss function arguments
-    parser.add_argument('--loss_lambda_mse', type=float, default=0.01,
+    parser.add_argument('--loss_lambda_mse', type=float, default=1,
                        help='MSE reconstruction loss weight')
-    parser.add_argument('--loss_lambda_pearson', type=float, default=1,
+    parser.add_argument('--loss_lambda_pearson', type=float, default=5,
                        help='Pearson correlation loss weight')
-    parser.add_argument('--loss_lambda_cosine', type=float, default=2,
+    parser.add_argument('--loss_lambda_cosine', type=float, default=5,
                        help='Cosine similarity loss weight')
     parser.add_argument('--loss_lambda_gene_pearson', type=float, default=1,
                        help='Gene-level Pearson loss weight (across spots)')
-    parser.add_argument('--loss_lambda_gene_cosine', type=float, default=2,
+    parser.add_argument('--loss_lambda_gene_cosine', type=float, default=1,
                        help='Gene-level Cosine loss weight (across spots)')
     parser.add_argument('--loss_lambda_reg', type=float, default=0.5,
                        help='Weight regularization weight')
     parser.add_argument('--loss_lambda_sparse', type=float, default=0.01,
                        help='Sparsity regularization weight (Shannon entropy)')
 
-    parser.add_argument('--loss_lambda_proportion', type=float, default=1.0,
+    parser.add_argument('--loss_lambda_proportion', type=float, default=0.1,
                        help='Global cell type proportion consistency loss weight (matches SC cluster distribution)')
     
     # Spot composition argument
@@ -1020,7 +1000,11 @@ def main():
     print(f"Loading ST data: {args.st_file}")
     st_adata = sc.read_h5ad(args.st_file)
     st_adata.var_names_make_unique()  # Handle duplicate gene names
-    # sc.pp.normalize_total(st_adata, target_sum=1e4)
+    # Preserve raw counts before normalization/log
+    st_raw_all = st_adata.X.toarray() if hasattr(st_adata.X, "toarray") else st_adata.X
+    st_proc = st_adata.copy()
+    sc.pp.normalize_total(st_proc, target_sum=1e4)
+    sc.pp.log1p(st_proc)
     # Check spatial coordinates
     if 'spatial' not in st_adata.obsm:
         print(f"⚠️  ST data file {args.st_file} missing spatial coordinates. Falling back to embedding-based KNN for spot graph.")
@@ -1035,23 +1019,21 @@ def main():
     if trainer.all_genes is None:
         raise ValueError("all_genes not found in Stage 1 checkpoint! Please retrain Stage 1.")
     
-    # Filter ST to all_genes (used in Stage 1)
-    st_all_genes_subset = st_adata[:, [g for g in trainer.all_genes if g in st_adata.var_names]].copy()
-    st_all_genes_raw = st_all_genes_subset.X.toarray() if hasattr(st_all_genes_subset.X, 'toarray') else st_all_genes_subset.X
-    spot_total_counts = np.asarray(st_all_genes_raw.sum(axis=1)).ravel()  # Shape: [n_spots] - sum over ALL genes
+    # Filter ST to all_genes (used in Stage 1) on raw counts
+    st_all_genes_subset = st_raw_all if st_raw_all.shape[1] == len(trainer.all_genes) else \
+        st_raw_all[:, [list(st_proc.var_names).index(g) for g in trainer.all_genes]]
+    spot_total_counts = np.asarray(st_all_genes_subset.sum(axis=1)).ravel()  # Shape: [n_spots] - sum over ALL genes
     print(f"ST spot total counts (all {len(trainer.all_genes)} genes): min={spot_total_counts.min():.1f}, max={spot_total_counts.max():.1f}, mean={spot_total_counts.mean():.1f}")
     
-    # Extract ST marker genes (for loss calculation)
-    st_subset = st_adata[:, trainer.genes].copy()
+    # Extract ST marker genes (raw for loss, log1p norm for embedding)
+    st_subset_raw = st_adata[:, trainer.genes].copy()
+    st_subset_norm = st_proc[:, trainer.genes].copy()
     print(f"ST matching marker genes: {len(trainer.genes)}/{len(trainer.genes)}")
     
-    # ✅ 保存原始 raw counts (marker genes only, 用于计算 loss)
-    st_X_raw = st_subset.X.toarray() if hasattr(st_subset.X, 'toarray') else st_subset.X
-
-    # Stage 1 now uses raw counts; feed raw counts to the encoder for embedding
-    st_X_embed = st_X_raw.copy()
+    st_X_raw = st_subset_raw.X.toarray() if hasattr(st_subset_raw.X, 'toarray') else st_subset_raw.X
+    st_X_embed = st_subset_norm.X.toarray() if hasattr(st_subset_norm.X, 'toarray') else st_subset_norm.X
     
-    print(f"ST data: embedding(raw)={st_X_embed.shape}, raw_for_loss={st_X_raw.shape}")
+    print(f"ST data: embedding(log1p norm)={st_X_embed.shape}, raw_for_loss={st_X_raw.shape}")
     
     # ✅ No need for cells_per_spot with this approach!
     # We use spot_total_counts as scaling factor directly

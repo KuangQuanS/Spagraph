@@ -40,7 +40,8 @@ def compute_clusters_and_marker_genes(adata,
                                      min_fold_change: float = 1.5, 
                                      resolution: float = 0.5, 
                                      save_path: Optional[str] = None,
-                                     marker_selection_method: str = 'l1') -> Tuple[List[str], pd.Series, sc.AnnData]:
+                                     marker_selection_method: str = 'l1',
+                                     min_cells_per_cluster: int = 2) -> Tuple[List[str], pd.Series, sc.AnnData]:
     """
     Compute clusters and extract top marker genes for each cluster
     
@@ -92,6 +93,18 @@ def compute_clusters_and_marker_genes(adata,
     
     # Transfer clustering results to full dataset
     adata_full.obs['leiden'] = adata.obs['leiden'].copy()
+
+    # Drop clusters with too few cells
+    counts = adata_full.obs['leiden'].value_counts()
+    small_clusters = counts[counts < min_cells_per_cluster].index.tolist()
+    if small_clusters:
+        print(f"Dropping clusters with < {min_cells_per_cluster} cells: {small_clusters}")
+        keep_mask = ~adata_full.obs['leiden'].isin(small_clusters)
+        removed = int((~keep_mask).sum())
+        print(f"   Removed {removed} cells")
+        adata_full = adata_full[keep_mask].copy()
+        if hasattr(adata_full.obs['leiden'], 'cat'):
+            adata_full.obs['leiden'] = adata_full.obs['leiden'].cat.remove_unused_categories()
     
     # Compute marker genes for each cluster
     sc.tl.rank_genes_groups(

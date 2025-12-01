@@ -184,7 +184,8 @@ class coEncoder:
                 top_n=top_n_per_type, 
                 resolution=resolution,
                 save_path=cluster_save_path,
-                marker_selection_method=marker_selection_method
+                marker_selection_method=marker_selection_method,
+                min_cells_per_cluster=2
             )
         
         # 1.1 Augment marker genes with top ST HVGs (union) - disabled
@@ -213,24 +214,23 @@ class coEncoder:
         self.sc_clusters = sc_clusters
         self.resolution = resolution
         
-        # 2. Process SC data (extract marker genes then normalize)
-        print("Processing SC data...")
-                
-        # IMPORTANT: Use ORIGINAL sc_adata (raw counts), NOT sc_adata_clustered (which has been scaled)
-        # sc_adata_clustered was used for clustering but contains scaled/transformed data
-        # We need raw counts for VAE training
-        
-        # Get the original SC data filtered to cells that passed clustering
+        # 2. Process SC data (extract marker genes then normalize + log1p)
+        print("Processing SC data (log1p on library-normalized counts)...")
+
+        # Preserve raw counts for full-gene aggregation later
+        sc_raw_all = sc_adata.X.toarray() if hasattr(sc_adata.X, 'toarray') else sc_adata.X
+
+        # Use log1p(normalize_total) for VAE training / clustering features
         sc_adata_count = sc_adata[sc_clusters.index].copy()
         sc.pp.normalize_total(sc_adata_count, target_sum=1e4)
-        # Verify we have raw counts (not scaled data)
-        print(f" SC data (all genes): min={sc_adata_count.X.min():.2f}, max={sc_adata_count.X.max():.2f}, genes={sc_adata_count.shape[1]}")
+        sc.pp.log1p(sc_adata_count)
+        print(f" SC data (all genes, log1p norm): min={sc_adata_count.X.min():.2f}, max={sc_adata_count.X.max():.2f}, genes={sc_adata_count.shape[1]}")
     
-        # Extract full gene expression (count version)
+        # Extract full gene expression (log1p norm) for training features
         sc_X_full_count = sc_adata_count.X.toarray() if hasattr(sc_adata_count.X, 'toarray') else sc_adata_count.X
         sc_all_genes = list(sc_adata_count.var.index)
         
-        # Extract marker genes (count for training)
+        # Extract marker genes (log1p norm for training)
         sc_subset = sc_adata_count[:, sc_adata_count.var.index.isin(self.marker_genes)].copy()
         sc_X = sc_subset.X.toarray() if hasattr(sc_subset.X, 'toarray') else sc_subset.X
         sc_labels = sc_clusters.values
@@ -245,12 +245,15 @@ class coEncoder:
         print(f"   SC data: {sc_X.shape}")
         print(f"   Number of clusters: {len(self.label_encoder.classes_)}")
 
-        # ST
-        # sc.pp.normalize_total(st_adata, target_sum=1e4)
-        print(f" ST data (all genes): min={st_adata.X.min():.2f}, max={st_adata.X.max():.2f}, genes={st_adata.shape[1]}")
+        # ST (log1p on library-normalized counts)
+        st_raw_all = st_adata.X.toarray() if hasattr(st_adata.X, 'toarray') else st_adata.X
+        st_proc = st_adata.copy()
+        sc.pp.normalize_total(st_proc, target_sum=1e4)
+        sc.pp.log1p(st_proc)
+        print(f" ST data (all genes, log1p norm): min={st_proc.X.min():.2f}, max={st_proc.X.max():.2f}, genes={st_proc.shape[1]}")
     
-        available_genes = [g for g in self.marker_genes if g in st_adata.var.index]
-        st_subset = st_adata[:, available_genes].copy()
+        available_genes = [g for g in self.marker_genes if g in st_proc.var.index]
+        st_subset = st_proc[:, available_genes].copy()
         
         st_X = st_subset.X.toarray() if hasattr(st_subset.X, 'toarray') else st_subset.X
         print("="*60)
@@ -304,7 +307,7 @@ class coEncoder:
         print(f"   Test set: {test_X.shape} (SC: {len(sc_test)}, ST: {len(st_test)})")
         
         # ✅ Keep ALL SC data (train + test) for cluster embedding computation
-        sc_X_full_all_count = sc_X_full_count  # All cells
+        sc_X_full_all_count = sc_raw_all  # All cells (raw counts, no norm/log)
         sc_all_indices = np.arange(len(sc_X_final))  # All indices
         sc_all_labels = sc_y  # All labels
         
@@ -709,9 +712,9 @@ def main():
                        help='Learning rate')
     parser.add_argument('--beta', type=float, default=0.1,
                        help='KL divergence weight (beta-VAE)')
-    parser.add_argument('--loss_type', type=str, default='zinb', choices=['mse', 'zinb'],
+    parser.add_argument('--loss_type', type=str, default='mse', choices=['mse', 'zinb'],
                        help='Reconstruction loss type: mse (default) or zinb')
-    parser.add_argument('--lambda_mmd', type=float, default=1.0,
+    parser.add_argument('--lambda_mmd', type=float, default=0,
                        help='MMD loss weight for modality alignment (0=disabled, 1.0=recommended)')
     parser.add_argument('--use_dual_decoder', type=bool, default=True,
                        help='Use DualDecoderVAE with separate SC/ST decoders for better modality alignment')

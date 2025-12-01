@@ -798,8 +798,8 @@ class SpatialDeconvolutionLoss(nn.Module):
         L_pearson = 1.0 - pearson_corr.mean()  # 1 - 相关系数,越小越好
         
         # ============ 2. MSE Loss (重建误差) ============
-        # MSE 在 count 空间计算（保持比例线性） - 只在 marker 基因上
-        L_mse = F.mse_loss(reconstructed_spot_marker, true_spot_expression)
+        # 改为在 log1p 空间计算，聚焦表达模式差异，减弱高表达基因主导
+        L_mse = F.mse_loss(reconstructed_log, true_log)
         
         # ============ 3. Cosine Similarity Loss ============
         # Cosine相似度在 log-normalized 空间计算（避免高表达基因主导）

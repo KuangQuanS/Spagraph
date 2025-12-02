@@ -37,6 +37,12 @@ def plot_heatmaps(coords, gt_vec, pred_vec, target_gene: str, output_png: str, l
         gt_vec = np.log1p(gt_vec)
         pred_vec = np.log1p(pred_vec)
 
+    # Basic stats
+    def summarize(name, arr):
+        return f"{name}: mean={arr.mean():.4f}, median={np.median(arr):.4f}, min={arr.min():.4f}, max={arr.max():.4f}"
+    print(summarize("GT", gt_vec))
+    print(summarize("Pred", pred_vec))
+
     all_vals = np.concatenate([gt_vec, pred_vec])
     vmax = np.percentile(all_vals, clip_percentile)
     vmin = np.percentile(all_vals, 100 - clip_percentile) if log1p else 0.0

@@ -626,19 +626,31 @@ class GATDeconvolution:
         spot_barcodes = list(st_adata.obs.index)
         
         # Full gene expression matrix (use count version with spot_total_counts)
-        if self.spot_total_counts is None:
-            raise ValueError("spot_total_counts not set; cannot reconstruct expressions without spot totals.")
         reconstructed_full_expr = None
         if self.celltype_expressions_full is not None and all(expr is not None for expr in self.celltype_expressions_full):
             print("   Reconstructing all gene expression...")
-            celltype_expr_full = np.array(self.celltype_expressions_full)
+            celltype_expr_full = np.array(self.celltype_expressions_full)  # [n_clusters, n_all_genes]
+            celltype_expr_marker = self.celltype_expressions.cpu().numpy()  # [n_clusters, n_marker_genes]
             
-            # 使用原始/计数尺度的 cluster 表达，先线性混合，再按 spot 总计归一到真实 total counts
+            # ✅ 使用 marker 基因的 total counts 计算 scale factor
+            # 1. 重建的 marker 基因表达 (raw count scale)
+            mixed_expr_marker = np.dot(deconv_weights, celltype_expr_marker)  # [n_spots, n_marker_genes]
+            reconstructed_marker_total = mixed_expr_marker.sum(axis=1)  # [n_spots]
+            
+            # 2. 真实 spot 的 marker 基因 total counts (raw count, 已在 main 中计算)
+            if self.spot_total_counts is None:
+                raise ValueError("spot_total_counts not set; cannot compute scale factor.")
+            spot_marker_total = self.spot_total_counts[:len(spot_barcodes)]  # [n_spots]
+            
+            # 3. 计算 scale factor: spot真实值 / 重建值
+            scale = spot_marker_total / (reconstructed_marker_total + 1e-8)
+            print(f"   ✅ Scale factor computed from MARKER genes ({len(self.genes)} genes)")
+            print(f"      Spot marker total (real): mean={spot_marker_total.mean():.1f}")
+            print(f"      Reconstructed marker total: mean={reconstructed_marker_total.mean():.1f}")
+            print(f"      Scale factor: min={scale.min():.4f}, max={scale.max():.4f}, mean={scale.mean():.4f}")
+            
+            # 4. 应用 scale 到全基因重建表达
             mixed_expr_full = np.dot(deconv_weights, celltype_expr_full)  # [n_spots, n_all_genes]
-            
-            spot_total_full = self.spot_total_counts[:len(spot_barcodes)]
-            mixed_totals = mixed_expr_full.sum(axis=1)
-            scale = spot_total_full / (mixed_totals + 1e-8)
             reconstructed_full_expr = mixed_expr_full * scale[:, np.newaxis]
             
             # Get full gene names
@@ -657,7 +669,7 @@ class GATDeconvolution:
             print(f"   Saved: {full_expr_file}")
         else:
             print("   ⚠️  Warning: Full gene expressions not available, skipping reconstruction")
-        
+
         # 3. Cell type composition matrix (spot × cluster/celltype)
         print("   Cell type composition...")
 
@@ -1002,37 +1014,17 @@ def main():
         spatial_coords = st_adata.obsm['spatial']
         trainer.use_embedding_knn = False
     
-    # ✅ 计算全部基因的 spot total counts (用于重建时的 scaling)
-    # 使用 Stage 1 的 all_genes 列表，按原始计数尺度
-    if trainer.all_genes is None:
-        raise ValueError("all_genes not found in Stage 1 checkpoint! Please retrain Stage 1.")
-    
-    # Filter ST to all_genes (used in Stage 1) on raw counts
-    st_all_genes_subset = st_raw_all if st_raw_all.shape[1] == len(trainer.all_genes) else \
-        st_raw_all[:, [list(st_proc.var_names).index(g) for g in trainer.all_genes]]
-    spot_total_counts = np.asarray(st_all_genes_subset.sum(axis=1)).ravel()  # Shape: [n_spots] - sum over ALL genes
-    print(f"ST spot total counts (all {len(trainer.all_genes)} genes): min={spot_total_counts.min():.1f}, max={spot_total_counts.max():.1f}, mean={spot_total_counts.mean():.1f}")
-    
     # Extract ST marker genes (raw for loss, log1p norm for embedding)
     st_subset_raw = st_adata[:, trainer.genes].copy()
     st_subset_norm = st_proc[:, trainer.genes].copy()
-    print(f"ST matching marker genes: {len(trainer.genes)}/{len(trainer.genes)}")
-    
+
     st_X_raw = st_subset_raw.X.toarray() if hasattr(st_subset_raw.X, 'toarray') else st_subset_raw.X
     st_X_embed = st_subset_norm.X.toarray() if hasattr(st_subset_norm.X, 'toarray') else st_subset_norm.X
-    
-    print(f"ST data: embedding(log1p norm)={st_X_embed.shape}, raw_for_loss={st_X_raw.shape}")
-    
-    # ✅ No need for cells_per_spot with this approach!
-    # We use spot_total_counts as scaling factor directly
-    print("\n" + "="*60)
-    print("Using NEW scaling approach:")
-    print("  - SC cluster expressions: use raw/count-scale averages from Stage 1")
-    print("  - ST spots: raw counts")
-    print("  - Scaling: reconstruct mixture then rescale to match spot total counts")
-    print("  - Formula: X̂_i = scale_i × Σ(w_ic × R_c), scale_i matches spot_total_counts")
-    print("="*60 + "\n")
-    
+
+    # ✅ 计算 marker 基因的 spot total counts (用于缩放)
+    spot_total_counts = np.asarray(st_X_raw.sum(axis=1)).ravel()
+    print(f"ST spot total counts (marker {len(trainer.genes)} genes): min={spot_total_counts.min():.1f}, max={spot_total_counts.max():.1f}, mean={spot_total_counts.mean():.1f}")
+ 
     # Build GAT model and loss function
     print("="*60)
     print(f"Building GAT deconvolution model (clusters: {n_clusters})...")

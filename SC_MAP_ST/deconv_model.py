@@ -766,11 +766,12 @@ class SpatialDeconvolutionLoss(nn.Module):
             self.celltype_expressions_full   # [n_cell_types, n_all_genes]
         )  # [n_spots, n_all_genes]
 
-        # scale: 使重建后的总 counts 与真实 spot_total_counts 对齐
+        # scale: 使用 marker 子集的总量与真实 spot_total_counts（基于 marker）对齐
         spot_counts = batch_spot_total_counts.unsqueeze(-1)  # [batch_size, 1]
-        mixed_totals = mixed_expr_full.sum(dim=1, keepdim=True)  # [batch_size, 1]
-        scale = spot_counts / (mixed_totals + 1e-8)
-
+        mixed_marker_totals = mixed_expr_full[:, self.marker_gene_indices].sum(dim=1, keepdim=True)  # [batch_size, 1]
+        scale = spot_counts / (mixed_marker_totals + 1e-8)
+        # 仅放大，不再对 scale<1 的样本缩小，避免进一步压缩表达
+    
         reconstructed_spot_full = mixed_expr_full * scale  # [n_spots, n_all_genes]
         
         # 提取 marker 基因: 只在 marker 基因上计算 loss

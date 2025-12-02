@@ -43,14 +43,13 @@ def plot_heatmaps(coords, gt_vec, pred_vec, target_gene: str, output_png: str, l
     print(summarize("GT", gt_vec))
     print(summarize("Pred", pred_vec))
 
-    all_vals = np.concatenate([gt_vec, pred_vec])
-    vmax = np.percentile(all_vals, clip_percentile)
-    vmin = np.percentile(all_vals, 100 - clip_percentile) if log1p else 0.0
-
     fig, axes = plt.subplots(1, 2, figsize=(12, 5))
     titles = ["Ground truth", "Prediction"]
     data = [gt_vec, pred_vec]
     for ax, vals, title in zip(axes, data, titles):
+        # 每个子图单独做颜色缩放，相当于“两个 y 轴各自最大值”
+        vmax = np.percentile(vals, clip_percentile)
+        vmin = np.percentile(vals, 100 - clip_percentile) if log1p else 0.0
         sc = ax.scatter(coords[:, 0], coords[:, 1], c=vals, cmap="viridis", s=8, vmin=vmin, vmax=vmax)
         ax.set_title(f"{title} - {target_gene}")
         ax.set_xlabel("x")

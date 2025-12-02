@@ -916,7 +916,7 @@ def main():
                        help='Batch size')
     
     # Loss function arguments
-    parser.add_argument('--loss_lambda_mse', type=float, default=1,
+    parser.add_argument('--loss_lambda_mse', type=float, default=0.1,
                        help='MSE reconstruction loss weight')
     parser.add_argument('--loss_lambda_pearson', type=float, default=5,
                        help='Pearson correlation loss weight')

@@ -716,7 +716,7 @@ def main():
                        help='KL divergence weight (beta-VAE)')
     parser.add_argument('--loss_type', type=str, default='mse', choices=['mse', 'zinb'],
                        help='Reconstruction loss type: mse (default) or zinb')
-    parser.add_argument('--lambda_mmd', type=float, default=0.05,
+    parser.add_argument('--lambda_mmd', type=float, default=0.01,
                        help='MMD loss weight for modality alignment (0=disabled, 1.0=recommended)')
     parser.add_argument('--use_dual_decoder', type=bool, default=True,
                        help='Use DualDecoderVAE with separate SC/ST decoders for better modality alignment')

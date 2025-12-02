@@ -220,3 +220,6 @@ SC_MAP_ST/*_results
 results/*
 SC_MAP_ST/evalutate/*_results/
 SC_MAP_ST/figures/
+SC_MAP_ST/evaluate/D*
+SC_MAP_ST/evaluate/GSE*
+SC_MAP_ST/evaluate/STAR*

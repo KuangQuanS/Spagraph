@@ -662,24 +662,14 @@ class GATDeconvolution:
         print("   Cell type composition...")
 
         cluster_list = list(self.label_encoder.classes_)
-        
-        # Get cluster-to-celltype mapping from checkpoint if available
-        checkpoint_cluster_to_celltype = {}
 
-        sc_clustered_path = f"{os.path.dirname(self.stage1_model_path)}/sc_adata_clustered.h5ad"
-        
-        if os.path.exists(sc_clustered_path):
-            # Load the clustered adata to get cluster-celltype mapping
-            sc_clustered = sc.read_h5ad(sc_clustered_path)
-            if 'leiden' in sc_clustered.obs.columns:
-                for cluster_id in sorted(sc_clustered.obs['leiden'].unique()):
-                    cluster_mask = sc_clustered.obs['leiden'] == cluster_id
-                    if 'cell_type' in sc_clustered.obs.columns:
-                        celltype_counts = sc_clustered.obs[cluster_mask]['cell_type'].value_counts()
-                    else:
-                        celltype_counts = sc_clustered.obs[cluster_mask]['celltype'].value_counts()
-                    major_celltype = celltype_counts.index[0]
-                    checkpoint_cluster_to_celltype[str(cluster_id)] = major_celltype
+        # Get cluster-to-celltype mapping only from Stage 1 checkpoint/npz
+        checkpoint_cluster_to_celltype = {}
+        if self.cluster_to_celltype:
+            checkpoint_cluster_to_celltype = {str(k): str(v) for k, v in self.cluster_to_celltype.items()}
+            print(f"   Using cluster→celltype mapping from Stage 1 checkpoint ({len(checkpoint_cluster_to_celltype)} entries).")
+        else:
+            print("   ⚠️  No cluster→celltype mapping found in Stage 1 checkpoint; using cluster IDs as column names.")
         
         # Map cluster columns to celltype names
         celltype_columns = []
@@ -886,9 +876,9 @@ def main():
                        help='Output directory path')
 
     # GAT model arguments
-    parser.add_argument('--gat_hidden_dim', type=int, default=64,
+    parser.add_argument('--gat_hidden_dim', type=int, default=512,
                        help='GAT hidden layer dimension')
-    parser.add_argument('--gat_layers', type=int, default=3,
+    parser.add_argument('--gat_layers', type=int, default=4,
                        help='Number of GAT layers')
     parser.add_argument('--gat_heads', type=int, default=4,
                        help='Number of GAT attention heads')
@@ -900,17 +890,17 @@ def main():
                        help='Leiden clustering resolution')
     
     # Graph construction arguments
-    parser.add_argument('--k_spatial', type=int, default=10,
+    parser.add_argument('--k_spatial', type=int, default=5,
                        help='Number of spatial neighbors (KNN)')
-    parser.add_argument('--k_celltype', type=int, default=20,
+    parser.add_argument('--k_celltype', type=int, default=30,
                        help='Number of nearest celltypes per spot (KNN)')
     
     # Training arguments
-    parser.add_argument('--n_epochs', type=int, default=50,
+    parser.add_argument('--n_epochs', type=int, default=250,
                        help='Number of epochs')
-    parser.add_argument('--lr', type=float, default=1e-3,
+    parser.add_argument('--lr', type=float, default=5e-3,
                        help='Learning rate')
-    parser.add_argument('--batch_size', type=int, default=512,
+    parser.add_argument('--batch_size', type=int, default=1024,
                        help='Batch size')
     
     # Loss function arguments
@@ -928,16 +918,14 @@ def main():
                        help='Weight regularization weight')
     parser.add_argument('--loss_lambda_sparse', type=float, default=0.01,
                        help='Sparsity regularization weight (Shannon entropy)')
-
     parser.add_argument('--loss_lambda_proportion', type=float, default=0.1,
                        help='Global cell type proportion consistency loss weight (matches SC cluster distribution)')
-    
     # Spot composition argument
     parser.add_argument('--cells_per_spot', type=float, default=10,
                        help='Average number of cells per spot (default: auto-calculate from data, or 10.0 for Visium if auto-calc fails)')
     
     # Weight thresholding argument
-    parser.add_argument('--weight_threshold', type=float, default=0.0001,
+    parser.add_argument('--weight_threshold', type=float, default=0.001,
                        help='Weight threshold for sparsification (default 0.01, i.e., 1%)')
     
     # Device argument

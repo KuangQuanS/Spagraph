@@ -207,7 +207,7 @@ class coEncoder:
         # Save clustered adata for annotation
         self.sc_adata_clustered = sc_adata_clustered
         cluster_adata_file = f"{self.output_dir}/sc_adata_clustered.h5ad"
-        sc_adata_clustered.write_h5ad(cluster_adata_file)
+        # sc_adata_clustered.write_h5ad(cluster_adata_file)
         print(f"Saved clustered SC adata: {cluster_adata_file}")
         
         # Save clustering info and resolution
@@ -440,6 +440,8 @@ class coEncoder:
         print(f"   ✓ Expressions (full): {len(expressions_full_list)} clusters × {expressions_full_list[0].shape[0]} genes")
         if celltype_mapping is not None:
             print(f"   ✓ Celltype mapping: {len(celltype_mapping)} clusters")
+        else:
+            print("   ⚠️ No celltype mapping found; Stage 2 will fall back to cluster IDs. Make sure sc_adata_clustered.obs contains 'cell_type' or 'celltype'.")
         print(f"✅ Saved cluster data: {filepath}")
     
     def load_vae(self, filepath):
@@ -692,7 +694,7 @@ def main():
                        help='Output directory path')
     
     # Clustering arguments
-    parser.add_argument('--resolution', type=float, default=0.5,
+    parser.add_argument('--resolution', type=float, default=4,
                        help='Leiden clustering resolution')
     
     # Model arguments
@@ -704,9 +706,9 @@ def main():
                        help='VAE latent space dimension')
     
     # Training arguments
-    parser.add_argument('--batch_size', type=int, default=256,
+    parser.add_argument('--batch_size', type=int, default=1024,
                        help='Batch size')
-    parser.add_argument('--n_epochs', type=int, default=100,
+    parser.add_argument('--n_epochs', type=int, default=150,
                        help='Number of epochs')
     parser.add_argument('--lr', type=float, default=5e-4,
                        help='Learning rate')
@@ -714,7 +716,7 @@ def main():
                        help='KL divergence weight (beta-VAE)')
     parser.add_argument('--loss_type', type=str, default='mse', choices=['mse', 'zinb'],
                        help='Reconstruction loss type: mse (default) or zinb')
-    parser.add_argument('--lambda_mmd', type=float, default=0,
+    parser.add_argument('--lambda_mmd', type=float, default=0.05,
                        help='MMD loss weight for modality alignment (0=disabled, 1.0=recommended)')
     parser.add_argument('--use_dual_decoder', type=bool, default=True,
                        help='Use DualDecoderVAE with separate SC/ST decoders for better modality alignment')

@@ -35,6 +35,46 @@ def align_data(recon_df: pd.DataFrame, gt_adata):
     return gt_df, recon_df, list(shared_genes)
 
 
+def align_csv_pair(pred_df: pd.DataFrame, gt_df: pd.DataFrame, target_gene: str):
+    """Align two CSV matrices on spots and target gene; return vectors for PCC."""
+    shared_spots = pred_df.index.intersection(gt_df.index)
+    if len(shared_spots) == 0:
+        raise ValueError("No overlapping spots between predicted and ground truth CSVs.")
+
+    pred_df = pred_df.loc[shared_spots]
+    gt_df = gt_df.loc[shared_spots]
+
+    shared_genes = pred_df.columns.intersection(gt_df.columns)
+    if target_gene not in shared_genes:
+        raise ValueError(f"Target gene '{target_gene}' not found in overlapping genes.")
+
+    pred_vec = pred_df[target_gene].astype(float)
+    gt_vec = gt_df[target_gene].astype(float)
+
+    pred_vec = pred_vec.replace([np.inf, -np.inf], np.nan).fillna(0)
+    gt_vec = gt_vec.replace([np.inf, -np.inf], np.nan).fillna(0)
+
+    return gt_vec.values, pred_vec.values
+
+
+def compute_pcc(true_vec: np.ndarray, pred_vec: np.ndarray) -> float:
+    """Compute Pearson correlation for two 1D arrays; returns nan if zero variance."""
+    eps = 1e-8
+    finite_mask = np.isfinite(true_vec) & np.isfinite(pred_vec)
+    if finite_mask.sum() == 0:
+        return np.nan
+    true_vec = true_vec[finite_mask]
+    pred_vec = pred_vec[finite_mask]
+
+    t_mean = true_vec.mean()
+    p_mean = pred_vec.mean()
+    t_std = true_vec.std()
+    p_std = pred_vec.std()
+    if t_std < eps or p_std < eps:
+        return np.nan
+    return np.mean((true_vec - t_mean) * (pred_vec - p_mean)) / (t_std * p_std)
+
+
 def select_hvg(gt_df: pd.DataFrame, top_n: int = 1000):
     """Select top-N highly variable genes from ground truth (shared genes only).
     
@@ -154,10 +194,10 @@ def save_boxplots(metrics_df: pd.DataFrame, output_csv: str, title: str = "Metri
         ax.set_ylabel("Score")
     ax.set_title(title)
     plt.tight_layout()
-    png_path = output_csv.rsplit('.', 1)[0] + "_boxplot.png"
-    plt.savefig(png_path, dpi=300, bbox_inches='tight')
+    # png_path = output_csv.rsplit('.', 1)[0] + "_boxplot.png"
+    # plt.savefig(png_path, dpi=300, bbox_inches='tight')
     plt.close(fig)
-    print(f"Boxplot saved to {png_path}")
+    # print(f"Boxplot saved to {png_path}")
 
 
 def save_compare_boxplots(metrics_a: pd.DataFrame, metrics_b: pd.DataFrame,
@@ -205,10 +245,10 @@ def save_compare_boxplots(metrics_a: pd.DataFrame, metrics_b: pd.DataFrame,
                        plt.Rectangle((0, 0), 1, 1, color=colors[1])],
               labels=labels, loc='best')
     plt.tight_layout()
-    png_path = output_csv.rsplit('.', 1)[0] + "_compare_boxplot.png"
-    plt.savefig(png_path, dpi=300, bbox_inches='tight')
+    # png_path = output_csv.rsplit('.', 1)[0] + "_compare_boxplot.png"
+    # plt.savefig(png_path, dpi=300, bbox_inches='tight')
     plt.close(fig)
-    print(f"Comparison boxplot saved to {png_path}")
+    # print(f"Comparison boxplot saved to {png_path}")
 
 
 def save_multi_boxplots(metrics_list: List[pd.DataFrame], labels: List[str],
@@ -290,10 +330,10 @@ def save_spot_diff_boxplots(true_vec: pd.Series, pred_dfs: List[pd.DataFrame],
     ax.set_ylabel(f"|pred - true| ({celltype})")
     ax.set_title(f"{celltype} Per-spot Absolute Difference")
     plt.tight_layout()
-    png_path = output_csv.rsplit('.', 1)[0] + "_spot_diff_boxplot.png"
-    plt.savefig(png_path, dpi=300, bbox_inches='tight')
+    # png_path = output_csv.rsplit('.', 1)[0] + "_spot_diff_boxplot.png"
+    # plt.savefig(png_path, dpi=300, bbox_inches='tight')
     plt.close(fig)
-    print(f"Per-spot abs diff boxplot saved to {png_path}")
+    # print(f"Per-spot abs diff boxplot saved to {png_path}")
 
 
 def main():
@@ -308,6 +348,8 @@ def main():
                         help="Number of highly variable genes to evaluate (default: 1000).")
     parser.add_argument("--gene_list", type=str, default=None,
                         help="Optional path to a gene list (one gene per line). If provided, use these genes (intersected with shared genes) instead of HVG selection.")
+    parser.add_argument("--target_gene", type=str, default=None,
+                        help="If set (expression mode), evaluate only this gene (overrides HVG/gene_list).")
     parser.add_argument("--composition_pred_csv", type=str, default=None,
                         help="Predicted cell composition CSV (spots x celltypes). If provided with --composition_true_csv, compute metrics on compositions instead of gene expression.")
     parser.add_argument("--composition_true_csv", type=str, default=None,
@@ -394,7 +436,7 @@ def main():
         out_prefix = args.output_csv.rsplit('.', 1)[0]
         # Method1 metrics to main csv
         metrics_df = compute_metrics(true_comp.values, pred_dfs[0].values, list(expected_cols))
-        metrics_df.to_csv(args.output_csv, index=False)
+        # metrics_df.to_csv(args.output_csv, index=False)
         metrics_list.append(metrics_df)
         print(f"[Composition mode] Spots aligned: {pred_dfs[0].shape[0]}, Celltypes evaluated: {len(expected_cols)}")
         print(f"{pred_labels[0]} Mean PCC: {np.nanmean(metrics_df['pcc']):.4f}")
@@ -414,7 +456,7 @@ def main():
         for idx in range(1, len(pred_dfs)):
             alt_metrics = compute_metrics(true_comp.values, pred_dfs[idx].values, list(expected_cols))
             alt_csv = f"{out_prefix}_method{idx+1}.csv"
-            alt_metrics.to_csv(alt_csv, index=False)
+            # alt_metrics.to_csv(alt_csv, index=False)
             metrics_list.append(alt_metrics)
             print(f"{pred_labels[idx]} metrics saved to {alt_csv}")
             if args.celltype:
@@ -444,8 +486,8 @@ def main():
                 spot_df[f"pred_{name}"] = pred_vec.values
                 spot_df[f"diff_{name}"] = pred_vec.values - true_vec.values
                 spot_df[f"abs_diff_{name}"] = np.abs(pred_vec.values - true_vec.values)
-            spot_df.to_csv(out_spot, index=False)
-            print(f"Per-spot values and diffs saved to {out_spot}")
+            # spot_df.to_csv(out_spot, index=False)
+            # print(f"Per-spot values and diffs saved to {out_spot}")
             save_spot_diff_boxplots(true_vec, pred_dfs, pred_labels[:len(pred_dfs)],
                                     output_csv=args.output_csv, celltype=args.celltype)
         return
@@ -455,12 +497,35 @@ def main():
         raise ValueError("Provide --reconstructed_csv and --ground_truth_h5ad for expression evaluation, or both composition CSVs for composition mode.")
 
     recon_df = pd.read_csv(args.reconstructed_csv, index_col=0)
+
+    # Special case: single gene PCC with two CSVs (or h5ad as GT)
+    if args.target_gene:
+        gt_path = args.ground_truth_h5ad
+        if gt_path.lower().endswith(".csv"):
+            gt_df = pd.read_csv(gt_path, index_col=0)
+        else:
+            gt_adata = sc.read_h5ad(gt_path)
+            gt_df = pd.DataFrame(gt_adata.X.toarray() if hasattr(gt_adata.X, "toarray") else gt_adata.X,
+                                 index=gt_adata.obs_names,
+                                 columns=gt_adata.var_names)
+
+        true_vec, pred_vec = align_csv_pair(recon_df, gt_df, args.target_gene)
+        pcc = compute_pcc(true_vec, pred_vec)
+        print(f"Target gene '{args.target_gene}' PCC: {pcc:.6f}" if np.isfinite(pcc) else
+              f"Target gene '{args.target_gene}' PCC: nan (zero variance or invalid values)")
+        return
+
     gt_adata = sc.read_h5ad(args.ground_truth_h5ad)
 
     gt_df, pred_df, genes = align_data(recon_df, gt_adata)
 
-    # Select genes: prefer user-provided list; otherwise HVG
-    if args.gene_list:
+    # Select genes: target_gene > gene_list > HVG
+    if args.target_gene:
+        if args.target_gene not in genes:
+            raise ValueError(f"Target gene '{args.target_gene}' not found in shared genes.")
+        selected_genes = [args.target_gene]
+        print(f"Using target gene: {args.target_gene}")
+    elif args.gene_list:
         selected_genes = load_gene_list(args.gene_list, genes)
         if len(selected_genes) == 0:
             raise ValueError("No genes from gene_list found in shared genes between datasets.")

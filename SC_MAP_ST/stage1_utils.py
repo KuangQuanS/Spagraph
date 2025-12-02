@@ -9,6 +9,7 @@ import scanpy as sc
 from sklearn.linear_model import LogisticRegression
 from typing import List, Tuple, Dict, Optional
 import torch
+import scipy.sparse as sp
 
 
 def load_marker_genes_from_file(file_path: str) -> List[str]:
@@ -145,11 +146,9 @@ def compute_clusters_and_marker_genes(adata,
                     sub_adata = adata_full[:, selected_genes].copy()
                     y = (adata_full.obs['leiden'] == cluster).astype(int)
                     X = sub_adata.X
-                    if hasattr(X, 'toarray'):
-                        X = X.toarray()
-                    
-                    X_scaled = X
-                    
+                    # 保持稀疏输入以加速 saga（支持 CSR）
+                    if not sp.issparse(X):
+                        X = sp.csr_matrix(X)
                     clf = LogisticRegression(
                         C=1,
                         penalty='l1',
@@ -159,7 +158,7 @@ def compute_clusters_and_marker_genes(adata,
                         n_jobs=-1
                     )
 
-                    clf.fit(X_scaled, y)
+                    clf.fit(X, y)
                     coef = clf.coef_.ravel()
                     
                     final_selected_genes = [g for g, c in zip(selected_genes, coef) if abs(c) > 1e-5]

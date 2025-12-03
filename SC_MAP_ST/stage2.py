@@ -196,6 +196,21 @@ class GATDeconvolution:
             expressions_full_list = [expressions_full_array[i] for i in range(len(cluster_ids))]
         
         self.celltype_expressions_full = expressions_full_list
+
+        # Optional: load HVG intersection (SC/ST 3000 HVGs) if available
+        if 'hvg_genes_union' in cluster_data:
+            try:
+                hvg_union = cluster_data['hvg_genes_union']
+                # hvg_union may be object array; convert to Python list of str
+                if isinstance(hvg_union, np.ndarray):
+                    hvg_union = list(hvg_union.tolist())
+                self.hvg_genes_union = [str(g) for g in hvg_union]
+                print(f"   HVG union loaded from cluster_data: {len(self.hvg_genes_union)} genes")
+            except Exception as e:
+                self.hvg_genes_union = None
+                print(f"   ⚠️ Failed to load hvg_genes_union from cluster_data: {e}")
+        else:
+            self.hvg_genes_union = None
         
         # Load celltype mapping if available
         if 'cluster_to_celltype' in cluster_data:
@@ -319,6 +334,16 @@ class GATDeconvolution:
         marker_gene_indices = [self.all_genes.index(g) for g in self.genes]
         print(f"   Marker gene indices: {len(marker_gene_indices)} markers in {len(self.all_genes)} all genes")
         
+        # 计算 HVG 交集在全部基因中的索引（如果可用）
+        hvg_gene_indices = None
+        if getattr(self, "hvg_genes_union", None) is not None:
+            try:
+                hvg_gene_indices = [self.all_genes.index(g) for g in self.hvg_genes_union if g in self.all_genes]
+                print(f"   HVG gene indices: {len(hvg_gene_indices)} HVGs in {len(self.all_genes)} all genes")
+            except Exception as e:
+                hvg_gene_indices = None
+                print(f"   ⚠️ Failed to compute HVG gene indices: {e}")
+        
         self.loss_fn = SpatialDeconvolutionLoss(
             lambda_pearson=loss_lambda_pearson,
             lambda_mse=loss_lambda_mse,
@@ -331,7 +356,9 @@ class GATDeconvolution:
             sc_celltype_proportions=sc_celltype_proportions,
             spot_total_counts=self.spot_total_counts,
             celltype_expressions_full=celltype_expr_full,
-            marker_gene_indices=marker_gene_indices
+            marker_gene_indices=marker_gene_indices,
+            hvg_gene_indices=hvg_gene_indices,
+            scale_basis=getattr(self, "scale_basis", "hvg")
         ).to(self.device)  # ✅ Move loss function to device
         
         gat_params = sum(p.numel() for p in self.gat_model.parameters())
@@ -632,26 +659,30 @@ class GATDeconvolution:
             celltype_expr_full = np.array(self.celltype_expressions_full)  # [n_clusters, n_all_genes]
             celltype_expr_marker = self.celltype_expressions.cpu().numpy()  # [n_clusters, n_marker_genes]
             
-            # ✅ 使用 marker 基因的 total counts 计算 scale factor
-            # 1. 重建的 marker 基因表达 (raw count scale)
-            mixed_expr_marker = np.dot(deconv_weights, celltype_expr_marker)  # [n_spots, n_marker_genes]
-            reconstructed_marker_total = mixed_expr_marker.sum(axis=1)  # [n_spots]
-            
-            # 2. 真实 spot 的 marker 基因 total counts (raw count, 已在 main 中计算)
-            if self.spot_total_counts is None:
-                raise ValueError("spot_total_counts not set; cannot compute scale factor.")
-            spot_marker_total = self.spot_total_counts[:len(spot_barcodes)]  # [n_spots]
-            
-            # 3. 计算 scale factor: spot真实值 / 重建值
-            scale = spot_marker_total / (reconstructed_marker_total + 1e-8)
-            print(f"   ✅ Scale factor computed from MARKER genes ({len(self.genes)} genes)")
-            print(f"      Spot marker total (real): mean={spot_marker_total.mean():.1f}")
-            print(f"      Reconstructed marker total: mean={reconstructed_marker_total.mean():.1f}")
-            print(f"      Scale factor: min={scale.min():.4f}, max={scale.max():.4f}, mean={scale.mean():.4f}")
-            
-            # 4. 应用 scale 到全基因重建表达
+            # 计算重建表达（根据 scale_basis 决定是否缩放）
             mixed_expr_full = np.dot(deconv_weights, celltype_expr_full)  # [n_spots, n_all_genes]
-            reconstructed_full_expr = mixed_expr_full * scale[:, np.newaxis]
+            
+            scale_basis = getattr(self, "scale_basis", "all")
+            if scale_basis == "none":
+                # 不使用缩放，直接使用混合表达
+                reconstructed_full_expr = mixed_expr_full
+                print("   💡 No scaling applied (scale_basis='none')")
+            else:
+                # ✅ 使用 spot_total_counts 计算 scale factor
+                # 1. 重建的 marker 基因表达 (raw count scale)
+                mixed_expr_marker = np.dot(deconv_weights, celltype_expr_marker)  # [n_spots, n_marker_genes]
+                reconstructed_marker_total = mixed_expr_marker.sum(axis=1)  # [n_spots]
+                
+                # 2. 真实 spot 的 marker 基因 total counts (raw count, 已在 main 中计算)
+                if self.spot_total_counts is None:
+                    raise ValueError("spot_total_counts not set; cannot compute scale factor.")
+                spot_marker_total = self.spot_total_counts[:len(spot_barcodes)]  # [n_spots]
+                
+                # 3. 计算 scale factor: spot真实值 / 重建值
+                scale = spot_marker_total / (reconstructed_marker_total + 1e-8)
+                
+                # 4. 应用 scale 到全基因重建表达
+                reconstructed_full_expr = mixed_expr_full * scale[:, np.newaxis]
             
             # Get full gene names
             if self.all_genes is not None:
@@ -897,10 +928,6 @@ def main():
     parser.add_argument('--dropout', type=float, default=0.1,
                        help='Dropout rate')
     
-    # Clustering arguments
-    parser.add_argument('--resolution', type=float, default=2,
-                       help='Leiden clustering resolution')
-    
     # Graph construction arguments
     parser.add_argument('--k_spatial', type=int, default=5,
                        help='Number of spatial neighbors (KNN)')
@@ -912,11 +939,11 @@ def main():
                        help='Number of epochs')
     parser.add_argument('--lr', type=float, default=5e-3,
                        help='Learning rate')
-    parser.add_argument('--batch_size', type=int, default=1024,
+    parser.add_argument('--batch_size', type=int, default=512,
                        help='Batch size')
     
     # Loss function arguments
-    parser.add_argument('--loss_lambda_mse', type=float, default=0.1,
+    parser.add_argument('--loss_lambda_mse', type=float, default=0.5,
                        help='MSE reconstruction loss weight')
     parser.add_argument('--loss_lambda_pearson', type=float, default=5,
                        help='Pearson correlation loss weight')
@@ -926,9 +953,9 @@ def main():
                        help='Gene-level Pearson loss weight (across spots)')
     parser.add_argument('--loss_lambda_gene_cosine', type=float, default=1,
                        help='Gene-level Cosine loss weight (across spots)')
-    parser.add_argument('--loss_lambda_reg', type=float, default=0.5,
+    parser.add_argument('--loss_lambda_reg', type=float, default=0.1,
                        help='Weight regularization weight')
-    parser.add_argument('--loss_lambda_sparse', type=float, default=0.01,
+    parser.add_argument('--loss_lambda_sparse', type=float, default=10,
                        help='Sparsity regularization weight (Shannon entropy)')
     parser.add_argument('--loss_lambda_proportion', type=float, default=0.1,
                        help='Global cell type proportion consistency loss weight (matches SC cluster distribution)')
@@ -939,6 +966,14 @@ def main():
     # Weight thresholding argument
     parser.add_argument('--weight_threshold', type=float, default=0.001,
                        help='Weight threshold for sparsification (default 0.01, i.e., 1%)')
+    
+    # Scaling basis argument
+    parser.add_argument('--scale_basis', type=str, default='all',
+                       choices=['marker', 'hvg', 'all', 'none'],
+                       help='Gene set used to compute per-spot scaling factor for final reconstruction: '
+                            'marker (marker genes only), hvg (SC/ST HVG intersection), all (all shared genes), '
+                            'or none (no scaling, direct weighted mixture). '
+                            'Default: all. Must match the spot_total_counts calculation method.')
     
     # Device argument
     parser.add_argument('--device', type=str, default=None,
@@ -968,6 +1003,8 @@ def main():
     # Set graph construction parameters
     trainer.k_spatial = args.k_spatial
     trainer.k_celltype = args.k_celltype
+    # Set scaling basis for reconstruction
+    trainer.scale_basis = args.scale_basis
     
     # Load VAE Encoder
     trainer.load_vae_encoder()
@@ -1021,9 +1058,44 @@ def main():
     st_X_raw = st_subset_raw.X.toarray() if hasattr(st_subset_raw.X, 'toarray') else st_subset_raw.X
     st_X_embed = st_subset_norm.X.toarray() if hasattr(st_subset_norm.X, 'toarray') else st_subset_norm.X
 
-    # ✅ 计算 marker 基因的 spot total counts (用于缩放)
-    spot_total_counts = np.asarray(st_X_raw.sum(axis=1)).ravel()
-    print(f"ST spot total counts (marker {len(trainer.genes)} genes): min={spot_total_counts.min():.1f}, max={spot_total_counts.max():.1f}, mean={spot_total_counts.mean():.1f}")
+    # ✅ 计算不同基因集的 spot total counts（根据 scale_basis 选择）
+    # 1. 全基因 counts（用于 scale_basis='all'）
+    spot_total_counts_all = np.asarray(st_raw_all.sum(axis=1)).ravel()
+    # 2. Marker 基因 counts（用于 scale_basis='marker'）
+    spot_total_counts_marker = np.asarray(st_X_raw.sum(axis=1)).ravel()
+    # 3. HVG 交集 counts（用于 scale_basis='hvg'，如果可用）
+    spot_total_counts_hvg = None
+    if hasattr(trainer, 'hvg_genes_union') and trainer.hvg_genes_union is not None:
+        hvg_in_st = [g for g in trainer.hvg_genes_union if g in st_adata.var_names]
+        if len(hvg_in_st) > 0:
+            st_hvg = st_adata[:, hvg_in_st]
+            st_hvg_raw = st_hvg.X.toarray() if hasattr(st_hvg.X, 'toarray') else st_hvg.X
+            spot_total_counts_hvg = np.asarray(st_hvg_raw.sum(axis=1)).ravel()
+    
+    # 根据 scale_basis 选择对应的 counts
+    if args.scale_basis == 'none':
+        spot_total_counts = None
+        print(f"💡 scale_basis='none': No scaling will be applied (direct weighted mixture)")
+    elif args.scale_basis == 'all':
+        spot_total_counts = spot_total_counts_all
+        print(f"ST spot total counts (all {st_raw_all.shape[1]} genes): min={spot_total_counts.min():.1f}, max={spot_total_counts.max():.1f}, mean={spot_total_counts.mean():.1f}")
+    elif args.scale_basis == 'hvg' and spot_total_counts_hvg is not None:
+        spot_total_counts = spot_total_counts_hvg
+        print(f"ST spot total counts (HVG {len(hvg_in_st)} genes): min={spot_total_counts.min():.1f}, max={spot_total_counts.max():.1f}, mean={spot_total_counts.mean():.1f}")
+    else:
+        # 默认使用 marker（或当 hvg 不可用时回退到 marker）
+        if args.scale_basis == 'hvg' and spot_total_counts_hvg is None:
+            print(f"⚠️  Warning: scale_basis='hvg' but HVG genes not available, falling back to 'marker'")
+            trainer.scale_basis = 'marker'
+        spot_total_counts = spot_total_counts_marker
+        print(f"ST spot total counts (marker {len(trainer.genes)} genes): min={spot_total_counts.min():.1f}, max={spot_total_counts.max():.1f}, mean={spot_total_counts.mean():.1f}")
+    
+    # 一致性检查：如果 scale_basis 与 counts 不匹配，打印警告
+    ratio_all_marker = spot_total_counts_all.mean() / (spot_total_counts_marker.mean() + 1e-8)
+    if args.scale_basis == 'all' and ratio_all_marker < 1.5:
+        print(f"⚠️  Warning: scale_basis='all' but all-gene counts ({spot_total_counts_all.mean():.1f}) is very close to marker counts ({spot_total_counts_marker.mean():.1f}). Check if using correct data!")
+    elif args.scale_basis == 'marker' and ratio_all_marker > 5.0:
+        print(f"💡 Info: scale_basis='marker', but you have much more genes available (all={spot_total_counts_all.mean():.1f} vs marker={spot_total_counts_marker.mean():.1f}). Consider using scale_basis='all' for better reconstruction.")
  
     # Build GAT model and loss function
     print("="*60)

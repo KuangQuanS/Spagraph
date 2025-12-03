@@ -695,7 +695,8 @@ class SpatialDeconvolutionLoss(nn.Module):
                  lambda_gene_pearson=0.0, lambda_gene_cosine=0.0,
                  lambda_reg=0.5, lambda_sparse=0.01,
                  lambda_proportion=1.0, sc_celltype_proportions=None, spot_total_counts=None,
-                 celltype_expressions_full=None, marker_gene_indices=None):
+                 celltype_expressions_full=None, marker_gene_indices=None,
+                 hvg_gene_indices=None, scale_basis: str = "hvg"):
         super().__init__()
         self.lambda_pearson = lambda_pearson      # Pearson损失权重
         self.lambda_mse = lambda_mse              # MSE损失权重
@@ -705,11 +706,16 @@ class SpatialDeconvolutionLoss(nn.Module):
         self.lambda_reg = lambda_reg              # 权重正则化权重
         self.lambda_sparse = lambda_sparse        # 稀疏性正则化权重
         self.lambda_proportion = lambda_proportion  # 细胞类型比例一致性权重
+        self.scale_basis = scale_basis            # 用于缩放的基因集合: marker / hvg / all / none
         
         # ✅ spot_total_counts: 每个 spot 在全部基因上的总 UMI 数 [n_spots]
-        if spot_total_counts is None:
-            raise ValueError("spot_total_counts is required for reconstruction!")
-        self.register_buffer('spot_total_counts', torch.FloatTensor(spot_total_counts))
+        # 当 scale_basis='none' 时允许为 None（不进行缩放）
+        if spot_total_counts is None and scale_basis != 'none':
+            raise ValueError("spot_total_counts is required for reconstruction when scale_basis != 'none'!")
+        if spot_total_counts is not None:
+            self.register_buffer('spot_total_counts', torch.FloatTensor(spot_total_counts))
+        else:
+            self.spot_total_counts = None
         
         # ✅ celltype_expressions_full: 细胞类型在全部基因上的表达 [n_cell_types, n_all_genes]
         # 用于重建完整的 spot 表达谱，然后只在 marker 基因上计算 loss
@@ -722,6 +728,12 @@ class SpatialDeconvolutionLoss(nn.Module):
         if marker_gene_indices is None:
             raise ValueError("marker_gene_indices is required to extract marker genes!")
         self.register_buffer('marker_gene_indices', torch.LongTensor(marker_gene_indices))
+        
+        # ✅ hvg_gene_indices: HVG 交集在全部基因中的索引 [n_hvg_genes]（可选）
+        if hvg_gene_indices is not None and len(hvg_gene_indices) > 0:
+            self.register_buffer('hvg_gene_indices', torch.LongTensor(hvg_gene_indices))
+        else:
+            self.hvg_gene_indices = None
         
         # 单细胞数据中各cluster的比例 [n_cell_types]
         # 例如: [0.10, 0.15, 0.20, ...] 表示cluster0占10%, cluster1占15%等
@@ -755,24 +767,36 @@ class SpatialDeconvolutionLoss(nn.Module):
             损失字典
         """
         n_spots = attention_weights.shape[0]
-        if batch_spot_total_counts is None:
-            batch_spot_total_counts = self.spot_total_counts[:n_spots]
-        # ✅ 使用全部基因重建 spot 表达: X̂_i = scale_i × Σ(w_ic × R_c^full)
+
+        # ✅ 使用全部基因重建 spot 表达: X̂_i = scale_i × Σ(w_ic × R_c^full) 或直接混合（无缩放）
         # 1) 使用原始尺度的 celltype_expressions_full [n_cell_types, n_all_genes]
         # 2) 线性混合得到预估表达
-        # 3) 重新按 spot_total_counts 归一，匹配实际文库大小
         mixed_expr_full = torch.matmul(
             attention_weights,               # [n_spots, n_cell_types]
             self.celltype_expressions_full   # [n_cell_types, n_all_genes]
         )  # [n_spots, n_all_genes]
 
-        # scale: 使用 marker 子集的总量与真实 spot_total_counts（基于 marker）对齐
-        spot_counts = batch_spot_total_counts.unsqueeze(-1)  # [batch_size, 1]
-        mixed_marker_totals = mixed_expr_full[:, self.marker_gene_indices].sum(dim=1, keepdim=True)  # [batch_size, 1]
-        scale = spot_counts / (mixed_marker_totals + 1e-8)
-        # 仅放大，不再对 scale<1 的样本缩小，避免进一步压缩表达
-    
-        reconstructed_spot_full = mixed_expr_full * scale  # [n_spots, n_all_genes]
+        # 3) 根据 scale_basis 决定是否缩放
+        if self.scale_basis == "none":
+            # 不使用缩放，直接使用混合表达
+            reconstructed_spot_full = mixed_expr_full
+        else:
+            # 使用 spot_total_counts 进行缩放
+            batch_spot_total_counts = self.spot_total_counts[:n_spots]
+            spot_counts = batch_spot_total_counts.unsqueeze(-1)  # [batch_size, 1]
+
+            if self.scale_basis == "all":
+                # 使用全部基因总量
+                mixed_basis_totals = mixed_expr_full.sum(dim=1, keepdim=True)
+            elif self.scale_basis == "hvg" and self.hvg_gene_indices is not None:
+                # 使用 HVG 交集
+                mixed_basis_totals = mixed_expr_full[:, self.hvg_gene_indices].sum(dim=1, keepdim=True)
+            else:
+                # 默认：使用 marker 子集
+                mixed_basis_totals = mixed_expr_full[:, self.marker_gene_indices].sum(dim=1, keepdim=True)
+
+            scale = spot_counts / (mixed_basis_totals + 1e-8)
+            reconstructed_spot_full = mixed_expr_full * scale  # [n_spots, n_all_genes]
         
         # 提取 marker 基因: 只在 marker 基因上计算 loss
         reconstructed_spot_marker = reconstructed_spot_full[:, self.marker_gene_indices]  # [n_spots, n_marker_genes]

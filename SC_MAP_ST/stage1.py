@@ -260,6 +260,37 @@ class coEncoder:
         print(f"ST data (marker genes): min={np.min(st_X)}, max={np.max(st_X)}, genes={len(available_genes)}/{len(self.marker_genes)}")
         print("="*60)
         print(f"   ST data: {st_X.shape}")
+
+        # 3. 计算 SC/ST 各自 top-3000 高变基因，并取交集（用于 Stage 2 缩放因子测试）
+        print("Computing intersection of top-3000 HVGs from SC and ST...")
+        try:
+            # SC HVG：在已做 normalize_total+log1p 的 sc_adata_count 上
+            sc_hvg = sc_adata_count.copy()
+            sc.pp.highly_variable_genes(
+                sc_hvg,
+                n_top_genes=min(3000, sc_hvg.shape[1]),
+                flavor="seurat"
+            )
+            sc_hvg_genes = list(sc_hvg.var.index[sc_hvg.var["highly_variable"]])
+            print(f"   SC HVGs (top 3000): {len(sc_hvg_genes)}")
+
+            # ST HVG：在已做 normalize_total+log1p 的 st_proc 上
+            st_hvg = st_proc.copy()
+            sc.pp.highly_variable_genes(
+                st_hvg,
+                n_top_genes=min(3000, st_hvg.shape[1]),
+                flavor="seurat"
+            )
+            st_hvg_genes = list(st_hvg.var.index[st_hvg.var["highly_variable"]])
+            print(f"   ST HVGs (top 3000): {len(st_hvg_genes)}")
+
+            # 交集（只保留在 SC/ST 都高变的基因）
+            hvg_intersection = list(sorted(set(sc_hvg_genes) & set(st_hvg_genes)))
+            self.hvg_genes_union = hvg_intersection
+            print(f"   Intersection HVGs (SC∩ST): {len(hvg_intersection)} genes")
+        except Exception as e:
+            self.hvg_genes_union = None
+            print(f"   ⚠️ Failed to compute SC/ST HVG union: {e}")
         
         # 4. Ensure SC and ST feature dimensions are consistent
         final_genes = [g for g in self.marker_genes 
@@ -431,6 +462,11 @@ class coEncoder:
         
         if hasattr(self, 'cluster_cell_weights') and self.cluster_cell_weights is not None:
             save_dict['cluster_cell_weights'] = self.cluster_cell_weights
+
+        # 可选：保存 SC/ST 3000-HVG 交集，供 Stage 2 读取
+        if hasattr(self, 'hvg_genes_union') and self.hvg_genes_union is not None:
+            save_dict['hvg_genes_union'] = np.array(self.hvg_genes_union, dtype=object)
+            print(f"   ✓ HVG union: {len(self.hvg_genes_union)} genes")
         
         np.savez(filepath, **save_dict)
         
@@ -706,7 +742,7 @@ def main():
                        help='VAE latent space dimension')
     
     # Training arguments
-    parser.add_argument('--batch_size', type=int, default=1024,
+    parser.add_argument('--batch_size', type=int, default=512,
                        help='Batch size')
     parser.add_argument('--n_epochs', type=int, default=150,
                        help='Number of epochs')
@@ -716,7 +752,7 @@ def main():
                        help='KL divergence weight (beta-VAE)')
     parser.add_argument('--loss_type', type=str, default='mse', choices=['mse', 'zinb'],
                        help='Reconstruction loss type: mse (default) or zinb')
-    parser.add_argument('--lambda_mmd', type=float, default=0.01,
+    parser.add_argument('--lambda_mmd', type=float, default=0.1,
                        help='MMD loss weight for modality alignment (0=disabled, 1.0=recommended)')
     parser.add_argument('--use_dual_decoder', type=bool, default=True,
                        help='Use DualDecoderVAE with separate SC/ST decoders for better modality alignment')

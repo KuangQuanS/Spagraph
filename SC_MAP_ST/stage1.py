@@ -70,8 +70,6 @@ class coEncoder:
             self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         else:
             self.device = torch.device(device)
-        
-        print(f"Using device: {self.device}")
 
         # Model components
         self.vae = None
@@ -80,9 +78,6 @@ class coEncoder:
         
     def load_data(self) -> Tuple[ad.AnnData, ad.AnnData]:
         """Load SC and ST data from specified files"""
-        print("="*60)
-        print("Loading datasets...")
-        
         if self.sc_file is None or self.st_file is None:
             raise ValueError("SC file and ST file must be specified!")
         
@@ -95,25 +90,19 @@ class coEncoder:
         sc_adata = sc.read_h5ad(self.sc_file)
         sc_adata.obs['modality'] = 'SC'
         sc_adata.var_names_make_unique()
-        print(f"   SC shape: {sc_adata.shape}")
         
         # Load ST data
         st_adata = sc.read_h5ad(self.st_file)
         st_adata.obs['modality'] = 'ST'
         st_adata.var_names_make_unique()
-        print(f"   ST shape: {st_adata.shape}")
         
         # Find common genes
         common_genes = list(set(sc_adata.var_names) & set(st_adata.var_names))
         common_genes.sort()
-        print(f"   Common genes: {len(common_genes)}")
         
         # Subset to common genes
         sc_adata = sc_adata[:, common_genes].copy()
         st_adata = st_adata[:, common_genes].copy()
-        
-        print(f"   SC final: {sc_adata.shape}")
-        print(f"   ST final: {st_adata.shape}")
         
         return sc_adata, st_adata
 
@@ -134,10 +123,8 @@ class coEncoder:
         """
 
         # 1. Compute clusters and marker genes  
-        print("="*60)
         if precomputed_marker_file is not None:
             # Load precomputed marker genes
-            print(f"Using precomputed marker genes from: {precomputed_marker_file}")
             self.marker_genes = load_marker_genes_from_file(precomputed_marker_file)
             # For compatibility, create dummy clustering results
             # We'll use a simple clustering approach for the rest of the pipeline
@@ -154,7 +141,6 @@ class coEncoder:
             sc_clusters = sc_adata_clustered.obs['leiden'].copy()
         else:
             # Auto-cluster using Leiden
-            print("Computing clusters and marker genes...")
             cluster_save_path = f"{self.output_dir}/marker_genes.txt"
             self.marker_genes, sc_clusters, sc_adata_clustered = compute_clusters_and_marker_genes(
                 sc_adata.copy(), 
@@ -196,9 +182,6 @@ class coEncoder:
         # Encode labels
         self.label_encoder = LabelEncoder()
         sc_y = self.label_encoder.fit_transform(sc_labels)
-        
-        print(f"   SC data: {sc_X.shape}")
-        print(f"   Number of clusters: {len(self.label_encoder.classes_)}")
 
         # ST (log1p on library-normalized counts)
         st_raw_all = st_adata.X.toarray() if hasattr(st_adata.X, 'toarray') else st_adata.X
@@ -212,7 +195,7 @@ class coEncoder:
         st_X = st_subset.X.toarray() if hasattr(st_subset.X, 'toarray') else st_subset.X
 
         try:
-            # SC HVG：在已做 normalize_total+log1p 的 sc_adata_count 上
+            # SC HVG
             sc_hvg = sc_adata_count.copy()
             sc.pp.highly_variable_genes(
                 sc_hvg,
@@ -220,9 +203,8 @@ class coEncoder:
                 flavor="seurat"
             )
             sc_hvg_genes = list(sc_hvg.var.index[sc_hvg.var["highly_variable"]])
-            print(f"   SC HVGs (top 3000): {len(sc_hvg_genes)}")
 
-            # ST HVG：在已做 normalize_total+log1p 的 st_proc 上
+            # ST HVG
             st_hvg = st_proc.copy()
             sc.pp.highly_variable_genes(
                 st_hvg,
@@ -230,15 +212,12 @@ class coEncoder:
                 flavor="seurat"
             )
             st_hvg_genes = list(st_hvg.var.index[st_hvg.var["highly_variable"]])
-            print(f"   ST HVGs (top 3000): {len(st_hvg_genes)}")
 
-            # 交集（只保留在 SC/ST 都高变的基因）
+            # 交集
             hvg_intersection = list(sorted(set(sc_hvg_genes) & set(st_hvg_genes)))
             self.hvg_genes_union = hvg_intersection
-            print(f"   Intersection HVGs (SC∩ST): {len(hvg_intersection)} genes")
         except Exception as e:
             self.hvg_genes_union = None
-            print(f"   ⚠️ Failed to compute SC/ST HVG union: {e}")
         
         # 4. Ensure SC and ST feature dimensions are consistent
         final_genes = [g for g in self.marker_genes 
@@ -249,8 +228,6 @@ class coEncoder:
         
         sc_X_final = sc_X[:, sc_gene_indices]
         st_X_final = st_X[:, st_gene_indices]
-        
-        print(f"   Final gene count: {len(final_genes)}")
         
         # 5. Split data for training (with test set for early stopping)
         sc_train, sc_test, y_train, y_test = train_test_split(
@@ -282,9 +259,6 @@ class coEncoder:
             np.ones(len(st_test))
         ])
         
-        print(f"   Train set: {train_X.shape} (SC: {len(sc_train)}, ST: {len(st_train)})")
-        print(f"   Test set: {test_X.shape} (SC: {len(sc_test)}, ST: {len(st_test)})")
-        
         # ✅ Keep ALL SC data (train + test) for cluster embedding computation
         sc_X_full_all_count = sc_raw_all  # All cells (raw counts, no norm/log)
         sc_all_indices = np.arange(len(sc_X_final))  # All indices
@@ -307,11 +281,6 @@ class coEncoder:
             use_dual_decoder: If True, use DualDecoderVAE (shared encoder + separate SC/ST decoders)
                             If False, use standard VAE (single encoder + single decoder)
         """
-        print("="*60)
-        print("Building VAE model...")
-        print(f"   Loss type: {loss_type.upper()}")
-        print(f"   Architecture: {'Dual Decoder (SC/ST-specific)' if use_dual_decoder else 'Single Decoder (shared)'}")
-        
         # 根据loss_type设置output_type
         output_type = 'zinb' if loss_type == 'zinb' else 'mse'
         
@@ -333,20 +302,6 @@ class coEncoder:
                 dropout=dropout,
                 output_type=output_type
             ).to(self.device)
-        
-        print(f"   Input: {input_dim} -> Latent: {latent_dim}")
-        print(f"   Hidden layers: {hidden_dims}")
-        vae_params = sum(p.numel() for p in self.vae.parameters())
-        print(f"   Parameters: {vae_params:,}")
-        
-        # 如果是双解码器，显示参数分布
-        if use_dual_decoder:
-            encoder_params = sum(p.numel() for p in self.vae.encoder.parameters())
-            decoder_sc_params = sum(p.numel() for p in self.vae.decoder_sc.parameters())
-            decoder_st_params = sum(p.numel() for p in self.vae.decoder_st.parameters())
-            print(f"   - Encoder: {encoder_params:,}")
-            print(f"   - Decoder SC: {decoder_sc_params:,}")
-            print(f"   - Decoder ST: {decoder_st_params:,}")
     
     def save_vae(self, filepath):
         """Save VAE model (only model weights and basic info, no cluster data)"""
@@ -360,12 +315,9 @@ class coEncoder:
             resolution=getattr(self, 'resolution', 0.5),
             all_genes=getattr(self, 'all_genes', None)
         )
-        print(f"✅ Saved VAE model (weights only): {filepath}")
     
     def save_cluster_data(self, filepath):
         """Save cluster data to separate NPZ file"""
-        print("="*60)
-        print(f"Saving cluster data to: {filepath}")
         
         # Prepare cluster data - convert dicts to arrays
         cluster_ids = np.arange(len(self.label_encoder.classes_))
@@ -413,19 +365,8 @@ class coEncoder:
         # 可选：保存 SC/ST 3000-HVG 交集，供 Stage 2 读取
         if hasattr(self, 'hvg_genes_union') and self.hvg_genes_union is not None:
             save_dict['hvg_genes_union'] = np.array(self.hvg_genes_union, dtype=object)
-            print(f"   ✓ HVG union: {len(self.hvg_genes_union)} genes")
         
         np.savez(filepath, **save_dict)
-        
-        print(f"   ✓ Cluster IDs: {len(cluster_ids)}")
-        print(f"   ✓ Prototypes: {prototypes_array.shape}")
-        print(f"   ✓ Expressions (marker): {expressions_array.shape}")
-        print(f"   ✓ Expressions (full): {len(expressions_full_list)} clusters × {expressions_full_list[0].shape[0]} genes")
-        if celltype_mapping is not None:
-            print(f"   ✓ Celltype mapping: {len(celltype_mapping)} clusters")
-        else:
-            print("   ⚠️ No celltype mapping found; Stage 2 will fall back to cluster IDs. Make sure sc_adata_clustered.obs contains 'cell_type' or 'celltype'.")
-        print(f"✅ Saved cluster data: {filepath}")
     
     def load_vae(self, filepath):
         """Load VAE model (basic loading for inference) using vae_io module"""
@@ -434,8 +375,6 @@ class coEncoder:
         self.label_encoder = loaded_data['label_encoder']
         self.marker_genes = loaded_data['marker_genes']
         self.genes = loaded_data['genes']
-        
-        print(f"VAE model loaded: {filepath}")
     
     def load_pretrained(self, filepath):
         """Load pretrained VAE weights for continued training using vae_io module"""
@@ -459,7 +398,7 @@ class coEncoder:
     def run_stage1_training(self, top_n_per_type=100, resolution=0.5, batch_size=256, n_epochs=100, 
                            lr=1e-3, beta=1.0, hidden_dims=[512, 256], latent_dim=128, loss_type='mse', 
                            lambda_mmd=0.0, pretrained_path=None, precomputed_marker_file=None, use_dual_decoder=False,
-                           aggregation_method='weighted', marker_selection_method='l1'):
+                           aggregation_method='weighted', marker_selection_method='l1', print_every=50):
         """Run stage 1 training: VAE on SC + ST with marker genes
         
         Args:
@@ -483,28 +422,9 @@ class coEncoder:
                 - 'median': Median aggregation (robust to outliers)
                 - 'weighted': Weighted average with UMI, representativeness, and marker activity (recommended)
             marker_selection_method: Method for marker gene selection ('l1', 'variance', 'correlation')
+            print_every: Print loss every N epochs (default: 50)
         """
-        print("="*60)
-        print("Stage 1 Training: VAE (SC + ST, Marker Genes)")
-        print("="*60)
-        print(f"Configuration:")
-        print(f"   Marker genes per type: {top_n_per_type}")
-        print(f"   Leiden resolution: {resolution}")
-        if precomputed_marker_file:
-            print(f"   Precomputed marker genes: {precomputed_marker_file}")
-        print(f"   Batch size: {batch_size}")
-        print(f"   Epochs: {n_epochs}")
-        print(f"   Learning rate: {lr}")
-        print(f"   Beta (KL weight): {beta}")
-        print(f"   Hidden dims: {hidden_dims}")
-        print(f"   Latent dim: {latent_dim}")
-        print(f"   Loss type: {loss_type.upper()}")
-        print(f"   Lambda MMD: {lambda_mmd}")
-        print(f"   Dual Decoder: {use_dual_decoder}")
-        print(f"   Aggregation method: {aggregation_method}")
-        if pretrained_path:
-            print(f"   Pretrained: {pretrained_path}")
-        print("="*60)
+        print(f"Stage 1 Training: VAE | epochs={n_epochs}, lr={lr}, latent_dim={latent_dim}")
         
         # 1. Load data
         sc_adata, st_adata = self.load_data()
@@ -524,14 +444,7 @@ class coEncoder:
             
             # Verify architecture compatibility
             if input_dim != self.vae.encoder.encoder[0].in_features:
-                print(f"   Warning: Input dim mismatch! Pretrained: {self.vae.encoder.encoder[0].in_features}, Current: {input_dim}")
-                print(f"   Rebuilding VAE from scratch...")
                 self.build_vae(input_dim, hidden_dims=hidden_dims, latent_dim=latent_dim, loss_type=loss_type, use_dual_decoder=use_dual_decoder)
-            else:
-                print(f"   Using pretrained VAE architecture")
-                # Update loss_type from pretrained if not specified
-                if loss_type == 'mse' and pretrained_output_type != 'mse':
-                    print(f"   Note: Pretrained model uses {pretrained_output_type}, current setting is {loss_type}")
         else:
             # Build from scratch
             self.build_vae(input_dim, hidden_dims=hidden_dims, latent_dim=latent_dim, loss_type=loss_type, use_dual_decoder=use_dual_decoder)
@@ -540,7 +453,7 @@ class coEncoder:
         best_loss = train_vae(
             vae=self.vae,
             train_X=train_X,
-            test_X=test_X,  # ✅ Use test set for validation and early stopping
+            test_X=test_X,  # Use test set for validation and early stopping
             train_modality=train_modality,
             test_modality=test_modality,
             batch_size=batch_size,
@@ -550,7 +463,8 @@ class coEncoder:
             loss_type=loss_type,
             lambda_mmd=lambda_mmd,
             device=self.device,
-            output_dir=self.output_dir
+            output_dir=self.output_dir,
+            print_every=print_every
         )
         
         # Save training data for cluster center computation
@@ -578,10 +492,6 @@ class coEncoder:
                 all_embeddings.append(mu.cpu().numpy())
             
             embeddings = np.vstack(all_embeddings)
-
-        # Print weight statistics if using weighted aggregation
-        if aggregation_method == 'weighted':
-            print_weight_statistics(sc_X_full_all_count)
         
         # ✅ Compute cluster centers and expressions using ALL SC data
         cluster_prototypes, cluster_expressions, cluster_expressions_full_count, cluster_cell_weights = \
@@ -620,8 +530,6 @@ class coEncoder:
                 #print(f"   Cluster {cluster_id} -> {major_celltype} ({celltype_counts.iloc[0]}/{total_cells} cells)")
             self.cluster_to_celltype = cluster_to_celltype
         else:
-            print("="*60)
-            print("   Note: Neither 'cell_type' nor 'celltype' column found in sc_adata, skipping celltype mapping")
             self.cluster_to_celltype = None
         
         # 7. Plot UMAP for modality alignment visualization using vae_viz module

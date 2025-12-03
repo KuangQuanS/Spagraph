@@ -1,0 +1,5 @@
+"""Version information for scmapst package."""
+__version__ = "0.1.0"
+__author__ = "Your Name"
+__email__ = "your.email@example.com"
+__description__ = "Single-cell mapping to spatial transcriptomics with deep learning"

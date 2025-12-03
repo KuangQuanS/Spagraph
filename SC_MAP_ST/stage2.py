@@ -164,7 +164,6 @@ class GATDeconvolution:
                 self.hvg_genes_union = [str(g) for g in hvg_union]
             except Exception as e:
                 self.hvg_genes_union = None
-                print(f"   ⚠️ Failed to load hvg_genes_union from cluster_data: {e}")
         else:
             self.hvg_genes_union = None
         
@@ -178,8 +177,6 @@ class GATDeconvolution:
         
         # Load average cell counts
         self.avg_cell_counts = checkpoint.get('avg_cell_counts', None)
-        if self.avg_cell_counts is not None:
-            print(f"   Average cell counts: {self.avg_cell_counts:.1f}")
         
         # Load all marker genes list
         all_genes = checkpoint.get('all_genes', None)
@@ -206,10 +203,8 @@ class GATDeconvolution:
         # Get embedding dimension from VAE encoder
         embedding_dim = self.latent_dim
         if spot_total_counts is not None:
-            print(f"Spot total counts: min={spot_total_counts.min():.1f}, max={spot_total_counts.max():.1f}, mean={spot_total_counts.mean():.1f}")
             self.spot_total_counts = spot_total_counts
         else:
-            print("⚠️  Warning: spot_total_counts not provided!")
             self.spot_total_counts = None
         self.gat_model = HeterogeneousGATDeconvolution(
             embedding_dim=embedding_dim,  # Use actual VAE latent dimension
@@ -243,8 +238,7 @@ class GATDeconvolution:
             
             sc_celltype_proportions = proportions
         else:
-            print("\n   ⚠️ Warning: sc_clusters not available, proportion loss will not be effective")
-            print("      Tip: Make sure stage1 saves sc_clusters or sc_adata_clustered.h5ad exists")
+            pass
         
         celltype_expr_full = np.vstack([np.asarray(expr, dtype=np.float64) for expr in self.celltype_expressions_full])
         # 计算 marker 基因在全部基因中的索引
@@ -357,12 +351,14 @@ class GATDeconvolution:
                                st_adata=None,
                                n_epochs: int = 50,
                                lr: float = 1e-3,
-                               batch_size: int = 512):
+                               batch_size: int = 512,
+                               print_every: int = 50):
         """Train GAT deconvolution model
         
         Args:
             st_data_normalized: Normalized ST data (sum=1) for VAE embedding
             st_data_raw: Raw count ST data for loss calculation
+            print_every: Print loss every N epochs (default: 50)
         """
         # Save st_adata for later use
         self.st_adata = st_adata
@@ -403,8 +399,7 @@ class GATDeconvolution:
         patience_cosine = 0
         patience = 200  # 每个损失的独立 patience
         
-        pbar = tqdm(range(n_epochs), desc="GAT Training", unit="epoch")
-        for epoch in pbar:
+        for epoch in range(n_epochs):
             # Train one epoch
             epoch_losses = self.train_epoch_batched(
                 dataloader=dataloader,
@@ -453,27 +448,14 @@ class GATDeconvolution:
             if patience_pearson == 0 or patience_mse == 0 or patience_cosine == 0:
                 self.save_model(f"{self.output_dir}/best_gat_model.pth")
             
-            # Update progress bar
-            pbar.set_postfix({
-                'Total': f'{avg_total_loss:.4f}',
-                'MSE': f'{current_mse:.4f}',
-                'Spot_Cosine': f'{current_cosine:.4f}',
-                'Gene_Cosine': f"{epoch_losses.get('gene_cosine_loss', 0.0):.4f}",
-                'Pearson': f'{current_pearson:.4f}',
-                'Gene_Pearson': f"{epoch_losses.get('gene_pearson_loss', 0.0):.4f}",
-                'P_pat': patience_pearson,  # Patience counter
-                'M_pat': patience_mse,
-                'C_pat': patience_cosine
-            })
+            # Print every N epochs
+            if (epoch + 1) % print_every == 0 or epoch == 0:
+                print(f"  Epoch {epoch+1}/{n_epochs}: Total={avg_total_loss:.4f}, MSE={current_mse:.4f}, Pearson={current_pearson:.4f}, Cosine={current_cosine:.4f}")
             
-            # ✅ 早停条件：三个核心损失都没有改善
+            # Early stopping: all three core losses stopped improving
             if patience_pearson >= patience and patience_mse >= patience and patience_cosine >= patience:
-                print(f"\n⚠️ Early stopping triggered at epoch {epoch+1}/{n_epochs}")
-                print(f"   All three core losses stopped improving:")
-                print(f"      Pearson: best={best_pearson:.4f}, current={current_pearson:.4f}, no improvement for {patience_pearson} epochs")
-                print(f"      MSE: best={best_mse:.4f}, current={current_mse:.4f}, no improvement for {patience_mse} epochs")
-                print(f"      Cosine: best={best_cosine:.4f}, current={current_cosine:.4f}, no improvement for {patience_cosine} epochs")
-                pbar.close()
+                print(f"Early stopping at epoch {epoch+1}/{n_epochs}")
+                print(f"  Best: Pearson={best_pearson:.4f}, MSE={best_mse:.4f}, Cosine={best_cosine:.4f}")
                 break
         
         # Plot training curves
@@ -585,7 +567,7 @@ class GATDeconvolution:
             full_expr_file = f"{self.output_dir}/{sample_name}_reconstructed_all_genes.csv"
             full_expr_df.to_csv(full_expr_file)
         else:
-            print("   ⚠️  Warning: Full gene expressions not available, skipping reconstruction")
+            pass
 
         # 3. Cell type composition matrix (spot × cluster/celltype)
 
@@ -595,8 +577,6 @@ class GATDeconvolution:
         checkpoint_cluster_to_celltype = {}
         if self.cluster_to_celltype:
             checkpoint_cluster_to_celltype = {str(k): str(v) for k, v in self.cluster_to_celltype.items()}
-        else:
-            print("   ⚠️  No cluster→celltype mapping found in Stage 1 checkpoint; using cluster IDs as column names.")
         
         # Map cluster columns to celltype names
         celltype_columns = []
@@ -640,7 +620,6 @@ class GATDeconvolution:
             try:
                 marker_indices = [self.all_genes.index(g) for g in self.genes]
             except ValueError:
-                print("   ⚠️ Marker genes not fully found in all_genes list, skipping reconstruction quality.")
                 marker_indices = None
 
         if reconstructed_full_expr is not None and marker_indices is not None:
@@ -678,9 +657,7 @@ class GATDeconvolution:
 
             # Plot reconstruction quality curve (sorted by similarity)
             self.plot_reconstruction_quality_curve(cosine_similarities, sample_name)
-        else:
-            print("   Skipping reconstruction quality metrics (no reconstructed matrix).")
-        
+    
     def plot_reconstruction_quality_curve(self, cosine_similarities, sample_name):
         """Plot reconstruction quality curve (sorted by cosine similarity)
         
@@ -688,7 +665,7 @@ class GATDeconvolution:
             cosine_similarities: Array of cosine similarities per spot [n_spots]
             sample_name: Sample name for saving
         """
-        print("\nPlotting reconstruction quality curve...")
+        n_spots = len(cosine_similarities)
         
         # Sort cosine similarities in ascending order
         sorted_similarities = np.sort(cosine_similarities)
@@ -742,15 +719,7 @@ class GATDeconvolution:
         # Save figure
         output_file = f"{self.output_dir}/{sample_name}_reconstruction_quality_curve.png"
         plt.savefig(output_file, dpi=300, bbox_inches='tight')
-        print(f"   Reconstruction quality curve saved: {output_file}")
         plt.close()
-        
-        # Print summary
-        print(f"\n   Reconstruction Quality Summary:")
-        print(f"      Mean cosine similarity: {mean_sim:.4f}")
-        print(f"      Median cosine similarity: {median_sim:.4f}")
-        print(f"      Range: [{min_sim:.4f}, {max_sim:.4f}]")
-        print(f"      Spots with similarity > 0.8: {np.sum(cosine_similarities > 0.8)} ({100*np.sum(cosine_similarities > 0.8)/n_spots:.1f}%)")
     
     def plot_training_curves(self, train_losses, pearson_losses, mse_losses,
                            cos_losses, gene_pearson_losses, gene_cosine_losses,

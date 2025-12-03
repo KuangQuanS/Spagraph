@@ -1,0 +1,23 @@
+# Include documentation
+include README.md
+include LICENSE
+include requirements.txt
+
+# Include configuration files
+include pyproject.toml
+include setup.py
+
+# Include marker gene files and databases
+recursive-include scmapst *.txt *.csv *.json
+
+# Exclude compiled files and caches
+global-exclude __pycache__
+global-exclude *.py[cod]
+global-exclude *.so
+global-exclude .DS_Store
+
+# Exclude test and development files
+prune tests
+prune trash
+prune results
+prune notebook

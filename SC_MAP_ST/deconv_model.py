@@ -1054,7 +1054,7 @@ def evaluate_vae(vae, test_loader, device, loss_type='mse', beta=1.0):
 
 def train_vae(vae, train_X, test_X, train_modality, test_modality, device,
               batch_size=256, n_epochs=100, lr=1e-3, beta=1.0, loss_type='mse', 
-              lambda_mmd=1.0, output_dir="./stage1_results"):
+              lambda_mmd=1.0, output_dir="./stage1_results", print_every=50):
     """Train VAE with optional MMD loss for modality alignment
     
     Args:
@@ -1071,6 +1071,7 @@ def train_vae(vae, train_X, test_X, train_modality, test_modality, device,
         loss_type: 'mse' or 'zinb'
         lambda_mmd: MMD loss weight
         output_dir: Output directory for saving plots
+        print_every: Print loss every N epochs (default: 50)
     
     Returns:
         best_loss
@@ -1104,8 +1105,7 @@ def train_vae(vae, train_X, test_X, train_modality, test_modality, device,
     patience_counter = 0
     patience = 200
     
-    pbar = tqdm(range(n_epochs), desc="VAE Training", unit="epoch")
-    for epoch in pbar:
+    for epoch in range(n_epochs):
         # Training
         avg_loss, avg_recon, avg_kl, avg_mmd = train_vae_epoch(
             vae, train_loader, optimizer, device, loss_type, beta, lambda_mmd
@@ -1122,13 +1122,12 @@ def train_vae(vae, train_X, test_X, train_modality, test_modality, device,
             
             scheduler.step(test_loss)
             
-            # Update progress bar with test loss
-            if lambda_mmd > 0:
-                pbar.set_postfix({'Train': f'{avg_loss:.4f}', 'Recon': f'{avg_recon:.4f}', 
-                                 'KL': f'{avg_kl:.4f}', 'MMD': f'{avg_mmd:.4f}', 'Test': f'{test_loss:.4f}'})
-            else:
-                pbar.set_postfix({'Train': f'{avg_loss:.4f}', 'Recon': f'{avg_recon:.4f}', 
-                                 'KL': f'{avg_kl:.4f}', 'Test': f'{test_loss:.4f}'})
+            # Print every N epochs
+            if (epoch + 1) % print_every == 0 or epoch == 0:
+                if lambda_mmd > 0:
+                    print(f"  Epoch {epoch+1}/{n_epochs}: Train={avg_loss:.4f}, Recon={avg_recon:.4f}, KL={avg_kl:.4f}, MMD={avg_mmd:.4f}, Test={test_loss:.4f}")
+                else:
+                    print(f"  Epoch {epoch+1}/{n_epochs}: Train={avg_loss:.4f}, Recon={avg_recon:.4f}, KL={avg_kl:.4f}, Test={test_loss:.4f}")
             
             # Save best model based on test loss
             if test_loss < best_loss:
@@ -1139,22 +1138,18 @@ def train_vae(vae, train_X, test_X, train_modality, test_modality, device,
                 
             # Early stopping
             if patience_counter >= patience:
-                print(f"\n⚠️ Early stopping triggered at epoch {epoch+1}/{n_epochs}")
-                print(f"   Best test loss: {best_loss:.4f}, Current test loss: {test_loss:.4f}")
-                print(f"   No improvement for {patience} consecutive epochs")
-                pbar.close()
+                print(f"Early stopping at epoch {epoch+1}/{n_epochs}, best_loss={best_loss:.4f}")
                 break
         else:
             # No test set - use training loss for scheduling and early stopping
             scheduler.step(avg_loss)
             
-            # Update progress bar without test loss
-            if lambda_mmd > 0:
-                pbar.set_postfix({'Train': f'{avg_loss:.4f}', 'Recon': f'{avg_recon:.4f}', 
-                                 'KL': f'{avg_kl:.4f}', 'MMD': f'{avg_mmd:.4f}'})
-            else:
-                pbar.set_postfix({'Train': f'{avg_loss:.4f}', 'Recon': f'{avg_recon:.4f}', 
-                                 'KL': f'{avg_kl:.4f}'})
+            # Print every N epochs
+            if (epoch + 1) % print_every == 0 or epoch == 0:
+                if lambda_mmd > 0:
+                    print(f"  Epoch {epoch+1}/{n_epochs}: Train={avg_loss:.4f}, Recon={avg_recon:.4f}, KL={avg_kl:.4f}, MMD={avg_mmd:.4f}")
+                else:
+                    print(f"  Epoch {epoch+1}/{n_epochs}: Train={avg_loss:.4f}, Recon={avg_recon:.4f}, KL={avg_kl:.4f}")
             
             # Save best model based on training loss
             if avg_loss < best_loss:
@@ -1165,10 +1160,7 @@ def train_vae(vae, train_X, test_X, train_modality, test_modality, device,
                 
             # Early stopping
             if patience_counter >= patience:
-                print(f"\n⚠️ Early stopping triggered at epoch {epoch+1}/{n_epochs}")
-                print(f"   Best train loss: {best_loss:.4f}, Current train loss: {avg_loss:.4f}")
-                print(f"   No improvement for {patience} consecutive epochs")
-                pbar.close()
+                print(f"Early stopping at epoch {epoch+1}/{n_epochs}, best_loss={best_loss:.4f}")
                 break
     
     # Plot training curves
@@ -1250,8 +1242,6 @@ def plot_vae_training_curves(train_losses, test_losses, recon_losses, kl_losses,
 def save_vae_checkpoint(vae, label_encoder, marker_genes, genes, all_genes,
                        sc_clusters, resolution, filepath):
     """Save VAE weights and basic metadata (cluster data saved separately)."""
-    print("="*60)
-    print(f"Saving model to: {filepath}")
     torch.save({
         'vae_state_dict': vae.state_dict(),
         'label_encoder': label_encoder,
@@ -1288,8 +1278,6 @@ def load_vae_for_inference(filepath, device):
     marker_genes = checkpoint['marker_genes']
     genes = checkpoint['genes']
     
-    print(f"VAE model loaded: {filepath}")
-    
     return vae, label_encoder, marker_genes, genes
 
 
@@ -1304,9 +1292,6 @@ def load_vae_pretrained(filepath, device):
         Tuple of (vae, components_dict, output_type, latent_dim)
         where components_dict contains all other checkpoint components
     """
-    print("="*60)
-    print(f"Loading pretrained weights from: {filepath}")
-    
     if not os.path.exists(filepath):
         raise FileNotFoundError(f"Pretrained model not found: {filepath}")
     
@@ -1335,7 +1320,6 @@ def load_vae_pretrained(filepath, device):
     # Try to load cluster data from .npz file
     npz_filepath = filepath.replace('.pth', '_cluster_data.npz')
     if os.path.exists(npz_filepath):
-        print(f"   Loading cluster data from: {npz_filepath}")
         cluster_data = np.load(npz_filepath, allow_pickle=True)
         
         cluster_ids = cluster_data['cluster_ids']
@@ -1370,16 +1354,12 @@ def load_vae_pretrained(filepath, device):
         components['cluster_to_celltype'] = cluster_to_celltype
 
     else:
-        print(f"   Warning: Cluster data file not found: {npz_filepath}")
         # Try to load from old format (in .pth)
         components['cluster_prototypes'] = checkpoint.get('cluster_prototypes', None)
         components['cluster_expressions'] = checkpoint.get('cluster_expressions', None)
         components['cluster_expressions_full'] = checkpoint.get('cluster_expressions_full', None)
         components['cluster_expressions_full_count'] = checkpoint.get('cluster_expressions_full_count', None)
         components['cluster_cell_weights'] = None
-        
-        if components['cluster_prototypes'] is not None:
-            print(f"   Loaded {len(components['cluster_prototypes'])} cluster prototypes from old format (.pth)")
     
     return vae, components, output_type, latent_dim
 

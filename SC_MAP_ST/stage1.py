@@ -92,35 +92,12 @@ class coEncoder:
         if not os.path.exists(self.st_file):
             raise FileNotFoundError(f"ST file not found: {self.st_file}")
         
-        # Load SC data
-        print(f"   Loading SC: {self.sc_file}")
         sc_adata = sc.read_h5ad(self.sc_file)
         sc_adata.obs['modality'] = 'SC'
         sc_adata.var_names_make_unique()
         print(f"   SC shape: {sc_adata.shape}")
         
-        # Calculate average cell counts (for cells_per_spot scale factor in Stage 2)
-        if 'n_counts' in sc_adata.obs.columns:
-            avg_cell_counts = sc_adata.obs['n_counts'].mean()
-            print(f"   SC avg counts/cell: {avg_cell_counts:.1f} (from n_counts)")
-        elif hasattr(sc_adata, 'raw') and sc_adata.raw is not None:
-            if hasattr(sc_adata.raw.X, 'toarray'):
-                avg_cell_counts = sc_adata.raw.X.toarray().sum(axis=1).mean()
-            else:
-                avg_cell_counts = sc_adata.raw.X.sum(axis=1).mean()
-            print(f"   SC avg counts/cell: {avg_cell_counts:.1f} (from raw layer)")
-        else:
-            if hasattr(sc_adata.X, 'toarray'):
-                avg_cell_counts = sc_adata.X.toarray().sum(axis=1).mean()
-            else:
-                avg_cell_counts = sc_adata.X.sum(axis=1).mean()
-            print(f"   SC avg counts/cell: {avg_cell_counts:.1f} (from X)")
-        
-        # Store for later saving
-        self.avg_cell_counts = avg_cell_counts
-        
         # Load ST data
-        print(f"   Loading ST: {self.st_file}")
         st_adata = sc.read_h5ad(self.st_file)
         st_adata.obs['modality'] = 'ST'
         st_adata.var_names_make_unique()
@@ -187,36 +164,18 @@ class coEncoder:
                 marker_selection_method=marker_selection_method,
                 min_cells_per_cluster=2
             )
-        
-        # 1.1 Augment marker genes with top ST HVGs (union) - disabled
-        # print("Augmenting markers with top ST HVGs (default top 1000)...")
-        # st_hvg = st_adata.copy()
-        # sc.pp.normalize_total(st_hvg, target_sum=1e4)
-        # sc.pp.log1p(st_hvg)
-        # sc.pp.highly_variable_genes(st_hvg, n_top_genes=min(1000, st_hvg.shape[1]), flavor='seurat')
-        # st_hvg_genes = list(st_hvg.var.index[st_hvg.var['highly_variable']])
-        # print(f"   ST HVGs selected: {len(st_hvg_genes)}")
 
-        # combined_genes = list(self.marker_genes)
-        # for g in st_hvg_genes:
-        #     if g not in combined_genes:
-        #         combined_genes.append(g)
-        # self.marker_genes = combined_genes
-        # print(f"   Combined marker+HVG genes: {len(self.marker_genes)}")
-        
         # Save clustered adata for annotation
         self.sc_adata_clustered = sc_adata_clustered
-        cluster_adata_file = f"{self.output_dir}/sc_adata_clustered.h5ad"
+        # cluster_adata_file = f"{self.output_dir}/sc_adata_clustered.h5ad"
         # sc_adata_clustered.write_h5ad(cluster_adata_file)
-        print(f"Saved clustered SC adata: {cluster_adata_file}")
-        
+
         # Save clustering info and resolution
         self.sc_clusters = sc_clusters
         self.resolution = resolution
         
         # 2. Process SC data (extract marker genes then normalize + log1p)
-        print("Processing SC data (log1p on library-normalized counts)...")
-
+ 
         # Preserve raw counts for full-gene aggregation later
         sc_raw_all = sc_adata.X.toarray() if hasattr(sc_adata.X, 'toarray') else sc_adata.X
 
@@ -224,8 +183,7 @@ class coEncoder:
         sc_adata_count = sc_adata[sc_clusters.index].copy()
         sc.pp.normalize_total(sc_adata_count, target_sum=1e4)
         sc.pp.log1p(sc_adata_count)
-        print(f" SC data (all genes, log1p norm): min={sc_adata_count.X.min():.2f}, max={sc_adata_count.X.max():.2f}, genes={sc_adata_count.shape[1]}")
-    
+  
         # Extract full gene expression (log1p norm) for training features
         sc_X_full_count = sc_adata_count.X.toarray() if hasattr(sc_adata_count.X, 'toarray') else sc_adata_count.X
         sc_all_genes = list(sc_adata_count.var.index)
@@ -234,10 +192,7 @@ class coEncoder:
         sc_subset = sc_adata_count[:, sc_adata_count.var.index.isin(self.marker_genes)].copy()
         sc_X = sc_subset.X.toarray() if hasattr(sc_subset.X, 'toarray') else sc_subset.X
         sc_labels = sc_clusters.values
-        print("="*60)
-        print(f"SC data (marker genes): min={np.min(sc_X)}, max={np.max(sc_X)}, genes={len(self.marker_genes)}")
-        print("="*60)
-
+  
         # Encode labels
         self.label_encoder = LabelEncoder()
         sc_y = self.label_encoder.fit_transform(sc_labels)
@@ -250,19 +205,12 @@ class coEncoder:
         st_proc = st_adata.copy()
         sc.pp.normalize_total(st_proc, target_sum=1e4)
         sc.pp.log1p(st_proc)
-        print(f" ST data (all genes, log1p norm): min={st_proc.X.min():.2f}, max={st_proc.X.max():.2f}, genes={st_proc.shape[1]}")
-    
+
         available_genes = [g for g in self.marker_genes if g in st_proc.var.index]
         st_subset = st_proc[:, available_genes].copy()
         
         st_X = st_subset.X.toarray() if hasattr(st_subset.X, 'toarray') else st_subset.X
-        print("="*60)
-        print(f"ST data (marker genes): min={np.min(st_X)}, max={np.max(st_X)}, genes={len(available_genes)}/{len(self.marker_genes)}")
-        print("="*60)
-        print(f"   ST data: {st_X.shape}")
 
-        # 3. 计算 SC/ST 各自 top-3000 高变基因，并取交集（用于 Stage 2 缩放因子测试）
-        print("Computing intersection of top-3000 HVGs from SC and ST...")
         try:
             # SC HVG：在已做 normalize_total+log1p 的 sc_adata_count 上
             sc_hvg = sc_adata_count.copy()
@@ -410,8 +358,7 @@ class coEncoder:
             genes=self.genes,
             sc_clusters=getattr(self, 'sc_clusters', None),
             resolution=getattr(self, 'resolution', 0.5),
-            all_genes=getattr(self, 'all_genes', None),
-            avg_cell_counts=getattr(self, 'avg_cell_counts', None)
+            all_genes=getattr(self, 'all_genes', None)
         )
         print(f"✅ Saved VAE model (weights only): {filepath}")
     
@@ -615,13 +562,6 @@ class coEncoder:
         self.sc_X_full_all_count = sc_X_full_all_count  # ALL SC full gene data (count)
         self.sc_all_labels = sc_all_labels  # ALL SC cluster labels
         
-        # 5. Compute and save cluster centers using ALL data (not just training set)
-        print("="*60)
-        print("📊 Computing cluster centers using ALL SC data (train + test)...")
-        
-        print(f"   ALL SC data: {sc_X_final.shape}")
-        print(f"   Number of clusters: {len(np.unique(sc_all_labels))}")
-        
         # ✅ Use trained VAE to compute embeddings for ALL SC cells
         self.vae.eval()
         with torch.no_grad():
@@ -638,9 +578,7 @@ class coEncoder:
                 all_embeddings.append(mu.cpu().numpy())
             
             embeddings = np.vstack(all_embeddings)
-        
-        print(f"   Computed embeddings shape: {embeddings.shape}")
-        
+
         # Print weight statistics if using weighted aggregation
         if aggregation_method == 'weighted':
             print_weight_statistics(sc_X_full_all_count)
@@ -673,8 +611,6 @@ class coEncoder:
             celltype_col = 'celltype'
         
         if celltype_col is not None:
-            print("="*60)
-            print(f"Extracting celltype-cluster mapping (using '{celltype_col}' column)...")
             for cluster_id in sorted(self.sc_adata_clustered.obs['leiden'].unique()):
                 cluster_mask = self.sc_adata_clustered.obs['leiden'] == cluster_id
                 celltype_counts = self.sc_adata_clustered.obs[cluster_mask][celltype_col].value_counts()
@@ -689,8 +625,6 @@ class coEncoder:
             self.cluster_to_celltype = None
         
         # 7. Plot UMAP for modality alignment visualization using vae_viz module
-        print("="*60)
-        print("Visualizing modality alignment...")
         plot_modality_alignment_umap(
             vae=self.vae,
             train_X=train_X,
@@ -742,7 +676,7 @@ def main():
                        help='VAE latent space dimension')
     
     # Training arguments
-    parser.add_argument('--batch_size', type=int, default=512,
+    parser.add_argument('--batch_size', type=int, default=256,
                        help='Batch size')
     parser.add_argument('--n_epochs', type=int, default=150,
                        help='Number of epochs')

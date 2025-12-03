@@ -708,7 +708,6 @@ class SpatialDeconvolutionLoss(nn.Module):
         self.lambda_proportion = lambda_proportion  # 细胞类型比例一致性权重
         self.scale_basis = scale_basis            # 用于缩放的基因集合: marker / hvg / all / none
         
-        # ✅ spot_total_counts: 每个 spot 在全部基因上的总 UMI 数 [n_spots]
         # 当 scale_basis='none' 时允许为 None（不进行缩放）
         if spot_total_counts is None and scale_basis != 'none':
             raise ValueError("spot_total_counts is required for reconstruction when scale_basis != 'none'!")
@@ -717,19 +716,16 @@ class SpatialDeconvolutionLoss(nn.Module):
         else:
             self.spot_total_counts = None
         
-        # ✅ celltype_expressions_full: 细胞类型在全部基因上的表达 [n_cell_types, n_all_genes]
         # 用于重建完整的 spot 表达谱，然后只在 marker 基因上计算 loss
         if celltype_expressions_full is None:
             raise ValueError("celltype_expressions_full is required for full gene reconstruction!")
         self.register_buffer('celltype_expressions_full', torch.FloatTensor(celltype_expressions_full))
         
-        # ✅ marker_gene_indices: marker 基因在全部基因中的索引 [n_marker_genes]
         # 用于从重建的全部基因表达中提取 marker 基因
         if marker_gene_indices is None:
             raise ValueError("marker_gene_indices is required to extract marker genes!")
         self.register_buffer('marker_gene_indices', torch.LongTensor(marker_gene_indices))
         
-        # ✅ hvg_gene_indices: HVG 交集在全部基因中的索引 [n_hvg_genes]（可选）
         if hvg_gene_indices is not None and len(hvg_gene_indices) > 0:
             self.register_buffer('hvg_gene_indices', torch.LongTensor(hvg_gene_indices))
         else:
@@ -768,9 +764,6 @@ class SpatialDeconvolutionLoss(nn.Module):
         """
         n_spots = attention_weights.shape[0]
 
-        # ✅ 使用全部基因重建 spot 表达: X̂_i = scale_i × Σ(w_ic × R_c^full) 或直接混合（无缩放）
-        # 1) 使用原始尺度的 celltype_expressions_full [n_cell_types, n_all_genes]
-        # 2) 线性混合得到预估表达
         mixed_expr_full = torch.matmul(
             attention_weights,               # [n_spots, n_cell_types]
             self.celltype_expressions_full   # [n_cell_types, n_all_genes]
@@ -803,7 +796,6 @@ class SpatialDeconvolutionLoss(nn.Module):
         
         # ============ 1. Pearson Correlation Loss ============
         # 计算Pearson相关系数(基于基因表达的相关性)
-        # ✅ 在 marker 基因上计算，先 normalize 到比例空间，再 log，消除文库大小差异
         def pearson_correlation(x, y):
             """计算Pearson相关系数"""
             x_centered = x - x.mean(dim=-1, keepdim=True)
@@ -1083,16 +1075,6 @@ def train_vae(vae, train_X, test_X, train_modality, test_modality, device,
     Returns:
         best_loss
     """
-    print("="*60)
-    print("Starting VAE training...")
-    print(f"   Train data: {train_X.shape} (SC: {sum(train_modality==0)}, ST: {sum(train_modality==1)})")
-    if test_X is not None:
-        print(f"   Test data: {test_X.shape} (SC: {sum(test_modality==0)}, ST: {sum(test_modality==1)})")
-    else:
-        print(f"   Test data: None (using all data for training)")
-    print(f"   Loss type: {loss_type.upper()}")
-    print(f"   MMD weight: {lambda_mmd}")
-
     # Data loader
     from torch.utils.data import DataLoader
     train_dataset = SimpleDataset(train_X, train_modality)
@@ -1134,7 +1116,6 @@ def train_vae(vae, train_X, test_X, train_modality, test_modality, device,
         kl_losses.append(avg_kl)
         mmd_losses.append(avg_mmd)
         
-        # ✅ Evaluate every epoch (not every 5 epochs) for better early stopping
         if test_loader is not None:
             test_loss = evaluate_vae(vae, test_loader, device, loss_type, beta)
             test_losses.append(test_loss)
@@ -1267,12 +1248,10 @@ def plot_vae_training_curves(train_losses, test_losses, recon_losses, kl_losses,
 
 
 def save_vae_checkpoint(vae, label_encoder, marker_genes, genes, all_genes,
-                       sc_clusters, resolution, filepath, avg_cell_counts=None):
+                       sc_clusters, resolution, filepath):
     """Save VAE weights and basic metadata (cluster data saved separately)."""
     print("="*60)
     print(f"Saving model to: {filepath}")
-    if avg_cell_counts is not None:
-        print(f"   Average cell counts: {avg_cell_counts:.1f} (for Stage 2 scale factor)")
     torch.save({
         'vae_state_dict': vae.state_dict(),
         'label_encoder': label_encoder,
@@ -1283,8 +1262,7 @@ def save_vae_checkpoint(vae, label_encoder, marker_genes, genes, all_genes,
         'output_type': vae.output_type,
         'sc_clusters': sc_clusters,
         'resolution': resolution,
-        'all_genes': all_genes,
-        'avg_cell_counts': avg_cell_counts
+        'all_genes': all_genes
     }, filepath)
     
 def load_vae_for_inference(filepath, device):
@@ -1339,9 +1317,6 @@ def load_vae_pretrained(filepath, device):
     latent_dim = checkpoint['latent_dim']
     output_type = checkpoint.get('output_type', 'mse')
     
-    print(f"   Input dim: {input_dim}")
-    print(f"   Latent dim: {latent_dim}")
-    print(f"   Output type: {output_type}")
     
     # Build VAE model with same architecture
     vae = VAE(input_dim=input_dim, latent_dim=latent_dim, output_type=output_type).to(device)
@@ -1393,14 +1368,7 @@ def load_vae_pretrained(filepath, device):
         components['cluster_expressions_full_count'] = cluster_expressions_full
         components['cluster_cell_weights'] = cluster_cell_weights if cluster_cell_weights else None
         components['cluster_to_celltype'] = cluster_to_celltype
-        
-        print(f"      Loaded {len(cluster_prototypes)} cluster prototypes")
-        print(f"      Loaded {len(cluster_expressions)} cluster expressions (marker genes)")
-        print(f"      Loaded {len(cluster_expressions_full)} cluster expressions (all genes)")
-        if cluster_cell_weights:
-            print(f"      Loaded cell weights for {len(cluster_cell_weights)} clusters")
-        if cluster_to_celltype:
-            print(f"      Loaded celltype mapping for {len(cluster_to_celltype)} clusters")
+
     else:
         print(f"   Warning: Cluster data file not found: {npz_filepath}")
         # Try to load from old format (in .pth)
@@ -1412,9 +1380,6 @@ def load_vae_pretrained(filepath, device):
         
         if components['cluster_prototypes'] is not None:
             print(f"   Loaded {len(components['cluster_prototypes'])} cluster prototypes from old format (.pth)")
-    
-    print("   Pretrained weights loaded successfully!")
-    print("="*60)
     
     return vae, components, output_type, latent_dim
 
@@ -1431,9 +1396,6 @@ def plot_modality_alignment_umap(vae, train_X, train_modality, device, y_train=N
         y_train: Optional cluster labels for SC samples
         output_dir: Output directory
     """
-    print("="*60)
-    print("Generating UMAP visualization for modality alignment...")
-    
     # Get embeddings from trained VAE
     vae.eval()
     with torch.no_grad():
@@ -1447,8 +1409,6 @@ def plot_modality_alignment_umap(vae, train_X, train_modality, device, y_train=N
             all_embeddings.append(mu.cpu().numpy())
         
         embeddings = np.vstack(all_embeddings)
-    
-    print(f"   Computing UMAP on {embeddings.shape[0]} samples with {embeddings.shape[1]} dims...")
     
     # Compute UMAP
     reducer = umap.UMAP(n_neighbors=30, min_dist=0.3, metric='euclidean', random_state=42)
@@ -1518,5 +1478,3 @@ def plot_modality_alignment_umap(vae, train_X, train_modality, device, y_train=N
     plt.tight_layout()
     plt.savefig(f"{output_dir}/modality_alignment_umap.png", dpi=300, bbox_inches='tight')
     plt.close()
-    
-    print(f"   UMAP visualization saved to: {output_dir}/modality_alignment_umap.png")

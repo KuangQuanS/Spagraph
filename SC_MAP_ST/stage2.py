@@ -61,13 +61,7 @@ class GATDeconvolution:
         
         # Weight threshold for sparsification
         self.weight_threshold = weight_threshold
-        
-        print("="*60)
-        print(f"Stage 1 model: {stage1_model_path}")
-        print(f"Output directory: {output_dir}")
-        print(f"Device: {self.device}")
-        print(f"Weight threshold: {weight_threshold}")
-    
+
         # Model components
         self.vae_encoder = None
         self.gat_model = None
@@ -86,9 +80,6 @@ class GATDeconvolution:
         
     def load_vae_encoder(self):
         """Load Stage 1 VAE components"""
-        print("="*60)
-        print("Loading pretrained VAE Encoder...")
-        
         checkpoint = torch.load(self.stage1_model_path, map_location=self.device, weights_only=False)
         
         # Rebuild VAE
@@ -96,26 +87,14 @@ class GATDeconvolution:
         latent_dim = checkpoint['latent_dim']
         output_type = checkpoint.get('output_type', 'mse')  # Get output_type from checkpoint
         
-        print(f"   VAE architecture: {input_dim} -> {latent_dim}")
-        print(f"   Output type: {output_type}")
-        
         # 检测是否是双解码器架构
         state_dict = checkpoint['vae_state_dict']
-        is_dual_decoder = any('decoder_sc' in key or 'decoder_st' in key for key in state_dict.keys())
-        
-        if is_dual_decoder:
-            print(f"   Architecture: Dual Decoder (SC/ST-specific)")
-            # 使用双解码器VAE
-            from deconv_model import DualDecoderVAE
-            full_vae = DualDecoderVAE(input_dim=input_dim, latent_dim=latent_dim, output_type=output_type).to(self.device)
-        else:
-            print(f"   Architecture: Single Decoder")
-            # 使用标准VAE
-            full_vae = VAE(input_dim=input_dim, latent_dim=latent_dim, output_type=output_type).to(self.device)
-        
+
+        from deconv_model import DualDecoderVAE
+        full_vae = DualDecoderVAE(input_dim=input_dim, latent_dim=latent_dim, output_type=output_type).to(self.device)
+
         full_vae.load_state_dict(state_dict)
-        
-        # Extract encoder (encoder是共享的，不管单双解码器)
+
         self.vae_encoder = full_vae.encoder
         self.vae_encoder.eval()  # Freeze encoder
         
@@ -127,25 +106,7 @@ class GATDeconvolution:
         self.marker_genes = checkpoint['marker_genes']
         self.genes = checkpoint['genes']
         self.sc_clusters = checkpoint.get('sc_clusters', None)
-        
-        # 尝试从 sc_adata_clustered.h5ad 加载聚类信息（作为备选）
-        if self.sc_clusters is None:
-            sc_adata_path = os.path.join(os.path.dirname(self.stage1_model_path), 'sc_adata_clustered.h5ad')
-            if os.path.exists(sc_adata_path):
-                print(f"\n   sc_clusters not in checkpoint, loading from {sc_adata_path}")
-                import scanpy as sc
-                sc_adata = sc.read_h5ad(sc_adata_path)
-                if 'leiden' in sc_adata.obs:
-                    self.sc_clusters = sc_adata.obs['leiden'].copy()
-                    if hasattr(self.sc_clusters, 'cat'):
-                        self.sc_clusters = self.sc_clusters.cat.remove_unused_categories()
-                    print(f"   ✓ Loaded {len(self.sc_clusters)} cell cluster labels from h5ad")
-                else:
-                    print(f"   ⚠️ 'leiden' column not found in {sc_adata_path}")
-            else:
-                print(f"   ⚠️ sc_adata_clustered.h5ad not found at {sc_adata_path}")
-        else:
-            print(f"   ✓ Loaded {len(self.sc_clusters)} cell cluster labels from checkpoint")
+
         self.resolution = checkpoint.get('resolution', 0.5)
         self.celltype_key = checkpoint.get('celltype_key', None)  # Get celltype mode info
         
@@ -155,9 +116,7 @@ class GATDeconvolution:
             # If using celltype mode, create mapping from label_encoder
             # label_encoder.classes_ contains celltype names
             self.cluster_to_celltype = {i: ct for i, ct in enumerate(self.label_encoder.classes_)}
-            print(f"Celltype mode: {self.celltype_key}")
-            print(f"Cluster → CellType mapping: {self.cluster_to_celltype}")
-        
+
         # Load cluster data from npz file
         npz_filepath = self.stage1_model_path.replace('.pth', '_cluster_data.npz')
         
@@ -167,7 +126,6 @@ class GATDeconvolution:
                 f"Please retrain Stage 1 with the latest version to generate the npz file."
             )
         
-        print(f"Loading cluster data from: {npz_filepath}")
         cluster_data = np.load(npz_filepath, allow_pickle=True)
         
         cluster_ids = cluster_data['cluster_ids']
@@ -187,7 +145,6 @@ class GATDeconvolution:
         self.celltype_prototypes = torch.FloatTensor(prototypes_array).to(self.device)
         self.celltype_expressions = torch.FloatTensor(expressions_array).to(self.device)
         
-        # ✅ Handle expressions_full_array (object array containing list of arrays)
         if expressions_full_array.ndim == 0:
             # It's a 0-d object array containing a list
             expressions_full_list = expressions_full_array.item()
@@ -205,7 +162,6 @@ class GATDeconvolution:
                 if isinstance(hvg_union, np.ndarray):
                     hvg_union = list(hvg_union.tolist())
                 self.hvg_genes_union = [str(g) for g in hvg_union]
-                print(f"   HVG union loaded from cluster_data: {len(self.hvg_genes_union)} genes")
             except Exception as e:
                 self.hvg_genes_union = None
                 print(f"   ⚠️ Failed to load hvg_genes_union from cluster_data: {e}")
@@ -220,30 +176,18 @@ class GATDeconvolution:
         else:
             self.cluster_to_celltype = None
         
-        print(f"   Cluster prototypes: {self.celltype_prototypes.shape}")
-        print(f"   Cluster expressions (marker): {self.celltype_expressions.shape}")
-        print(f"   Cluster expressions (all genes): {len(self.celltype_expressions_full)} × {len(self.celltype_expressions_full[0])}")
-        if self.cluster_to_celltype:
-            print(f"   Loaded celltype mapping: {len(self.cluster_to_celltype)} clusters")
-        
         # Load average cell counts
         self.avg_cell_counts = checkpoint.get('avg_cell_counts', None)
         if self.avg_cell_counts is not None:
             print(f"   Average cell counts: {self.avg_cell_counts:.1f}")
         
-        # Load all genes list
+        # Load all marker genes list
         all_genes = checkpoint.get('all_genes', None)
         if all_genes is not None:
             self.all_genes = all_genes
-            print(f"Loaded all genes list: {len(all_genes)} genes")
         else:
             self.all_genes = None
-            print("Warning: all genes list not found")
-        
-        print(f"VAE Encoder loaded: {input_dim} -> {latent_dim}")
-        print(f"Cell type clusters: {list(self.label_encoder.classes_)}")
-        print(f"Marker genes: {len(self.genes)}")
-        
+
         # Freeze encoder parameters
         for param in self.vae_encoder.parameters():
             param.requires_grad = False
@@ -259,30 +203,14 @@ class GATDeconvolution:
             spot_total_counts: Array of total counts for each spot (shape: [n_spots])
                               Used for scaling: reconstructed = s_i × Σ(w_ic × R_c)
         """
-        print("="*60)
-        print("Building GAT model...")
-        
         # Get embedding dimension from VAE encoder
         embedding_dim = self.latent_dim
-        print(f"VAE latent dimension: {embedding_dim}")
-        
-        print(f"GAT hidden dim: {gat_hidden_dim}")
-        print(f"GAT layers: {gat_layers}")
-        print(f"Attention heads: {gat_heads}")
-        print(f"Dropout: {dropout}")
-        
         if spot_total_counts is not None:
             print(f"Spot total counts: min={spot_total_counts.min():.1f}, max={spot_total_counts.max():.1f}, mean={spot_total_counts.mean():.1f}")
             self.spot_total_counts = spot_total_counts
         else:
             print("⚠️  Warning: spot_total_counts not provided!")
             self.spot_total_counts = None
-            
-        print(f"Loss weights: λ_pearson={loss_lambda_pearson}, λ_mse={loss_lambda_mse}, "
-              f"λ_cosine={loss_lambda_cosine}, λ_gene_pearson={loss_lambda_gene_pearson}, λ_gene_cosine={loss_lambda_gene_cosine}, "
-              f"λ_reg={loss_lambda_reg}, λ_sparse={loss_lambda_sparse}, "
-              f"λ_proportion={loss_lambda_proportion}")
-        
         self.gat_model = HeterogeneousGATDeconvolution(
             embedding_dim=embedding_dim,  # Use actual VAE latent dimension
             n_cell_types=n_cell_types,
@@ -299,7 +227,6 @@ class GATDeconvolution:
         sc_celltype_proportions = None
         if hasattr(self, 'sc_clusters') and self.sc_clusters is not None:
             # sc_clusters 是从 stage1 加载的单细胞cluster标签
-            print(f"\n   Computing cell type proportions from {len(self.sc_clusters)} cells...")
             cluster_counts = {}
             for cluster_id in self.sc_clusters:
                 cluster_counts[cluster_id] = cluster_counts.get(cluster_id, 0) + 1
@@ -315,34 +242,20 @@ class GATDeconvolution:
                 proportions.append(proportion)
             
             sc_celltype_proportions = proportions
-            print(f"   Single-cell cluster proportions (total {total_cells} cells):")
-            for i, prop in enumerate(proportions):
-                count = cluster_counts.get(str(i), cluster_counts.get(i, 0))
-                print(f"      Cluster {i}: {count:6d} cells ({prop*100:6.2f}%)")
         else:
             print("\n   ⚠️ Warning: sc_clusters not available, proportion loss will not be effective")
             print("      Tip: Make sure stage1 saves sc_clusters or sc_adata_clustered.h5ad exists")
         
-        # ✅ 准备 celltype_expressions_full (全部基因) 和 marker_gene_indices
-        # celltype_expressions_full: [n_cell_types, n_all_genes]
-        # 注意: self.celltype_expressions_full 是 list of arrays，需要 stack 成 2D array
-        # 强制转换为 float64 避免 object dtype 问题
         celltype_expr_full = np.vstack([np.asarray(expr, dtype=np.float64) for expr in self.celltype_expressions_full])
-        print(f"\n   Celltype expressions (all genes): {celltype_expr_full.shape}, dtype={celltype_expr_full.dtype}")
-        
         # 计算 marker 基因在全部基因中的索引
         marker_gene_indices = [self.all_genes.index(g) for g in self.genes]
-        print(f"   Marker gene indices: {len(marker_gene_indices)} markers in {len(self.all_genes)} all genes")
-        
         # 计算 HVG 交集在全部基因中的索引（如果可用）
         hvg_gene_indices = None
         if getattr(self, "hvg_genes_union", None) is not None:
             try:
                 hvg_gene_indices = [self.all_genes.index(g) for g in self.hvg_genes_union if g in self.all_genes]
-                print(f"   HVG gene indices: {len(hvg_gene_indices)} HVGs in {len(self.all_genes)} all genes")
             except Exception as e:
                 hvg_gene_indices = None
-                print(f"   ⚠️ Failed to compute HVG gene indices: {e}")
         
         self.loss_fn = SpatialDeconvolutionLoss(
             lambda_pearson=loss_lambda_pearson,
@@ -361,9 +274,6 @@ class GATDeconvolution:
             scale_basis=getattr(self, "scale_basis", "hvg")
         ).to(self.device)  # ✅ Move loss function to device
         
-        gat_params = sum(p.numel() for p in self.gat_model.parameters())
-        print(f"GAT parameters: {gat_params:,}")
-    
     def train_epoch_batched(self, 
                            dataloader: DataLoader,
                            optimizer) -> Dict[str, float]:
@@ -454,17 +364,9 @@ class GATDeconvolution:
             st_data_normalized: Normalized ST data (sum=1) for VAE embedding
             st_data_raw: Raw count ST data for loss calculation
         """
-        print("="*60)
-        print("Starting GAT deconvolution training...")
-        print(f"   ST normalized data for embedding: {st_data_normalized.shape}")
-        print(f"   ST raw count data for loss: {st_data_raw.shape}")
-        
         # Save st_adata for later use
         self.st_adata = st_adata
  
-        # Convert to tensor
-        st_tensor_normalized = torch.FloatTensor(st_data_normalized).to(self.device)
-        st_tensor_raw = torch.FloatTensor(st_data_raw).to(self.device)
         spatial_tensor = torch.FloatTensor(spatial_coords).to(self.device)
         
         # Create dataset and dataloader (use normalized data for embedding)
@@ -519,14 +421,11 @@ class GATDeconvolution:
             gene_cosine_losses.append(epoch_losses.get('gene_cosine_loss', 0.0))
             weight_regs.append(epoch_losses['weight_reg'])
             sparsity_regs.append(epoch_losses.get('sparsity_loss', 0.0))
-            diversity_losses.append(0.0)  # 已禁用
-            hetero_losses.append(0.0)  # 已禁用
             proportion_losses.append(epoch_losses.get('proportion_loss', 0.0))
             
             # Learning rate schedule (based on total loss)
             scheduler.step(avg_total_loss)
-            
-            # ✅ 分别跟踪三个核心损失的改善情况
+
             current_pearson = epoch_losses['pearson_loss']
             current_mse = epoch_losses['mse_loss']
             current_cosine = epoch_losses['cosine_loss']
@@ -607,9 +506,6 @@ class GATDeconvolution:
         Note: No longer needs cells_per_spot parameter.
         Uses spot_total_counts stored during build_gat_model.
         """
-        print("="*60)
-        print("Evaluating model results...")
-        
         self.gat_model.eval()
         
         st_tensor = torch.FloatTensor(st_data).to(self.device)
@@ -631,42 +527,33 @@ class GATDeconvolution:
             deconv_weights = gat_outputs['deconv_weights'].detach().cpu().numpy()
             attention_scores = gat_outputs['attention_scores'].detach().cpu().numpy()
         
-        # Apply weight threshold (sparsification)
-        print(f"Applying weight threshold: {self.weight_threshold}")
         original_nonzero = np.count_nonzero(deconv_weights)
         deconv_weights[deconv_weights < self.weight_threshold] = 0
         new_nonzero = np.count_nonzero(deconv_weights)
-        print(f"   Non-zero elements: {original_nonzero} -> {new_nonzero} ({100*new_nonzero/deconv_weights.size:.1f}%)")
-        
+ 
         # Renormalize weights to sum to 1 per spot (after thresholding)
         row_sums = deconv_weights.sum(axis=1, keepdims=True)
         row_sums[row_sums == 0] = 1  # Avoid division by zero
         deconv_weights = deconv_weights / row_sums
-        
-        print("Saving deconvolution results...")
+
 
         n_spots = deconv_weights.shape[0]
-        
-        print("Generating deconvolution expression matrices...")
-        
+
         # Get spot barcodes
         spot_barcodes = list(st_adata.obs.index)
         
         # Full gene expression matrix (use count version with spot_total_counts)
         reconstructed_full_expr = None
         if self.celltype_expressions_full is not None and all(expr is not None for expr in self.celltype_expressions_full):
-            print("   Reconstructing all gene expression...")
+
             celltype_expr_full = np.array(self.celltype_expressions_full)  # [n_clusters, n_all_genes]
             celltype_expr_marker = self.celltype_expressions.cpu().numpy()  # [n_clusters, n_marker_genes]
             
-            # 计算重建表达（根据 scale_basis 决定是否缩放）
             mixed_expr_full = np.dot(deconv_weights, celltype_expr_full)  # [n_spots, n_all_genes]
             
             scale_basis = getattr(self, "scale_basis", "all")
             if scale_basis == "none":
-                # 不使用缩放，直接使用混合表达
                 reconstructed_full_expr = mixed_expr_full
-                print("   💡 No scaling applied (scale_basis='none')")
             else:
                 # ✅ 使用 spot_total_counts 计算 scale factor
                 # 1. 重建的 marker 基因表达 (raw count scale)
@@ -697,12 +584,10 @@ class GATDeconvolution:
             )
             full_expr_file = f"{self.output_dir}/{sample_name}_reconstructed_all_genes.csv"
             full_expr_df.to_csv(full_expr_file)
-            print(f"   Saved: {full_expr_file}")
         else:
             print("   ⚠️  Warning: Full gene expressions not available, skipping reconstruction")
 
         # 3. Cell type composition matrix (spot × cluster/celltype)
-        print("   Cell type composition...")
 
         cluster_list = list(self.label_encoder.classes_)
 
@@ -710,7 +595,6 @@ class GATDeconvolution:
         checkpoint_cluster_to_celltype = {}
         if self.cluster_to_celltype:
             checkpoint_cluster_to_celltype = {str(k): str(v) for k, v in self.cluster_to_celltype.items()}
-            print(f"   Using cluster→celltype mapping from Stage 1 checkpoint ({len(checkpoint_cluster_to_celltype)} entries).")
         else:
             print("   ⚠️  No cluster→celltype mapping found in Stage 1 checkpoint; using cluster IDs as column names.")
         
@@ -733,17 +617,13 @@ class GATDeconvolution:
         # 如果存在重复的 celltype 名称，则将对应列合并（按列求和）并记录日志
         dup_names = [name for name in set(celltype_columns) if celltype_columns.count(name) > 1]
         if len(dup_names) > 0:
-            print(f"   Found duplicate celltype names: {dup_names}. Merging corresponding cluster columns by summing weights.")
-            # groupby on columns will sum duplicated-named columns
             composition_by_celltype = composition_df.groupby(by=composition_df.columns, axis=1).sum()
-            print(f"   Columns before: {len(composition_df.columns)}, after merge: {len(composition_by_celltype.columns)}")
         else:
             composition_by_celltype = composition_df
 
         # Save aggregated celltype composition
         composition_file = f"{self.output_dir}/{sample_name}_cell_composition.csv"
         composition_by_celltype.to_csv(composition_file)
-        print(f"   Saved cell composition (celltype): {composition_file}")
 
         # Also save cluster-level composition (columns are cluster IDs) for reproducibility
         cluster_composition_df = pd.DataFrame(
@@ -753,8 +633,7 @@ class GATDeconvolution:
         )
         cluster_file = f"{self.output_dir}/{sample_name}_cluster_composition.csv"
         cluster_composition_df.to_csv(cluster_file)
-        print(f"   Saved cluster composition: {cluster_file}")
-        
+
         # ============ Compute reconstruction quality (Cosine Similarity) ============
         marker_indices = None
         if reconstructed_full_expr is not None and self.all_genes is not None:
@@ -774,8 +653,6 @@ class GATDeconvolution:
             reconstructed_marker_expr = np.asarray(reconstructed_marker_expr, dtype=np.float64)
             true_expr = np.asarray(true_expr, dtype=np.float64)
 
-            print(f"   Using {len(self.genes)} marker genes for reconstruction quality (consistent with training objective)")
-            
             # Compute cosine similarity per spot (log-normalized space)
             reconstructed_log = np.log1p(reconstructed_marker_expr)
             true_log = np.log1p(true_expr)
@@ -798,7 +675,6 @@ class GATDeconvolution:
             })
             cosine_csv = f"{self.output_dir}/{sample_name}_spot_cosine_similarity.csv"
             cosine_df.to_csv(cosine_csv, index=False)
-            print(f"   Cosine similarities saved: {cosine_csv}")
 
             # Plot reconstruction quality curve (sorted by similarity)
             self.plot_reconstruction_quality_curve(cosine_similarities, sample_name)
@@ -939,7 +815,7 @@ def main():
                        help='Number of epochs')
     parser.add_argument('--lr', type=float, default=5e-3,
                        help='Learning rate')
-    parser.add_argument('--batch_size', type=int, default=512,
+    parser.add_argument('--batch_size', type=int, default=256,
                        help='Batch size')
     
     # Loss function arguments
@@ -990,8 +866,6 @@ def main():
     if sample_name.endswith('_ST'):
         sample_name = sample_name[:-3]
     
-    print(f"Sample name: {sample_name}")
- 
     # Initialize trainer
     trainer = GATDeconvolution(
         stage1_model_path=args.stage1_model_path,
@@ -1009,10 +883,6 @@ def main():
     # Load VAE Encoder
     trainer.load_vae_encoder()
 
-    # Stage 2 does not need to load SC data
-    # All cluster info (centers, expressions, encoder) already computed in stage1
-    print("Using Stage 1 cluster centers and expressions...")
-    
     if trainer.sc_clusters is None:
         raise ValueError("Stage 1 model missing cluster information! Please retrain with new version.")
     
@@ -1023,18 +893,10 @@ def main():
     has_expressions = hasattr(trainer, 'celltype_expressions') and trainer.celltype_expressions is not None
     
     if has_prototypes and has_expressions:
-        print("Using Stage 1 pretrained cluster data")
-        print(f"   Cluster centers: {trainer.celltype_prototypes.shape}")
-        print(f"   Cluster expressions: {trainer.celltype_expressions.shape}")
         n_clusters = trainer.celltype_prototypes.shape[0]
     else:
         raise ValueError("Stage 1 model missing cluster centers or expressions!")
     
-    print("="*60)
-    print("Loading and processing spatial transcriptomics data...")
-    
-    # Load ST data
-    print(f"Loading ST data: {args.st_file}")
     st_adata = sc.read_h5ad(args.st_file)
     st_adata.var_names_make_unique()  # Handle duplicate gene names
     # Preserve raw counts before normalization/log
@@ -1058,48 +920,26 @@ def main():
     st_X_raw = st_subset_raw.X.toarray() if hasattr(st_subset_raw.X, 'toarray') else st_subset_raw.X
     st_X_embed = st_subset_norm.X.toarray() if hasattr(st_subset_norm.X, 'toarray') else st_subset_norm.X
 
-    # ✅ 计算不同基因集的 spot total counts（根据 scale_basis 选择）
-    # 1. 全基因 counts（用于 scale_basis='all'）
-    spot_total_counts_all = np.asarray(st_raw_all.sum(axis=1)).ravel()
-    # 2. Marker 基因 counts（用于 scale_basis='marker'）
-    spot_total_counts_marker = np.asarray(st_X_raw.sum(axis=1)).ravel()
-    # 3. HVG 交集 counts（用于 scale_basis='hvg'，如果可用）
-    spot_total_counts_hvg = None
-    if hasattr(trainer, 'hvg_genes_union') and trainer.hvg_genes_union is not None:
-        hvg_in_st = [g for g in trainer.hvg_genes_union if g in st_adata.var_names]
-        if len(hvg_in_st) > 0:
-            st_hvg = st_adata[:, hvg_in_st]
-            st_hvg_raw = st_hvg.X.toarray() if hasattr(st_hvg.X, 'toarray') else st_hvg.X
-            spot_total_counts_hvg = np.asarray(st_hvg_raw.sum(axis=1)).ravel()
-    
     # 根据 scale_basis 选择对应的 counts
     if args.scale_basis == 'none':
         spot_total_counts = None
-        print(f"💡 scale_basis='none': No scaling will be applied (direct weighted mixture)")
     elif args.scale_basis == 'all':
+        spot_total_counts_all = np.asarray(st_raw_all.sum(axis=1)).ravel()
         spot_total_counts = spot_total_counts_all
-        print(f"ST spot total counts (all {st_raw_all.shape[1]} genes): min={spot_total_counts.min():.1f}, max={spot_total_counts.max():.1f}, mean={spot_total_counts.mean():.1f}")
-    elif args.scale_basis == 'hvg' and spot_total_counts_hvg is not None:
+    elif args.scale_basis == 'hvg':
+        spot_total_counts_hvg = None
+        if hasattr(trainer, 'hvg_genes_union') and trainer.hvg_genes_union is not None:
+            hvg_in_st = [g for g in trainer.hvg_genes_union if g in st_adata.var_names]
+            if len(hvg_in_st) > 0:
+                st_hvg = st_adata[:, hvg_in_st]
+                st_hvg_raw = st_hvg.X.toarray() if hasattr(st_hvg.X, 'toarray') else st_hvg.X
+                spot_total_counts_hvg = np.asarray(st_hvg_raw.sum(axis=1)).ravel()
         spot_total_counts = spot_total_counts_hvg
-        print(f"ST spot total counts (HVG {len(hvg_in_st)} genes): min={spot_total_counts.min():.1f}, max={spot_total_counts.max():.1f}, mean={spot_total_counts.mean():.1f}")
     else:
-        # 默认使用 marker（或当 hvg 不可用时回退到 marker）
-        if args.scale_basis == 'hvg' and spot_total_counts_hvg is None:
-            print(f"⚠️  Warning: scale_basis='hvg' but HVG genes not available, falling back to 'marker'")
-            trainer.scale_basis = 'marker'
+        spot_total_counts_marker = np.asarray(st_X_raw.sum(axis=1)).ravel()
+        trainer.scale_basis = 'marker'
         spot_total_counts = spot_total_counts_marker
-        print(f"ST spot total counts (marker {len(trainer.genes)} genes): min={spot_total_counts.min():.1f}, max={spot_total_counts.max():.1f}, mean={spot_total_counts.mean():.1f}")
-    
-    # 一致性检查：如果 scale_basis 与 counts 不匹配，打印警告
-    ratio_all_marker = spot_total_counts_all.mean() / (spot_total_counts_marker.mean() + 1e-8)
-    if args.scale_basis == 'all' and ratio_all_marker < 1.5:
-        print(f"⚠️  Warning: scale_basis='all' but all-gene counts ({spot_total_counts_all.mean():.1f}) is very close to marker counts ({spot_total_counts_marker.mean():.1f}). Check if using correct data!")
-    elif args.scale_basis == 'marker' and ratio_all_marker > 5.0:
-        print(f"💡 Info: scale_basis='marker', but you have much more genes available (all={spot_total_counts_all.mean():.1f} vs marker={spot_total_counts_marker.mean():.1f}). Consider using scale_basis='all' for better reconstruction.")
- 
-    # Build GAT model and loss function
-    print("="*60)
-    print(f"Building GAT deconvolution model (clusters: {n_clusters})...")
+     
     trainer.build_gat_model(
         n_cell_types=n_clusters,
         gat_hidden_dim=args.gat_hidden_dim,
@@ -1117,10 +957,6 @@ def main():
         spot_total_counts=spot_total_counts  # ✅ Pass spot total counts instead of cells_per_spot
     )
     
-    # Start training
-    print("="*60)
-    print("Starting GAT deconvolution training...")
-    
     trainer.train_gat_deconvolution(
         st_data_normalized=st_X_embed,  # For VAE embedding (now raw)
         st_data_raw=st_X_raw,           # For loss calculation
@@ -1131,9 +967,6 @@ def main():
         lr=args.lr,
         batch_size=args.batch_size
     )
-    
-    print("="*60)
-    print("GAT deconvolution training completed!")
 
 if __name__ == "__main__":
     main()

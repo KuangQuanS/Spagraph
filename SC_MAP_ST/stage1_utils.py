@@ -22,9 +22,8 @@ def load_marker_genes_from_file(file_path: str) -> List[str]:
     Returns:
         marker_genes: List of marker genes
     """
-    print("="*60)
     print(f"Loading marker genes from file: {file_path}")
-    
+
     import os
     if not os.path.exists(file_path):
         raise FileNotFoundError(f"Marker genes file not found: {file_path}")
@@ -62,10 +61,6 @@ def compute_clusters_and_marker_genes(adata,
         sc_clusters: Series of cluster labels
         adata_full: Clustered AnnData object
     """
-    print("="*60)
-    print("Starting clustering analysis...")
-    
-    # Backup original data
     adata_backup = adata.copy()
     
     # Preprocessing: normalization and PCA
@@ -84,9 +79,7 @@ def compute_clusters_and_marker_genes(adata,
     
     # Leiden clustering
     sc.tl.leiden(adata, resolution=resolution)
-    
-    print(f"Clustering results: {len(adata.obs['leiden'].unique())} clusters")
-    
+
     # Restore to original gene set for marker analysis
     adata_full = adata_backup.copy()
     sc.pp.normalize_total(adata_full, target_sum=1e4)
@@ -99,10 +92,8 @@ def compute_clusters_and_marker_genes(adata,
     counts = adata_full.obs['leiden'].value_counts()
     small_clusters = counts[counts < min_cells_per_cluster].index.tolist()
     if small_clusters:
-        print(f"Dropping clusters with < {min_cells_per_cluster} cells: {small_clusters}")
         keep_mask = ~adata_full.obs['leiden'].isin(small_clusters)
-        removed = int((~keep_mask).sum())
-        print(f"   Removed {removed} cells")
+
         adata_full = adata_full[keep_mask].copy()
         if hasattr(adata_full.obs['leiden'], 'cat'):
             adata_full.obs['leiden'] = adata_full.obs['leiden'].cat.remove_unused_categories()
@@ -120,7 +111,6 @@ def compute_clusters_and_marker_genes(adata,
     marker_genes = set()
     result = adata_full.uns['rank_genes_groups']
     
-    print(f"Marker genes per cluster:")
     lasso_selected = {}
     for cluster in sorted(adata_full.obs['leiden'].unique()):
         if cluster in result['names'].dtype.names:
@@ -163,9 +153,7 @@ def compute_clusters_and_marker_genes(adata,
                     
                     final_selected_genes = [g for g, c in zip(selected_genes, coef) if abs(c) > 1e-5]
                     final_selected_genes = sorted(final_selected_genes, key=lambda g: abs(coef[selected_genes.index(g)]), reverse=True)
-                    
-                    print(f"   {cluster}: {len(selected_genes)} -> {len(final_selected_genes)} (after L1)")
-                    
+    
                 elif marker_selection_method == 'variance':
                     # Apply variance threshold filtering
                     sub_adata = adata_full[:, selected_genes].copy()
@@ -178,9 +166,7 @@ def compute_clusters_and_marker_genes(adata,
                     # Select top genes by variance
                     top_indices = np.argsort(variances)[-min(len(selected_genes), top_n):]
                     final_selected_genes = [selected_genes[i] for i in top_indices]
-                    
-                    print(f"   {cluster}: {len(selected_genes)} -> {len(final_selected_genes)} (after variance)")
-                    
+  
                 elif marker_selection_method == 'correlation':
                     # Apply correlation-based filtering
                     sub_adata = adata_full[:, selected_genes].copy()
@@ -202,8 +188,6 @@ def compute_clusters_and_marker_genes(adata,
                     top_indices = np.argsort(correlations)[-min(len(selected_genes), top_n):]
                     final_selected_genes = [selected_genes[i] for i in top_indices]
                     
-                    print(f"   {cluster}: {len(selected_genes)} -> {len(final_selected_genes)} (after correlation)")
-                    
                 else:
                     raise ValueError(f"Unknown marker_selection_method: {marker_selection_method}. "
                                    f"Choose from 'l1', 'variance', or 'correlation'")
@@ -218,10 +202,9 @@ def compute_clusters_and_marker_genes(adata,
     
     clusters_to_drop = [cluster for cluster, genes in lasso_selected.items() if len(genes) == 0]
     if clusters_to_drop:
-        print(f"Removing clusters with no marker genes: {clusters_to_drop}")
+
         keep_mask = ~adata_full.obs['leiden'].isin(clusters_to_drop)
-        removed_cells = int((~keep_mask).sum())
-        print(f"   Removed {removed_cells} cells belonging to empty clusters")
+
         adata_full = adata_full[keep_mask].copy()
         if hasattr(adata_full.obs['leiden'], 'cat'):
             adata_full.obs['leiden'] = adata_full.obs['leiden'].cat.remove_unused_categories()
@@ -260,9 +243,7 @@ def compute_cluster_centers_and_expressions(
         cluster_expressions_full_count: Dict of cluster expressions (all genes)
         cluster_cell_weights: Dict of cell weights per cluster (None for mean/median)
     """
-    print("="*60)
-    print(f"Computing cluster centers with {aggregation_method} aggregation...")
-    
+
     cluster_prototypes = {}
     cluster_expressions = {}
     cluster_expressions_full_count = {}
@@ -287,8 +268,7 @@ def compute_cluster_centers_and_expressions(
             cluster_expression = np.mean(cluster_data, axis=0)
             cluster_expr_full = np.mean(cluster_full_data, axis=0)
             cluster_cell_weights[cluster_id] = None
-            
-            #print(f"      Cluster {cluster_id}: {n_cells} cells (mean aggregation)")
+
             
         elif aggregation_method == 'median':
             # Median aggregation
@@ -296,8 +276,7 @@ def compute_cluster_centers_and_expressions(
             cluster_expression = np.median(cluster_data, axis=0)
             cluster_expr_full = np.median(cluster_full_data, axis=0)
             cluster_cell_weights[cluster_id] = None
-            
-            #print(f"      Cluster {cluster_id}: {n_cells} cells (median aggregation)")
+
             
         elif aggregation_method == 'weighted':
             # Weighted aggregation
@@ -336,9 +315,6 @@ def compute_cluster_centers_and_expressions(
             cluster_expression = np.sum(cluster_data * w_combined[:, np.newaxis], axis=0)
             cluster_expr_full = np.sum(cluster_full_data * w_combined[:, np.newaxis], axis=0)
             
-            # print(f"      Cluster {cluster_id}: {n_cells} cells, "
-            #       f"weight_range=[{w_combined.min():.4f}, {w_combined.max():.4f}], "
-            #       f"top_weight_ratio={w_combined.max()/w_combined.mean():.2f}x")
         else:
             raise ValueError(f"Unknown aggregation method: {aggregation_method}. "
                            f"Choose from 'mean', 'median', or 'weighted'")
@@ -347,9 +323,7 @@ def compute_cluster_centers_and_expressions(
         cluster_prototypes[cluster_id] = cluster_center
         cluster_expressions[cluster_id] = cluster_expression
         cluster_expressions_full_count[cluster_id] = cluster_expr_full
-    
-    print(f"   Completed: {len(cluster_prototypes)} clusters with {aggregation_method} centers and expressions")
-    
+ 
     return cluster_prototypes, cluster_expressions, cluster_expressions_full_count, cluster_cell_weights
 
 

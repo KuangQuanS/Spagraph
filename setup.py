@@ -1,11 +1,11 @@
-"""Setup script for scmapst package"""
+"""Setup script for the Spagraph package."""
 
 from setuptools import setup, find_packages
 from pathlib import Path
 
 # Read version from __version__.py
 version_dict = {}
-with open(Path(__file__).parent / "scmapst" / "__version__.py") as f:
+with open(Path(__file__).parent / "spagraph" / "__version__.py") as f:
     exec(f.read(), version_dict)
 
 # Read README if exists
@@ -15,18 +15,18 @@ if readme_file.exists():
     with open(readme_file, encoding="utf-8") as f:
         long_description = f.read()
 else:
-    long_description = "SC-MAP-ST: Spatial transcriptomics cell type deconvolution using VAE and GAT"
+    long_description = "Spagraph: VAE + GAT spatial transcriptomics deconvolution and cell communication"
 
 setup(
-    name="scmapst",
+    name="spagraph",
     version=version_dict["__version__"],
     author=version_dict.get("__author__", "Your Name"),
     author_email=version_dict.get("__email__", "your.email@example.com"),
-    description="Spatial transcriptomics cell type deconvolution using VAE and Graph Attention Networks",
+    description="Spagraph: VAE + GAT spatial transcriptomics deconvolution and cell communication",
     long_description=long_description,
     long_description_content_type="text/markdown",
-    url="https://github.com/yourusername/scmapst",  # Update with actual repo
-    packages=find_packages(exclude=["tests", "notebooks", "trash", "results"]),
+    url="https://github.com/yourusername/spagraph",  # Update with actual repo
+    packages=find_packages(exclude=["tests", "notebooks", "trash", "results", "notebook"]),
     classifiers=[
         "Development Status :: 3 - Alpha",
         "Intended Audience :: Science/Research",
@@ -63,12 +63,6 @@ setup(
         "docs": [
             "sphinx>=4.5.0",
             "sphinx-rtd-theme>=1.0.0",
-        ],
-    },
-    entry_points={
-        "console_scripts": [
-            "scmapst-train=scmapst.cli:train_cli",
-            "scmapst-deconvolve=scmapst.cli:deconvolve_cli",
         ],
     },
     include_package_data=True,

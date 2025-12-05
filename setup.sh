@@ -1,10 +1,10 @@
 #!/bin/bash
-# Quick setup script for scmapst package
+# Quick setup script for spagraph package
 
 set -e  # Exit on error
 
 echo "============================================================"
-echo "SC-MAP-ST Package Setup"
+echo "Spagraph Package Setup"
 echo "============================================================"
 
 # Check Python version
@@ -28,7 +28,7 @@ fi
 # Install package in editable mode
 echo ""
 echo "============================================================"
-echo "Installing scmapst package (editable mode)..."
+echo "Installing spagraph package (editable mode)..."
 echo "============================================================"
 pip install -e .
 
@@ -39,30 +39,12 @@ else
     exit 1
 fi
 
-# Run installation tests
 echo ""
 echo "============================================================"
-echo "Running installation tests..."
+echo "Setup completed!"
 echo "============================================================"
-python test_installation.py
-
-if [ $? -eq 0 ]; then
-    echo ""
-    echo "============================================================"
-    echo "✓ Setup completed successfully!"
-    echo "============================================================"
-    echo ""
-    echo "You can now use scmapst:"
-    echo "  • Python API:  import scmapst"
-    echo "  • CLI:         scmapst-train --help"
-    echo "  • Example:     python example_usage.py"
-    echo ""
-else
-    echo ""
-    echo "============================================================"
-    echo "⚠ Setup completed with warnings"
-    echo "============================================================"
-    echo "Package is installed but some tests failed."
-    echo "Check the output above for details."
-    echo ""
-fi
+echo ""
+echo "You can now use spagraph:"
+echo "  • Python API:  import spagraph"
+echo "  • Example:     python example_usage.py"
+echo ""

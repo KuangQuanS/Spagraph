@@ -3,9 +3,9 @@ requires = ["setuptools>=45", "wheel", "setuptools_scm>=6.2"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "scmapst"
+name = "spagraph"
 dynamic = ["version"]
-description = "Spatial transcriptomics cell type deconvolution using VAE and Graph Attention Networks"
+description = "Spagraph: VAE + GAT spatial transcriptomics deconvolution and cell communication"
 readme = "README.md"
 requires-python = ">=3.8"
 license = {text = "MIT"}
@@ -53,20 +53,24 @@ docs = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/yourusername/scmapst"
-Documentation = "https://scmapst.readthedocs.io"
-Repository = "https://github.com/yourusername/scmapst.git"
-"Bug Tracker" = "https://github.com/yourusername/scmapst/issues"
-
-[project.scripts]
-scmapst-train = "scmapst.cli:train_cli"
-scmapst-deconvolve = "scmapst.cli:deconvolve_cli"
+Homepage = "https://github.com/yourusername/spagraph"
+Documentation = "https://spagraph.readthedocs.io"
+Repository = "https://github.com/yourusername/spagraph.git"
+"Bug Tracker" = "https://github.com/yourusername/spagraph/issues"
 
 [tool.setuptools]
-packages = ["scmapst", "scmapst.training", "scmapst.models", "scmapst.preprocessing", "scmapst.utils"]
+packages = [
+    "spagraph",
+    "spagraph.training",
+    "spagraph.models",
+    "spagraph.preprocessing",
+    "spagraph.utils",
+    "spagraph.cellcom",
+    "SC_MAP_ST",
+]
 
 [tool.setuptools.dynamic]
-version = {attr = "scmapst.__version__.__version__"}
+version = {attr = "spagraph.__version__.__version__"}
 
 [tool.black]
 line-length = 100
@@ -87,7 +91,7 @@ exclude = '''
 testpaths = ["tests"]
 python_files = "test_*.py"
 python_functions = "test_*"
-addopts = "-v --cov=scmapst --cov-report=html --cov-report=term"
+addopts = "-v --cov=spagraph --cov-report=html --cov-report=term"
 
 [tool.mypy]
 python_version = "3.8"

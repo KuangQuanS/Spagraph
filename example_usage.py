@@ -1,111 +1,123 @@
-"""Example usage of scmapst package
+"""Example usage of the Spagraph package.
 
-This script demonstrates the basic workflow of SC-MAP-ST.
+Spagraph provides a complete pipeline for spatial transcriptomics analysis:
+- Stage 1 (VAE): SC-ST integration and cell type clustering
+- Stage 2 (GAT): Spatial deconvolution
+- Stage 3 (CellCom): Cell-cell communication analysis
 """
 
-import scmapst
 from pathlib import Path
 
+import spagraph
+
+
 def main():
-    """Run complete SC-MAP-ST pipeline"""
+    """Run complete Spagraph pipeline"""
     
     # Define paths
     data_dir = Path("data")
     output_dir = Path("output")
     
-    sc_file = data_dir / "sc_adata.h5ad"
-    st_file = data_dir / "st_adata.h5ad"
-    
-    stage1_output = output_dir / "stage1"
-    stage2_output = output_dir / "stage2"
-    
-    # Create output directories
-    stage1_output.mkdir(parents=True, exist_ok=True)
-    stage2_output.mkdir(parents=True, exist_ok=True)
+    sc_file = str(data_dir / "sc_adata.h5ad")
+    st_file = str(data_dir / "st_adata.h5ad")
     
     print("="*80)
-    print("SC-MAP-ST Pipeline Example")
+    print("Spagraph Pipeline Example")
     print("="*80)
     
     # ========================================================================
-    # Stage 1: Train VAE for SC-ST integration
+    # Option 1: Run Stage 1 + Stage 2 separately
     # ========================================================================
     print("\n" + "="*80)
-    print("Stage 1: VAE Training for SC-ST Integration")
+    print("Option 1: Run stages separately")
     print("="*80)
     
-    stage1_results = scmapst.train(
-        sc_file=str(sc_file),
-        st_file=str(st_file),
-        output_dir=str(stage1_output),
+    # Stage 1: Train VAE
+    stage1 = spagraph.vae(
+        sc_file=sc_file,
+        st_file=st_file,
+        output_dir=str(output_dir / "stage1"),
         n_epochs=150,
         resolution=4.0,
-        top_n_per_type=100,
-        latent_dim=128,
-        batch_size=512,
-        lr=5e-4,
-        beta=0.1,
-        use_dual_decoder=True,
-        aggregation_method='weighted',
-        marker_selection_method='l1'
     )
+    print(f"Stage 1 complete: {stage1.n_clusters} clusters, {stage1.n_genes} genes")
     
-    print("\nStage 1 Results:")
-    print(f"  Model path: {stage1_results['model_path']}")
-    print(f"  Clusters: {stage1_results['n_clusters']}")
-    print(f"  Marker genes: {stage1_results['n_genes']}")
-    print(f"  Best loss: {stage1_results['best_loss']:.4f}")
+    # Stage 2: Deconvolution (reuse Stage 1 artifacts)
+    result = spagraph.deconv(
+        st_file=st_file,
+        vae=stage1,  # Pass Stage 1 artifacts directly
+        stage2_epochs=200,
+    )
+    print(f"Stage 2 complete: Pearson={result['metrics']['pearson']:.4f}")
+    print(f"Deconvolution matrix shape: {result['deconv'].shape}")
     
     # ========================================================================
-    # Stage 2: GAT-based spatial deconvolution
+    # Option 2: Run Stage 1 + Stage 2 in one call
     # ========================================================================
     print("\n" + "="*80)
-    print("Stage 2: GAT-based Spatial Deconvolution")
+    print("Option 2: Run deconvolution in one call")
     print("="*80)
     
-    stage2_results = scmapst.deconvolve(
-        stage1_model_path=stage1_results['model_path'],
-        st_file=str(st_file),
-        output_dir=str(stage2_output),
-        n_epochs=200,
-        lr=1e-3,
-        batch_size=512,
-        k_spatial=20,
-        k_celltype=10,
-        weight_threshold=0.01,
-        scale_basis='marker'  # Options: 'all', 'marker', 'hvg', 'none'
+    result = spagraph.deconv(
+        sc_file=sc_file,
+        st_file=st_file,
+        output_dir=str(output_dir / "combined"),
+        stage1_epochs=150,
+        stage2_epochs=200,
+        resolution=4.0,
     )
+    print(f"Complete: {result['metrics']['n_clusters']} clusters")
+    print(f"Pearson: {result['metrics']['pearson']:.4f}")
+    print(f"MSE: {result['metrics']['mse']:.4f}")
     
-    print("\nStage 2 Results:")
-    print(f"  Sample: {stage2_results['sample_name']}")
-    print(f"  Best Pearson: {stage2_results['best_pearson']:.4f}")
-    print(f"  Best MSE: {stage2_results['best_mse']:.4f}")
-    print(f"  Best Cosine: {stage2_results['best_cosine']:.4f}")
-    print(f"  Deconvolution weights: {stage2_results['deconv_weights_path']}")
-    print(f"  Reconstructed expression: {stage2_results['reconstructed_expr_path']}")
+    # Access deconvolution matrix directly
+    deconv_df = result['deconv']
+    print(f"\nDeconvolution matrix shape: {deconv_df.shape}")
+    print(f"Cell types: {list(deconv_df.columns)}")
+    print(f"\nAverage proportions:\n{deconv_df.mean().sort_values(ascending=False)}")
     
     # ========================================================================
-    # Load and inspect results
+    # Option 3: Run on multiple ST samples with same SC reference
     # ========================================================================
     print("\n" + "="*80)
-    print("Loading and Inspecting Results")
+    print("Option 3: Process multiple ST samples")
     print("="*80)
     
-    import pandas as pd
+    # First, train VAE once
+    stage1 = spagraph.vae(
+        sc_file=sc_file,
+        st_file=st_file,  # Use any ST file for initial training
+        output_dir=str(output_dir / "shared_model"),
+        n_epochs=150,
+    )
     
-    # Load deconvolution weights
-    deconv_weights = pd.read_csv(stage2_results['deconv_weights_path'], index_col=0)
-    print(f"\nDeconvolution weights shape: {deconv_weights.shape}")
-    print(f"Spot barcodes (first 5): {list(deconv_weights.index[:5])}")
-    print(f"Cell types: {list(deconv_weights.columns)}")
+    # Then apply to multiple ST samples
+    st_samples = ["st_sample1.h5ad", "st_sample2.h5ad", "st_sample3.h5ad"]
+    for st_sample in st_samples:
+        st_path = str(data_dir / st_sample)
+        result = spagraph.deconv(
+            st_file=st_path,
+            vae=stage1,  # Reuse the trained VAE
+            output_dir=str(output_dir / Path(st_sample).stem),
+            stage2_epochs=200,
+        )
+        print(f"{st_sample}: Pearson={result['metrics']['pearson']:.4f}")
     
-    # Show example predictions
-    print("\nExample cell type proportions (first 3 spots):")
-    print(deconv_weights.head(3))
+    # ========================================================================
+    # Stage 3: Cell Communication Analysis
+    # ========================================================================
+    print("\n" + "="*80)
+    print("Stage 3: Cell Communication Analysis")
+    print("="*80)
     
-    # Cell type abundance across all spots
-    print("\nAverage cell type proportions across all spots:")
-    print(deconv_weights.mean().sort_values(ascending=False))
+    spagraph.cellcom(
+        deconv_dir=str(output_dir / "combined"),  # Use deconvolution output
+        st_h5ad=st_file,
+        output_dir=str(output_dir / "cellcom"),
+        epochs=100,
+        batch_size=4,
+    )
+    print("Cell communication analysis complete!")
     
     print("\n" + "="*80)
     print("Pipeline completed successfully!")

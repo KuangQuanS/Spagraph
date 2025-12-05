@@ -1041,7 +1041,8 @@ def evaluate_vae(vae, test_loader, device, loss_type='mse', beta=1.0):
 
 def train_vae(vae, train_X, test_X, train_modality, test_modality, device,
               batch_size=256, n_epochs=100, lr=1e-3, beta=1.0, loss_type='mse', 
-              lambda_mmd=1.0, output_dir="./stage1_results", print_every=50):
+              lambda_mmd=1.0, output_dir="./stage1_results", print_every=50,
+              patience=20, min_delta=1.0):
     """Train VAE with optional MMD loss for modality alignment
     
     Args:
@@ -1090,7 +1091,7 @@ def train_vae(vae, train_X, test_X, train_modality, test_modality, device,
     
     best_loss = float('inf')
     patience_counter = 0
-    patience = 200
+    # 使用传入的 patience 参数（默认 20）
     
     for epoch in range(n_epochs):
         # Training
@@ -1114,7 +1115,9 @@ def train_vae(vae, train_X, test_X, train_modality, test_modality, device,
                 print(f"Epoch {epoch+1}/{n_epochs} | train_loss={avg_loss:.4f} | test_loss={test_loss:.4f}")
             
             # Save best model based on test loss
-            if test_loss < best_loss:
+            # 绝对改进阈值：best_loss - test_loss > min_delta
+            improvement = best_loss - test_loss
+            if improvement > min_delta:
                 best_loss = test_loss
                 patience_counter = 0
             else:
@@ -1122,7 +1125,10 @@ def train_vae(vae, train_X, test_X, train_modality, test_modality, device,
                 
             # Early stopping
             if patience_counter >= patience:
-                print(f"Early stopping at epoch {epoch+1}/{n_epochs}, best_loss={best_loss:.4f}")
+                if best_loss != float('inf'):
+                    print(f"Early stopping at epoch {epoch+1}/{n_epochs}, best_loss={best_loss:.4f}")
+                else:
+                    print(f"Early stopping at epoch {epoch+1}/{n_epochs}")
                 break
         else:
             # No test set - use training loss for scheduling and early stopping
@@ -1133,7 +1139,9 @@ def train_vae(vae, train_X, test_X, train_modality, test_modality, device,
                 print(f"Epoch {epoch+1}/{n_epochs} | train_loss={avg_loss:.4f}")
             
             # Save best model based on training loss
-            if avg_loss < best_loss:
+            # 绝对改进阈值：best_loss - avg_loss > min_delta
+            improvement = best_loss - avg_loss
+            if improvement > min_delta:
                 best_loss = avg_loss
                 patience_counter = 0
             else:
@@ -1141,17 +1149,28 @@ def train_vae(vae, train_X, test_X, train_modality, test_modality, device,
                 
             # Early stopping
             if patience_counter >= patience:
-                print(f"Early stopping at epoch {epoch+1}/{n_epochs}, best_loss={best_loss:.4f}")
+                if best_loss != float('inf'):
+                    print(f"Early stopping at epoch {epoch+1}/{n_epochs}, best_loss={best_loss:.4f}")
+                else:
+                    print(f"Early stopping at epoch {epoch+1}/{n_epochs}")
                 break
     
-    # Plot training curves
-    plot_vae_training_curves(train_losses, test_losses, recon_losses, kl_losses, mmd_losses, output_dir)
+    # Plot training curves (only if output_dir is provided)
+    if output_dir is not None:
+        plot_vae_training_curves(train_losses, test_losses, recon_losses, kl_losses, mmd_losses, output_dir)
     
     return best_loss
 
 
-def plot_vae_training_curves(train_losses, test_losses, recon_losses, kl_losses, mmd_losses=None, output_dir="./stage1_results"):
-    """Plot VAE training curves"""
+def plot_vae_training_curves(train_losses, test_losses, recon_losses, kl_losses, mmd_losses=None, output_dir=None):
+    """Plot VAE training curves
+    
+    Args:
+        output_dir: If None, skip saving the plot
+    """
+    if output_dir is None:
+        return
+    
     # Determine if we need to plot MMD
     has_mmd = mmd_losses is not None and len(mmd_losses) > 0 and max(mmd_losses) > 0
     

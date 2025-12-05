@@ -20,7 +20,7 @@ from tqdm import tqdm
 warnings.filterwarnings('ignore')
 
 # Import unified model definitions
-from deconv_model import VAE, HeterogeneousGATDeconvolution, SpatialDeconvolutionLoss
+from .deconv_model import VAE, HeterogeneousGATDeconvolution, SpatialDeconvolutionLoss
 
 class SpatialDataset(Dataset):
     """Spatial transcriptomics dataset
@@ -46,12 +46,30 @@ class SpatialDataset(Dataset):
         }
 
 class GATDeconvolution:
-    """Stage 2: GAT deconvolution trainer"""
-    def __init__(self, stage1_model_path: str, output_dir: str = "./stage2_results/", device: str = None, weight_threshold: float = 0.01):
+    """Stage 2: GAT deconvolution trainer
+    
+    支持两种模式：
+    1. 文件模式：通过 stage1_model_path 加载
+    2. 内存模式：通过 stage1_artifacts 直接传入
+    """
+    def __init__(self, stage1_model_path: str = None, output_dir: str = "./stage2_results/", 
+                 device: str = None, weight_threshold: float = 0.01, stage1_artifacts=None, seed: int = 42):
 
+        # Set random seed first
+        import random
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        
         self.stage1_model_path = stage1_model_path
+        self.stage1_artifacts = stage1_artifacts
         self.output_dir = output_dir
-        os.makedirs(output_dir, exist_ok=True)
+        self.seed = seed
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
         
         # Device
         if device is None:
@@ -77,9 +95,78 @@ class GATDeconvolution:
         # Graph construction parameters
         self.k_spatial = 20
         self.k_celltype = 10
+    
+    def load_from_artifacts(self, artifacts):
+        """从 Stage1Artifacts 对象加载所有必要的组件（纯内存模式）"""
+        # 加载 VAE 编码器
+        if artifacts.vae_encoder is not None:
+            # 直接使用已经加载的编码器
+            self.vae_encoder = artifacts.vae_encoder
+            if hasattr(self.vae_encoder, 'to'):
+                self.vae_encoder = self.vae_encoder.to(self.device)
+            self.vae_encoder.eval()
+            self.latent_dim = self.vae_encoder.fc_mu.out_features
+        elif artifacts.vae_state_dict is not None:
+            # 从 state_dict 重建编码器
+            from .deconv_model import DualDecoderVAE
+            input_dim = artifacts.input_dim
+            latent_dim = artifacts.latent_dim
+            output_type = artifacts.output_type or 'mse'
+            
+            full_vae = DualDecoderVAE(input_dim=input_dim, latent_dim=latent_dim, output_type=output_type).to(self.device)
+            full_vae.load_state_dict(artifacts.vae_state_dict)
+            
+            self.vae_encoder = full_vae.encoder
+            self.vae_encoder.eval()
+            self.latent_dim = latent_dim
+        else:
+            raise ValueError("Stage1Artifacts 必须包含 vae_encoder 或 vae_state_dict")
+        
+        # 加载其他组件
+        self.label_encoder = artifacts.label_encoder
+        self.marker_genes = artifacts.marker_genes
+        self.genes = artifacts.genes
+        self.sc_clusters = artifacts.sc_clusters
+        self.resolution = artifacts.resolution or 0.5
+        self.celltype_key = artifacts.celltype_key
+        self.cluster_to_celltype = artifacts.cluster_to_celltype
+        self.all_genes = artifacts.all_genes
+        self.hvg_genes_union = artifacts.hvg_genes_union
+        
+        # 加载聚类中心和表达
+        if artifacts.celltype_prototypes is not None:
+            if isinstance(artifacts.celltype_prototypes, torch.Tensor):
+                self.celltype_prototypes = artifacts.celltype_prototypes.to(self.device)
+            else:
+                self.celltype_prototypes = torch.FloatTensor(artifacts.celltype_prototypes).to(self.device)
+        
+        if artifacts.celltype_expressions is not None:
+            if isinstance(artifacts.celltype_expressions, torch.Tensor):
+                self.celltype_expressions = artifacts.celltype_expressions.to(self.device)
+            else:
+                self.celltype_expressions = torch.FloatTensor(artifacts.celltype_expressions).to(self.device)
+        
+        if artifacts.celltype_expressions_full is not None:
+            self.celltype_expressions_full = artifacts.celltype_expressions_full
+        
+        # 冻结编码器参数
+        for param in self.vae_encoder.parameters():
+            param.requires_grad = False
         
     def load_vae_encoder(self):
-        """Load Stage 1 VAE components"""
+        """Load Stage 1 VAE components
+        
+        优先从 stage1_artifacts 加载（内存模式），否则从文件加载
+        """
+        # 如果有 artifacts 且是内存模式，直接使用
+        if self.stage1_artifacts is not None and self.stage1_artifacts.is_memory_mode():
+            self.load_from_artifacts(self.stage1_artifacts)
+            return
+        
+        # 否则从文件加载
+        if self.stage1_model_path is None:
+            raise ValueError("必须提供 stage1_model_path 或包含内存数据的 stage1_artifacts")
+        
         checkpoint = torch.load(self.stage1_model_path, map_location=self.device, weights_only=False)
         
         # Rebuild VAE
@@ -90,7 +177,7 @@ class GATDeconvolution:
         # 检测是否是双解码器架构
         state_dict = checkpoint['vae_state_dict']
 
-        from deconv_model import DualDecoderVAE
+        from .deconv_model import DualDecoderVAE
         full_vae = DualDecoderVAE(input_dim=input_dim, latent_dim=latent_dim, output_type=output_type).to(self.device)
 
         full_vae.load_state_dict(state_dict)
@@ -389,15 +476,13 @@ class GATDeconvolution:
         hetero_losses = []
         proportion_losses = []
         
-        # ✅ 早停策略：分别跟踪三个核心重建损失（Pearson, MSE, Cosine）
-        # 只有当三个损失都在 patience 个 epoch 内没有改善时才停止训练
+        # ✅ 早停策略：监测 Pearson 和 Cosine 的绝对改进
         best_pearson = float('inf')
         best_mse = float('inf')
         best_cosine = float('inf')
-        patience_pearson = 0
-        patience_mse = 0
-        patience_cosine = 0
-        patience = 200  # 每个损失的独立 patience
+        patience_counter = 0
+        patience = 50  # 早停 patience
+        min_delta = 0.001  # 绝对改进阈值（Pearson/Cosine 需要下降至少这么多）
         
         for epoch in range(n_epochs):
             # Train one epoch
@@ -425,37 +510,33 @@ class GATDeconvolution:
             current_mse = epoch_losses['mse_loss']
             current_cosine = epoch_losses['cosine_loss']
             
-            # Update best values and patience counters
-            if current_pearson < best_pearson:
-                best_pearson = current_pearson
-                patience_pearson = 0
-            else:
-                patience_pearson += 1
+            # 绝对改进：best - current > min_delta（损失下降超过阈值）
+            pearson_improvement = best_pearson - current_pearson
+            cosine_improvement = best_cosine - current_cosine
             
-            if current_mse < best_mse:
-                best_mse = current_mse
-                patience_mse = 0
-            else:
-                patience_mse += 1
-            
-            if current_cosine < best_cosine:
-                best_cosine = current_cosine
-                patience_cosine = 0
-            else:
-                patience_cosine += 1
-            
-            # Save model when any core loss improves
-            if patience_pearson == 0 or patience_mse == 0 or patience_cosine == 0:
+            # 只要 Pearson 或 Cosine 其中一个有显著改进，就重置计数器
+            if pearson_improvement > min_delta or cosine_improvement > min_delta:
+                if current_pearson < best_pearson:
+                    best_pearson = current_pearson
+                if current_mse < best_mse:
+                    best_mse = current_mse
+                if current_cosine < best_cosine:
+                    best_cosine = current_cosine
+                patience_counter = 0
                 self.save_model(f"{self.output_dir}/best_gat_model.pth")
+            else:
+                patience_counter += 1
             
             # Print every N epochs
             if (epoch + 1) % print_every == 0 or epoch == 0:
                 print(f"  Epoch {epoch+1}/{n_epochs}: Total={avg_total_loss:.4f}, MSE={current_mse:.4f}, Pearson={current_pearson:.4f}, Cosine={current_cosine:.4f}")
             
-            # Early stopping: all three core losses stopped improving
-            if patience_pearson >= patience and patience_mse >= patience and patience_cosine >= patience:
+            # Early stopping
+            if patience_counter >= patience:
                 print(f"Early stopping at epoch {epoch+1}/{n_epochs}")
-                print(f"  Best: Pearson={best_pearson:.4f}, MSE={best_mse:.4f}, Cosine={best_cosine:.4f}")
+                # Only print best values if they are not inf
+                if best_pearson != float('inf') and best_mse != float('inf') and best_cosine != float('inf'):
+                    print(f"  Best: Pearson={best_pearson:.4f}, MSE={best_mse:.4f}, Cosine={best_cosine:.4f}")
                 break
         
         # Plot training curves
@@ -806,7 +887,7 @@ def main():
                        help='Batch size')
     
     # Loss function arguments
-    parser.add_argument('--loss_lambda_mse', type=float, default=0.5,
+    parser.add_argument('--loss_lambda_mse', type=float, default=0.1,
                        help='MSE reconstruction loss weight')
     parser.add_argument('--loss_lambda_pearson', type=float, default=5,
                        help='Pearson correlation loss weight')
@@ -818,7 +899,7 @@ def main():
                        help='Gene-level Cosine loss weight (across spots)')
     parser.add_argument('--loss_lambda_reg', type=float, default=0.1,
                        help='Weight regularization weight')
-    parser.add_argument('--loss_lambda_sparse', type=float, default=10,
+    parser.add_argument('--loss_lambda_sparse', type=float, default=1,
                        help='Sparsity regularization weight (Shannon entropy)')
     parser.add_argument('--loss_lambda_proportion', type=float, default=0.1,
                        help='Global cell type proportion consistency loss weight (matches SC cluster distribution)')

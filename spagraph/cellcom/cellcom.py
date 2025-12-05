@@ -1,21 +1,27 @@
 import argparse
+import glob
 import logging
 import os
-import torch
-import glob
-import pandas as pd
+
 import numpy as np
+import pandas as pd
 import scanpy as sc
-from torch.utils.data import DataLoader, RandomSampler
+import torch
 from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.utils.data import DataLoader, RandomSampler
 from tqdm import tqdm
 
 # VAE已移除：使用MLPEncoder作为编码器，不再引用DualDecoderVAE
 # 已经将DGI集成到HeteroSTModel (compute_dgi_loss)，不再需要独立的 DGIPretrainModel
-from hetero_model import HeteroSTModel
-from hetero_graph_builder import STHeteroSubgraphDataset, hetero_subgraph_collate_fn, setup_logging, set_seed
-from evaluate import evaluate_cell_communication, plot_training_loss
-from calculate_lr_scores import calculate_lr_scores
+from .cellcom_model import HeteroSTModel
+from .cellcom_graph_builder import (
+    STHeteroSubgraphDataset,
+    hetero_subgraph_collate_fn,
+    set_seed,
+    setup_logging,
+)
+from .cellcom_evaluate import evaluate_cell_communication, plot_training_loss
+from .lr_scores import calculate_lr_scores
 
 def _scalar(x):
     """Convert tensor/number to Python float for logging/accumulation."""
@@ -82,9 +88,10 @@ def parse_args():
     return parser.parse_args()
 
 #---------------------------------主程序---------------------------------
-def main():
+def main(args=None):
     # 解析参数
-    args = parse_args()
+    if args is None:
+        args = parse_args()
     
     # 创建输出目录
     os.makedirs(args.output_dir, exist_ok=True)

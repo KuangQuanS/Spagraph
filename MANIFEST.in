@@ -8,7 +8,7 @@ include pyproject.toml
 include setup.py
 
 # Include marker gene files and databases
-recursive-include scmapst *.txt *.csv *.json
+recursive-include spagraph *.txt *.csv *.json
 
 # Exclude compiled files and caches
 global-exclude __pycache__

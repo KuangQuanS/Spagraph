@@ -1,7 +1,4 @@
-"""Preprocessing module for scmapst
-
-This module will contain data preprocessing utilities.
-"""
+"""Preprocessing module for Spagraph."""
 
 # Placeholder for future refactoring
 # Functions for data loading, normalization, gene filtering, etc.

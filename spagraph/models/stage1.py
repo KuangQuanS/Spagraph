@@ -21,7 +21,7 @@ import umap
 warnings.filterwarnings('ignore')
 
 # Import model and utilities from deconv_model (which now includes vae_utils)
-from deconv_model import (
+from .deconv_model import (
     VAE, DualDecoderVAE,
     train_vae, evaluate_vae, save_vae_checkpoint, 
     load_vae_pretrained, load_vae_for_inference, 
@@ -29,7 +29,7 @@ from deconv_model import (
 )
 
 # Import stage1 utility functions
-from stage1_utils import (
+from .stage1_utils import (
     load_marker_genes_from_file,
     compute_clusters_and_marker_genes,
     compute_cluster_centers_and_expressions,
@@ -50,20 +50,37 @@ class coEncoder:
                  sc_file=None,
                  st_file=None,
                  output_dir="./stage1_results",
-                 device=None):
+                 device=None,
+                 save_to_disk=True,
+                 seed=42):
         """
         Initialize co-encoder
         
         Args:
             sc_file: Path to single-cell h5ad file
             st_file: Path to spatial transcriptomics h5ad file
-            output_dir: Output directory path
+            output_dir: Output directory path (如果 save_to_disk=False，仅用于临时文件)
             device: Computing device (cuda/cpu, None for auto)
+            save_to_disk: 是否保存模型和数据到磁盘。False 时只返回内存对象，不写入任何文件
+            seed: Random seed for reproducibility
         """
+        # Set random seed first
+        import random
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        
         self.sc_file = sc_file
         self.st_file = st_file
         self.output_dir = output_dir
-        os.makedirs(output_dir, exist_ok=True)
+        self.save_to_disk = save_to_disk
+        self.seed = seed
+        
+        if save_to_disk and output_dir:
+            os.makedirs(output_dir, exist_ok=True)
         
         if device is None:
             self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -140,7 +157,7 @@ class coEncoder:
             sc_clusters = sc_adata_clustered.obs['leiden'].copy()
         else:
             # Auto-cluster using Leiden
-            cluster_save_path = f"{self.output_dir}/marker_genes.txt"
+            cluster_save_path = f"{self.output_dir}/marker_genes.txt" if (self.save_to_disk and self.output_dir) else None
             self.marker_genes, sc_clusters, sc_adata_clustered = compute_clusters_and_marker_genes(
                 sc_adata.copy(), 
                 top_n=top_n_per_type, 
@@ -160,12 +177,13 @@ class coEncoder:
         self.resolution = resolution
         
         # 2. Process SC data (extract marker genes then normalize + log1p)
- 
-        # Preserve raw counts for full-gene aggregation later
-        sc_raw_all = sc_adata.X.toarray() if hasattr(sc_adata.X, 'toarray') else sc_adata.X
-
-        # Use log1p(normalize_total) for VAE training / clustering features
+        # ✅ First filter to match sc_clusters.index (some cells may be filtered during clustering)
         sc_adata_count = sc_adata[sc_clusters.index].copy()
+        
+        # ✅ Preserve raw counts AFTER filtering (must match sc_clusters.index length)
+        sc_raw_all = sc_adata_count.X.toarray() if hasattr(sc_adata_count.X, 'toarray') else sc_adata_count.X
+
+        # Normalize and log1p transform for VAE training
         sc.pp.normalize_total(sc_adata_count, target_sum=1e4)
         sc.pp.log1p(sc_adata_count)
   
@@ -230,7 +248,7 @@ class coEncoder:
         
         # 5. Split data for training (with test set for early stopping)
         sc_train, sc_test, y_train, y_test = train_test_split(
-            sc_X_final, sc_y, test_size=0.01, stratify=sc_y, random_state=42
+            sc_X_final, sc_y, test_size=0.05, stratify=sc_y, random_state=42
         )
         
         # Split full gene SC data with same indices
@@ -241,7 +259,7 @@ class coEncoder:
         # )
         
         st_train, st_test = train_test_split(
-            st_X_final, test_size=0.01, random_state=42
+            st_X_final, test_size=0.05, random_state=42
         )
         
         # 6. Combine train and test sets
@@ -266,10 +284,13 @@ class coEncoder:
         # Save gene list
         self.genes = final_genes
         self.all_genes = sc_all_genes  # Save all gene list
-        genes_file = f"{self.output_dir}/final_genes.txt"
-        with open(genes_file, 'w') as f:
-            for gene in self.genes:
-                f.write(f"{gene}\n")
+        
+        # 只有在 save_to_disk=True 时才保存文件
+        if self.save_to_disk and self.output_dir:
+            genes_file = f"{self.output_dir}/final_genes.txt"
+            with open(genes_file, 'w') as f:
+                for gene in self.genes:
+                    f.write(f"{gene}\n")
 
         return train_X, test_X, train_modality, test_modality, y_train, y_test, sc_X_final, sc_X_full_all_count, sc_all_labels
     
@@ -423,7 +444,21 @@ class coEncoder:
             marker_selection_method: Method for marker gene selection ('l1', 'variance', 'correlation')
             print_every: Print loss every N epochs (default: 50)
         """
-        print(f"Stage 1 Training: VAE | epochs={n_epochs}, lr={lr}, latent_dim={latent_dim}")
+        print(f"\n{'='*60}")
+        print(f"Stage 1: VAE Training")
+        print(f"{'='*60}")
+        print(f"  Epochs:        {n_epochs}")
+        print(f"  LR:            {lr}")
+        print(f"  Batch Size:    {batch_size}")
+        print(f"  Latent Dim:    {latent_dim}")
+        print(f"  Beta (KL):     {beta}")
+        print(f"  Lambda MMD:    {lambda_mmd}")
+        print(f"  Resolution:    {resolution}")
+        print(f"  Top N/Type:    {top_n_per_type}")
+        print(f"  Dual Decoder:  {use_dual_decoder}")
+        print(f"  Seed:          {self.seed}")
+        print(f"  Save to Disk:  {self.save_to_disk}")
+        print(f"{'='*60}\n")
         
         # 1. Load data
         sc_adata, st_adata = self.load_data()
@@ -449,6 +484,7 @@ class coEncoder:
             self.build_vae(input_dim, hidden_dims=hidden_dims, latent_dim=latent_dim, loss_type=loss_type, use_dual_decoder=use_dual_decoder)
         
         # 4. Train VAE with test set for early stopping
+        # 只有在 save_to_disk=True 时才传 output_dir（用于保存训练曲线图）
         best_loss = train_vae(
             vae=self.vae,
             train_X=train_X,
@@ -462,8 +498,10 @@ class coEncoder:
             loss_type=loss_type,
             lambda_mmd=lambda_mmd,
             device=self.device,
-            output_dir=self.output_dir,
-            print_every=print_every
+            output_dir=self.output_dir if self.save_to_disk else None,
+            print_every=print_every,
+            patience=20,
+            min_delta=0.001
         )
         
         # Save training data for cluster center computation
@@ -532,30 +570,72 @@ class coEncoder:
             self.cluster_to_celltype = None
         
         # 7. Plot UMAP for modality alignment visualization using vae_viz module
-        plot_modality_alignment_umap(
-            vae=self.vae,
-            train_X=train_X,
-            train_modality=train_modality,
-            y_train=y_train,
-            device=self.device,
-            output_dir=self.output_dir
-        )
+        if self.save_to_disk and self.output_dir:
+            plot_modality_alignment_umap(
+                vae=self.vae,
+                train_X=train_X,
+                train_modality=train_modality,
+                y_train=y_train,
+                device=self.device,
+                output_dir=self.output_dir
+            )
         
-        # 8. Save model and cluster data separately
-        model_path = f"{self.output_dir}/final_vae.pth"
-        self.save_vae(model_path)
+        # 8. Save model and cluster data separately (only if save_to_disk=True)
+        model_path = None
+        npz_path = None
         
-        # Save cluster data to separate NPZ file
-        npz_path = model_path.replace('.pth', '_cluster_data.npz')
-        self.save_cluster_data(npz_path)
+        if self.save_to_disk and self.output_dir:
+            model_path = f"{self.output_dir}/final_vae.pth"
+            self.save_vae(model_path)
+            
+            # Save cluster data to separate NPZ file
+            npz_path = model_path.replace('.pth', '_cluster_data.npz')
+            self.save_cluster_data(npz_path)
         
+        # 将 cluster_prototypes/expressions 转换为 numpy 数组（如果是 dict）
+        if isinstance(self.cluster_prototypes, dict):
+            cluster_ids_sorted = sorted(self.cluster_prototypes.keys())
+            prototypes_array = np.stack([self.cluster_prototypes[cid] for cid in cluster_ids_sorted], axis=0)
+        else:
+            prototypes_array = self.cluster_prototypes
+        
+        if isinstance(self.cluster_expressions, dict):
+            cluster_ids_sorted = sorted(self.cluster_expressions.keys())
+            expressions_array = np.stack([self.cluster_expressions[cid] for cid in cluster_ids_sorted], axis=0)
+        else:
+            expressions_array = self.cluster_expressions
+        
+        if isinstance(self.cluster_expressions_full_count, dict):
+            cluster_ids_sorted = sorted(self.cluster_expressions_full_count.keys())
+            expressions_full_list = [self.cluster_expressions_full_count[cid] for cid in cluster_ids_sorted]
+        else:
+            expressions_full_list = self.cluster_expressions_full_count
+        
+        # 返回结果：包含所有内存产物，供 Stage1Artifacts 使用
         return {
             'best_loss': best_loss,
             'n_genes': len(self.genes),
             'n_clusters': len(self.label_encoder.classes_),
             'model_path': model_path,
             'cluster_data_path': npz_path,
-            'clusters': list(self.label_encoder.classes_)
+            'clusters': list(self.label_encoder.classes_),
+            # ===== 内存产物（供纯内存模式使用）=====
+            'vae_encoder': self.vae.encoder,  # 直接返回编码器模块
+            'vae_state_dict': self.vae.state_dict(),  # 同时返回 state_dict 作为备份
+            'input_dim': len(self.genes),
+            'latent_dim': self.vae.encoder.fc_mu.out_features,
+            'output_type': getattr(self.vae, 'output_type', 'mse'),
+            'label_encoder': self.label_encoder,
+            'marker_genes': self.marker_genes,
+            'genes': self.genes,
+            'sc_clusters': self.sc_clusters,
+            'resolution': self.resolution,
+            'all_genes': getattr(self, 'all_genes', None),
+            'cluster_to_celltype': self.cluster_to_celltype,
+            'celltype_prototypes': prototypes_array,
+            'celltype_expressions': expressions_array,
+            'celltype_expressions_full': expressions_full_list,
+            'hvg_genes_union': getattr(self, 'hvg_genes_union', None),
         }
 
 def main():

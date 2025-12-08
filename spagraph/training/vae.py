@@ -179,7 +179,7 @@ def train_vae(
                 f.write(f"Final Loss:\n")
                 f.write(f"  Best Loss:     {best_loss_val:.6f}\n")
             f.write("="*60 + "\n")
-        print(f"\u2705 Stage 1 config saved to: {config_path}")
+        print(f"Stage 1 config saved to: {config_path}")
     
     return artifacts if as_artifacts else results
 

@@ -580,17 +580,11 @@ class coEncoder:
                 output_dir=self.output_dir
             )
         
-        # 8. Save model and cluster data separately (only if save_to_disk=True)
+        # 8. 不保存模型文件（完全内存模式，通过 Stage1Artifacts 传递）
         model_path = None
         npz_path = None
         
-        if self.save_to_disk and self.output_dir:
-            model_path = f"{self.output_dir}/final_vae.pth"
-            self.save_vae(model_path)
-            
-            # Save cluster data to separate NPZ file
-            npz_path = model_path.replace('.pth', '_cluster_data.npz')
-            self.save_cluster_data(npz_path)
+        # Stage 1 不再保存 .pth 和 .npz，所有数据通过内存传递
         
         # 将 cluster_prototypes/expressions 转换为 numpy 数组（如果是 dict）
         if isinstance(self.cluster_prototypes, dict):

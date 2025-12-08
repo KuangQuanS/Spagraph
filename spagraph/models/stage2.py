@@ -68,8 +68,7 @@ class GATDeconvolution:
         self.stage1_artifacts = stage1_artifacts
         self.output_dir = output_dir
         self.seed = seed
-        if output_dir:
-            os.makedirs(output_dir, exist_ok=True)
+        # 不在初始化时创建目录，留到实际保存文件时再创建
         
         # Device
         if device is None:
@@ -79,6 +78,9 @@ class GATDeconvolution:
         
         # Weight threshold for sparsification
         self.weight_threshold = weight_threshold
+        
+        # Output options
+        self.save_reconstructed_genes = False  # 是否保存重构的全基因表达
 
         # Model components
         self.vae_encoder = None
@@ -480,6 +482,8 @@ class GATDeconvolution:
         best_pearson = float('inf')
         best_mse = float('inf')
         best_cosine = float('inf')
+        best_gene_pearson = float('inf')
+        best_gene_cosine = float('inf')
         patience_counter = 0
         patience = 50  # 早停 patience
         min_delta = 0.001  # 绝对改进阈值（Pearson/Cosine 需要下降至少这么多）
@@ -509,6 +513,8 @@ class GATDeconvolution:
             current_pearson = epoch_losses['pearson_loss']
             current_mse = epoch_losses['mse_loss']
             current_cosine = epoch_losses['cosine_loss']
+            current_gene_pearson = epoch_losses.get('gene_pearson_loss', 0.0)
+            current_gene_cosine = epoch_losses.get('gene_cosine_loss', 0.0)
             
             # 绝对改进：best - current > min_delta（损失下降超过阈值）
             pearson_improvement = best_pearson - current_pearson
@@ -522,31 +528,41 @@ class GATDeconvolution:
                     best_mse = current_mse
                 if current_cosine < best_cosine:
                     best_cosine = current_cosine
+                if current_gene_pearson < best_gene_pearson:
+                    best_gene_pearson = current_gene_pearson
+                if current_gene_cosine < best_gene_cosine:
+                    best_gene_cosine = current_gene_cosine
                 patience_counter = 0
-                self.save_model(f"{self.output_dir}/best_gat_model.pth")
+                if self.output_dir:  # 只在有输出目录时保存
+                    os.makedirs(self.output_dir, exist_ok=True)
+                    self.save_model(f"{self.output_dir}/best_gat_model.pth")
             else:
                 patience_counter += 1
             
-            # Print every N epochs
-            if (epoch + 1) % print_every == 0 or epoch == 0:
+            # Print every N epochs（网格搜索时 print_every=9999 不会触发）
+            if (epoch + 1) % print_every == 0:
                 print(f"  Epoch {epoch+1}/{n_epochs}: Total={avg_total_loss:.4f}, MSE={current_mse:.4f}, Pearson={current_pearson:.4f}, Cosine={current_cosine:.4f}")
             
             # Early stopping
             if patience_counter >= patience:
-                print(f"Early stopping at epoch {epoch+1}/{n_epochs}")
-                # Only print best values if they are not inf
-                if best_pearson != float('inf') and best_mse != float('inf') and best_cosine != float('inf'):
-                    print(f"  Best: Pearson={best_pearson:.4f}, MSE={best_mse:.4f}, Cosine={best_cosine:.4f}")
+                if print_every != 9999:  # 网格搜索时不打印
+                    print(f"Early stopping at epoch {epoch+1}/{n_epochs}")
+                    # Only print best values if they are not inf
+                    if best_pearson != float('inf') and best_mse != float('inf') and best_cosine != float('inf'):
+                        print(f"  Best: Pearson={best_pearson:.4f}, MSE={best_mse:.4f}, Cosine={best_cosine:.4f}")
                 break
         
-        # Plot training curves
-        self.plot_training_curves(train_losses, pearson_losses, mse_losses,
-                                 cos_losses, gene_pearson_losses, gene_cosine_losses,
-                                 weight_regs, sparsity_regs, diversity_losses, hetero_losses, 
-                                 proportion_losses, sample_name)
+        # Plot training curves (only if output_dir exists)
+        if self.output_dir:
+            self.plot_training_curves(train_losses, pearson_losses, mse_losses,
+                                     cos_losses, gene_pearson_losses, gene_cosine_losses,
+                                     weight_regs, sparsity_regs, diversity_losses, hetero_losses, 
+                                     proportion_losses, sample_name)
         
-        # Save final model
-        self.save_model(f"{self.output_dir}/final_gat_model.pth")
+        # Save final model (only if output_dir exists)
+        if self.output_dir:
+            os.makedirs(self.output_dir, exist_ok=True)
+            self.save_model(f"{self.output_dir}/final_gat_model.pth")
         
         # Evaluate and visualize results (use normalized data for embedding)
         eval_outputs = self.evaluate_and_visualize(st_data_normalized, self.st_adata, spatial_tensor, sample_name)
@@ -555,6 +571,8 @@ class GATDeconvolution:
             'best_pearson': best_pearson,
             'best_mse': best_mse,
             'best_cosine': best_cosine,
+            'best_gene_pearson': best_gene_pearson,
+            'best_gene_cosine': best_gene_cosine,
             'train_losses': train_losses,
             'sample_name': sample_name,
             **(eval_outputs or {})
@@ -621,21 +639,25 @@ class GATDeconvolution:
             if scale_basis == "none":
                 reconstructed_full_expr = mixed_expr_full
             else:
-                # ✅ 使用 spot_total_counts 计算 scale factor
-                # 1. 重建的 marker 基因表达 (raw count scale)
-                mixed_expr_marker = np.dot(deconv_weights, celltype_expr_marker)  # [n_spots, n_marker_genes]
-                reconstructed_marker_total = mixed_expr_marker.sum(axis=1)  # [n_spots]
-                
-                # 2. 真实 spot 的 marker 基因 total counts (raw count, 已在 main 中计算)
+                # 使用 spot_total_counts 进行缩放（与 deconv_model.py 保持一致）
                 if self.spot_total_counts is None:
                     raise ValueError("spot_total_counts not set; cannot compute scale factor.")
-                spot_marker_total = self.spot_total_counts[:len(spot_barcodes)]  # [n_spots]
+                spot_counts = self.spot_total_counts[:len(spot_barcodes)]
                 
-                # 3. 计算 scale factor: spot真实值 / 重建值
-                scale = spot_marker_total / (reconstructed_marker_total + 1e-8)
+                if scale_basis == "all":
+                    # 使用全部基因总量
+                    mixed_basis_totals = mixed_expr_full.sum(axis=1, keepdims=True)
+                elif scale_basis == "hvg" and self.hvg_genes_union is not None:
+                    # 使用 HVG 交集
+                    hvg_indices = [i for i, g in enumerate(self.all_genes) if g in self.hvg_genes_union]
+                    mixed_basis_totals = mixed_expr_full[:, hvg_indices].sum(axis=1, keepdims=True)
+                else:
+                    # 默认：使用 marker 子集
+                    marker_indices = [i for i, g in enumerate(self.all_genes) if g in self.marker_genes]
+                    mixed_basis_totals = mixed_expr_full[:, marker_indices].sum(axis=1, keepdims=True)
                 
-                # 4. 应用 scale 到全基因重建表达
-                reconstructed_full_expr = mixed_expr_full * scale[:, np.newaxis]
+                scale = spot_counts[:, np.newaxis] / (mixed_basis_totals + 1e-8)
+                reconstructed_full_expr = mixed_expr_full * scale
             
             # Get full gene names
             if self.all_genes is not None:
@@ -643,13 +665,16 @@ class GATDeconvolution:
             else:
                 all_gene_names = [f"Gene_{i}" for i in range(celltype_expr_full.shape[1])]
             
-            full_expr_df = pd.DataFrame(
-                reconstructed_full_expr,
-                columns=all_gene_names,
-                index=spot_barcodes
-            )
-            full_expr_file = f"{self.output_dir}/{sample_name}_reconstructed_all_genes.csv"
-            full_expr_df.to_csv(full_expr_file)
+            # 只在启用时保存重构的全基因表达
+            if self.save_reconstructed_genes and self.output_dir:
+                os.makedirs(self.output_dir, exist_ok=True)
+                full_expr_df = pd.DataFrame(
+                    reconstructed_full_expr,
+                    columns=all_gene_names,
+                    index=spot_barcodes
+                )
+                full_expr_file = f"{self.output_dir}/{sample_name}_reconstructed_all_genes.csv"
+                full_expr_df.to_csv(full_expr_file)
         else:
             pass
 
@@ -685,18 +710,14 @@ class GATDeconvolution:
         else:
             composition_by_celltype = composition_df
 
-        # Save aggregated celltype composition
-        composition_file = f"{self.output_dir}/{sample_name}_cell_composition.csv"
-        composition_by_celltype.to_csv(composition_file)
+        # Save aggregated celltype composition (only if output_dir exists)
+        composition_file = None
+        if self.output_dir:
+            os.makedirs(self.output_dir, exist_ok=True)
+            composition_file = f"{self.output_dir}/{sample_name}_cell_composition.csv"
+            composition_by_celltype.to_csv(composition_file)
 
-        # Also save cluster-level composition (columns are cluster IDs) for reproducibility
-        cluster_composition_df = pd.DataFrame(
-            deconv_weights,
-            columns=cluster_columns,
-            index=spot_barcodes
-        )
-        cluster_file = f"{self.output_dir}/{sample_name}_cluster_composition.csv"
-        cluster_composition_df.to_csv(cluster_file)
+        # Skip cluster-level composition to reduce file clutter
 
         # ============ Compute reconstruction quality (Cosine Similarity) ============
         marker_indices = None
@@ -731,30 +752,25 @@ class GATDeconvolution:
             
             cosine_similarities = np.array(cosine_similarities)
             
-            # Save cosine similarities to CSV
-            cosine_df = pd.DataFrame({
-                'spot_id': spot_barcodes,
-                'cosine_similarity': cosine_similarities
-            })
-            cosine_csv = f"{self.output_dir}/{sample_name}_spot_cosine_similarity.csv"
-            cosine_df.to_csv(cosine_csv, index=False)
+            # Skip saving cosine similarities to reduce file clutter
+            # (still available in metrics)
 
-            # Plot reconstruction quality curve (sorted by similarity)
-            self.plot_reconstruction_quality_curve(cosine_similarities, sample_name)
+            # Plot reconstruction quality curve (sorted by similarity, only if output_dir exists)
+            if self.output_dir:
+                self.plot_reconstruction_quality_curve(cosine_similarities, sample_name)
         
         # 缓存到对象并返回，便于上层直接拿到矩阵
         self.last_deconv = composition_by_celltype
         self.last_deconv_path = composition_file
-        self.last_cluster_deconv_path = cluster_file
         self.last_reconstructed_expr_path = full_expr_file
         self.last_cosine_path = cosine_csv
 
         return {
             'composition_df': composition_by_celltype,
             'composition_path': composition_file,
-            'cluster_composition_path': cluster_file,
             'reconstructed_expr_path': full_expr_file,
-            'cosine_path': cosine_csv
+            'cosine_path': cosine_csv,
+            'deconv_weights_raw': deconv_weights  # 未合并的 cluster-level 权重 [n_spots, n_clusters]
         }
     
     def plot_reconstruction_quality_curve(self, cosine_similarities, sample_name):
@@ -816,8 +832,10 @@ class GATDeconvolution:
         plt.tight_layout()
         
         # Save figure
-        output_file = f"{self.output_dir}/{sample_name}_reconstruction_quality_curve.png"
-        plt.savefig(output_file, dpi=300, bbox_inches='tight')
+        if self.output_dir:
+            os.makedirs(self.output_dir, exist_ok=True)
+            output_file = f"{self.output_dir}/{sample_name}_reconstruction_quality_curve.png"
+            plt.savefig(output_file, dpi=300, bbox_inches='tight')
         plt.close()
     
     def plot_training_curves(self, train_losses, pearson_losses, mse_losses,
@@ -840,7 +858,9 @@ class GATDeconvolution:
         ax.legend(fontsize=10, ncol=2)
 
         plt.tight_layout()
-        plt.savefig(f"{self.output_dir}/gat_training_curves_{sample_name}.png", dpi=300, bbox_inches='tight')
+        if self.output_dir:
+            os.makedirs(self.output_dir, exist_ok=True)
+            plt.savefig(f"{self.output_dir}/gat_training_curves_{sample_name}.png", dpi=300, bbox_inches='tight')
         plt.close()
     
     def save_model(self, filepath: str):

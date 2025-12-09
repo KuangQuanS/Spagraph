@@ -533,7 +533,7 @@ class GATDeconvolution:
         best_gene_pearson = float('inf')
         best_gene_cosine = float('inf')
         patience_counter = 0
-        patience = 50  # 早停 patience
+        patience = 20  # 早停 patience
         min_delta = 0.001  # 绝对改进阈值（Pearson/Cosine 需要下降至少这么多）
         
         for epoch in range(n_epochs):
@@ -586,8 +586,8 @@ class GATDeconvolution:
                 patience_counter += 1
             
             # Print every N epochs（网格搜索时 print_every=9999 不会触发）
-            if (epoch + 1) % print_every == 0:
-                print(f"  Epoch {epoch+1}/{n_epochs}: Total={avg_total_loss:.4f}, MSE={current_mse:.4f}, Pearson={current_pearson:.4f}, Cosine={current_cosine:.4f}")
+            if (epoch) % print_every == 0:
+                print(f"  Epoch {epoch}/{n_epochs}: Total={avg_total_loss:.4f}, MSE={current_mse:.4f}, Pearson={current_pearson:.4f}, Cosine={current_cosine:.4f}")
             
             # Early stopping
             if patience_counter >= patience:

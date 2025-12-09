@@ -125,7 +125,7 @@ def run_deconv(
     # Graph parameters
     k_spatial: int = 5,
     k_celltype: int = 20,
-    k_celltype_range: Optional[list] = "auto",  # 自动网格搜索，默认 [15,20,25,30]，设为 [] 禁用
+    k_celltype_range: Optional[list] = [15, 20, 25, 30, 35],  # 自动网格搜索，默认 [15,20,25,30]，设为 [] 禁用
     # GAT architecture
     gat_hidden_dim: int = 512,
     gat_layers: int = 4,
@@ -133,7 +133,7 @@ def run_deconv(
     dropout: float = 0.1,
     # Loss weights
     lambda_pearson: float = 5.0,
-    lambda_mse: float = 0.001,
+    lambda_mse: float = 0.01,
     lambda_cosine: float = 5.0,
     lambda_gene_pearson: float = 1.0,
     lambda_gene_cosine: float = 1.0,
@@ -143,10 +143,10 @@ def run_deconv(
     # Output options
     save_reconstructed_genes: bool = False,  # 是否保存重构的全基因表达
     # Dynamic cluster representation (optional)
-    use_dynamic_cluster_repr: bool = False,  # 启用动态cluster表示（用k个最近细胞代替cluster平均）
+    use_dynamic_cluster_repr: bool = True,  # 启用动态cluster表示（用k个最近细胞代替cluster平均）
     k_cells_per_cluster: int = 10,  # 每个cluster使用多少个最近细胞
     precompute_knn: bool = True,  # 是否在训练前预计算k-nearest cells（推荐True）
-    use_learnable_weights: bool = True,  # 是否用MLP学习cell权重（False则用均匀平均）
+    use_learnable_weights: bool = False,  # 是否用MLP学习cell权重（False则用均匀平均）
     # Other
     weight_threshold: float = 0.001,
     scale_basis: str = 'all',
@@ -155,74 +155,49 @@ def run_deconv(
     _silent_header: bool = False,  # 内部参数：禁止打印配置头部
 ) -> Dict[str, Any]:
     """Stage 2: GAT Deconvolution
-    
-    Args:
-        vae: Stage1Artifacts 对象（必须，由 spg.vae() 返回）
-        st_file: ST h5ad 文件路径（可选，默认用 vae.st_file）
-        output_dir: 输出目录（提供则保存，不提供则纯内存）
-        
-        # 训练参数
-        n_epochs: 训练轮数
-        lr: 学习率
-        batch_size: 批大小
-        print_every: 每 N 轮打印一次
-        
-        # 图构建参数
-        k_spatial: 空间邻居数
-        k_celltype: 细胞类型邻居数（如果启用网格搜索则被忽略）
-        k_celltype_range: k_celltype 候选列表，启用自动网格搜索
-                         "auto" (默认): 自动搜索 [10,15,20,25,30]
-                         [15,20,25]: 自定义候选列表
-                         [] 或 [25]: 禁用网格搜索，使用固定的 k_celltype
-        
-        # GAT 架构
-        gat_hidden_dim: GAT 隐藏层维度
-        gat_layers: GAT 层数
-        gat_heads: 注意力头数
-        dropout: Dropout 比率
-        
-        # 损失权重
-        lambda_pearson: Pearson 相关损失权重（spot level）
-        lambda_mse: MSE 损失权重
-        lambda_cosine: Cosine 相似度损失权重（spot level）
-        lambda_gene_pearson: Gene-wise Pearson 相关损失权重
-        lambda_gene_cosine: Gene-wise Cosine 相似度损失权重
-        lambda_reg: 正则化损失权重
-        lambda_sparse: 稀疏性损失权重
-        lambda_proportion: 比例约束损失权重
-        
-        # 其他
-        weight_threshold: 权重稀疏化阈值
-        scale_basis: 缩放基准 ('all', 'marker', 'hvg', 'none', 'fixed_10')
-                    - 'all': 使用全部基因总量缩放
-                    - 'marker': 使用marker基因总量缩放
-                    - 'hvg': 使用HVG交集总量缩放
-                    - 'none': 不缩放
-                    - 'fixed_10': 固定缩放因子10（比例×10 = 每个spot的细胞数）
-        device: 计算设备
-        seed: 随机种子
-    
-    Returns:
-        dict: {deconv, deconv_path, sample_name, n_clusters, best_pearson, metrics}
-              如果启用网格搜索，还包含 {best_k, best_score, all_trials}
-    
-    Example:
-        >>> art = spg.vae(sc_file="sc.h5ad", st_file="st.h5ad")
-        >>> # 默认启用网格搜索 k=[10,15,20,25,30]
-        >>> res = spg.deconv(art, output_dir="output/")
-        >>> print(f"Best k: {res['best_k']}")
-        >>> # 禁用网格搜索，使用固定 k
-        >>> res = spg.deconv(art, k_celltype=25, k_celltype_range=[])
     """
     # 参数检查
     if st_file is None:
         st_file = vae.st_file
     if st_file is None:
         raise ValueError("st_file is required")
-    
-    # 🔍 自动网格搜索 k_celltype（默认启用）
-    if k_celltype_range == "auto":
-        k_celltype_range = [20]
+
+    # 打印Stage 2配置信息（在网格搜索前）
+    sample_name = Path(st_file).stem
+    if not _silent_header:
+        print(f"\n{'='*60}")
+        print(f"Stage 2: GAT Deconvolution")
+        print(f"{'='*60}")
+        print(f"Sample:             {sample_name}")
+        print(f"Epochs:             {n_epochs}")
+        print(f"LR:                 {lr}")
+        print(f"Batch Size:         {batch_size}")
+        print(f"K Spatial:          {k_spatial}")
+        if k_celltype_range is not None and len(k_celltype_range) > 1:
+            print(f"K Celltype:         Grid Search {k_celltype_range}")
+        else:
+            print(f"K Celltype:         {k_celltype if k_celltype_range is None or len(k_celltype_range) == 0 else k_celltype_range[0]}")
+        print(f"GAT Architecture:   {gat_layers}L × {gat_hidden_dim}D × {gat_heads}H")
+        print(f"Dropout:            {dropout}")
+        print(f"Loss Weights:")
+        print(f"  Pearson:          {lambda_pearson}")
+        print(f"  MSE:              {lambda_mse}")
+        print(f"  Cosine:           {lambda_cosine}")
+        print(f"  Gene Pearson:     {lambda_gene_pearson}")
+        print(f"  Gene Cosine:      {lambda_gene_cosine}")
+        print(f"  Reg:              {lambda_reg}")
+        print(f"  Sparse:           {lambda_sparse}")
+        print(f"  Proportion:       {lambda_proportion}")
+        print(f"Dynamic Cluster:    {use_dynamic_cluster_repr}")
+        if use_dynamic_cluster_repr:
+            print(f"  K Cells/Cluster:  {k_cells_per_cluster}")
+            print(f"  Learnable Weights: {use_learnable_weights}")
+            print(f"  Precompute KNN:   {precompute_knn}")
+        print(f"Scale Basis:        {scale_basis}")
+        print(f"Weight Threshold:   {weight_threshold}")
+        print(f"Seed:               {seed}")
+        print(f"Save to Disk:       {bool(output_dir)}")
+        print(f"{'='*60}\n")
     
     # 网格搜索启用条件：列表且长度 > 1
     if k_celltype_range is not None and len(k_celltype_range) > 1:
@@ -250,7 +225,6 @@ def run_deconv(
             lambda_sparse=lambda_sparse,
             lambda_proportion=lambda_proportion,
             save_reconstructed_genes=save_reconstructed_genes,
-            # 动态cluster参数（重要！）
             use_dynamic_cluster_repr=use_dynamic_cluster_repr,
             k_cells_per_cluster=k_cells_per_cluster,
             precompute_knn=precompute_knn,
@@ -274,24 +248,7 @@ def run_deconv(
     sample_name = Path(st_file).stem
     use_memory_mode = vae.is_memory_mode()
     
-    # 打印配置（网格搜索时只打印一次）
-    if not _silent_header:
-        print(f"\n{'='*60}")
-        print(f"Stage 2: GAT Deconvolution")
-        print(f"{'='*60}")
-        print(f"  Sample:        {sample_name}")
-        print(f"  Epochs:        {n_epochs}")
-        print(f"  LR:            {lr}")
-        print(f"  Batch Size:    {batch_size}")
-        print(f"  K Spatial:     {k_spatial}")
-        print(f"  K Celltype:    {k_celltype}")
-        print(f"  GAT:           {gat_layers}L x {gat_hidden_dim}D x {gat_heads}H")
-        print(f"  Loss Weights:  Pearson={lambda_pearson}, MSE={lambda_mse}, Cosine={lambda_cosine}")
-        print(f"                 GenePearson={lambda_gene_pearson}, GeneCosine={lambda_gene_cosine}")
-        print(f"  Regularization: Reg={lambda_reg}, Sparse={lambda_sparse}, Prop={lambda_proportion}")
-        print(f"  Seed:          {seed}")
-        print(f"  Memory Mode:   {use_memory_mode}")
-        print(f"{'='*60}\n")
+    # 配置已经在函数开头打印过了，这里不再重复打印
     
     # 初始化 trainer (seed 会在 __init__ 中设置)
     # output_dir 可以是 None（纯内存模式），trainer 在实际保存文件时才创建目录
@@ -502,6 +459,14 @@ def run_deconv(
             f.write(f"  Reg:           {lambda_reg}\n")
             f.write(f"  Sparse:        {lambda_sparse}\n")
             f.write(f"  Proportion:    {lambda_proportion}\n\n")
+            f.write(f"Dynamic Cluster Representation:\n")
+            f.write(f"  Enabled:       {use_dynamic_cluster_repr}\n")
+            if use_dynamic_cluster_repr:
+                f.write(f"  K Cells/Cluster: {k_cells_per_cluster}\n")
+                f.write(f"  Learnable Weights: {use_learnable_weights}\n")
+                f.write(f"  Precompute KNN: {precompute_knn}\n\n")
+            else:
+                f.write("\n")
             f.write(f"Output Options:\n")
             f.write(f"  Save Reconstructed Genes: {save_reconstructed_genes}\n\n")
             f.write(f"Results:\n")
@@ -564,9 +529,7 @@ def run_deconv_auto_k(
         - 'all_trials': 所有尝试的摘要列表
         - 其他 run_deconv 返回的字段（使用最优 k）
     """
-    if k_celltype_range is None:
-        k_celltype_range = [15, 20, 25, 30]
-    
+
     # 简化输出
     print(f"\nGrid search: k_celltype = {k_celltype_range}")
     
@@ -768,6 +731,22 @@ def run_deconv_auto_k(
             f.write(f"  Reg:           {lambda_reg}\n")
             f.write(f"  Sparse:        {lambda_sparse}\n")
             f.write(f"  Proportion:    {lambda_proportion}\n\n")
+            
+            # 动态cluster参数
+            use_dynamic_cluster_repr = kwargs.get('use_dynamic_cluster_repr', False)
+            k_cells_per_cluster = kwargs.get('k_cells_per_cluster', 10)
+            use_learnable_weights = kwargs.get('use_learnable_weights', True)
+            precompute_knn = kwargs.get('precompute_knn', True)
+            
+            f.write(f"Dynamic Cluster Representation:\n")
+            f.write(f"  Enabled:       {use_dynamic_cluster_repr}\n")
+            if use_dynamic_cluster_repr:
+                f.write(f"  K Cells/Cluster: {k_cells_per_cluster}\n")
+                f.write(f"  Learnable Weights: {use_learnable_weights}\n")
+                f.write(f"  Precompute KNN: {precompute_knn}\n\n")
+            else:
+                f.write("\n")
+            
             f.write(f"Output Options:\n")
             f.write(f"  Save Reconstructed Genes: {save_reconstructed_genes}\n\n")
             f.write(f"All Trials (Score = MSE + Cosine + Gene_Pearson):\n")

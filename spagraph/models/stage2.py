@@ -282,12 +282,18 @@ class GATDeconvolution:
                        gat_heads=4, dropout=0.1, loss_lambda_pearson=1.0, loss_lambda_mse=1.0,
                        loss_lambda_cosine=1.0, loss_lambda_gene_pearson=0.0, loss_lambda_gene_cosine=0.0,
                        loss_lambda_reg=0.5, loss_lambda_sparse=0.01,
-                       loss_lambda_proportion=1.0, spot_total_counts=None):
+                       loss_lambda_proportion=1.0, spot_total_counts=None,
+                       use_dynamic_cluster_repr=False, k_cells_per_cluster=10, 
+                       use_learnable_weights=True, sc_cell_expressions=None):
         """Build GAT deconvolution model
         
         Args:
             spot_total_counts: Array of total counts for each spot (shape: [n_spots])
                               Used for scaling: reconstructed = s_i × Σ(w_ic × R_c)
+            use_dynamic_cluster_repr: 是否启用动态cluster表示
+            k_cells_per_cluster: 每个cluster使用多少个最近细胞
+            use_learnable_weights: 是否使用MLP学习cell权重（False则用均匀平均）
+            sc_cell_expressions: [n_cells, n_marker_genes] 单细胞marker基因原始count（动态模式需要）
         """
         # Get embedding dimension from VAE encoder
         embedding_dim = self.latent_dim
@@ -304,7 +310,12 @@ class GATDeconvolution:
             dropout=dropout,
             k_spatial=self.k_spatial,
             k_celltype=self.k_celltype,
-            celltype_prototypes=self.celltype_prototypes  # 使用第一阶段的celltype prototypes初始化
+            celltype_prototypes=self.celltype_prototypes,  # 使用第一阶段的celltype prototypes初始化
+            # 动态cluster参数
+            use_dynamic_cluster_repr=use_dynamic_cluster_repr,
+            k_cells_per_cluster=k_cells_per_cluster,
+            use_learnable_weights=use_learnable_weights,
+            sc_cell_expressions=sc_cell_expressions
         ).to(self.device)
         
         # 计算单细胞数据中各cluster的比例
@@ -392,6 +403,14 @@ class GATDeconvolution:
             else:
                 batch_spot_total_counts = None
             
+            # ✅ 获取动态cluster数据（如果启用）
+            batch_knn_indices = None
+            if self.knn_cell_indices is not None:
+                # 使用non_blocking加速数据传输
+                batch_knn_indices = torch.LongTensor(
+                    self.knn_cell_indices[batch_indices]
+                ).to(self.device, non_blocking=True)
+            
             # Compute spot embeddings (using normalized data, consistent with VAE training)
             with torch.no_grad():
                 mu, log_var = self.vae_encoder(batch_st_normalized)
@@ -410,10 +429,15 @@ class GATDeconvolution:
                 attention_weights=gat_outputs['deconv_weights'],
                 celltype_expression=self.celltype_expressions,
                 true_spot_expression=batch_st_raw,  # ✅ Use raw counts for loss
-                spot_embedding=gat_outputs['spot_features'],
+                spot_embedding=spot_embeddings,  # ✅ Use original VAE embeddings for dynamic cluster MLP
                 celltype_embedding=gat_outputs['celltype_features'],
                 edge_index=gat_outputs['edge_index'],
-                batch_spot_total_counts=batch_spot_total_counts  # ✅ Pass batch-specific counts
+                batch_spot_total_counts=batch_spot_total_counts,  # ✅ Pass batch-specific counts
+                # 动态cluster参数
+                knn_cell_indices=batch_knn_indices,
+                sc_cell_embeddings=self.sc_cell_embeddings_tensor,  # ✅ 使用预转换的tensor
+                sc_cell_expressions=self.gat_model.sc_cell_expressions if hasattr(self.gat_model, 'sc_cell_expressions') else None,
+                gat_model=self.gat_model
             )
             
             # Backward pass
@@ -441,23 +465,47 @@ class GATDeconvolution:
                                n_epochs: int = 50,
                                lr: float = 1e-3,
                                batch_size: int = 512,
-                               print_every: int = 50):
+                               print_every: int = 50,
+                               knn_cell_indices=None,
+                               sc_cell_embeddings=None):
         """Train GAT deconvolution model
         
         Args:
             st_data_normalized: Normalized ST data (sum=1) for VAE embedding
             st_data_raw: Raw count ST data for loss calculation
             print_every: Print loss every N epochs (default: 50)
+            knn_cell_indices: [n_spots, n_cell_types, k] 预计算的k-nearest cell索引（动态模式）
+            sc_cell_embeddings: [n_cells, embedding_dim] 单细胞embeddings（动态模式）
         """
         # Save st_adata for later use
         self.st_adata = st_adata
+        
+        # 保存动态cluster数据
+        self.knn_cell_indices = knn_cell_indices
+        self.sc_cell_embeddings = sc_cell_embeddings
+        
+        # ✅ 预先转换为GPU tensor，避免每个batch重复转换
+        if self.sc_cell_embeddings is not None:
+            self.sc_cell_embeddings_tensor = torch.FloatTensor(self.sc_cell_embeddings).to(self.device)
+        else:
+            self.sc_cell_embeddings_tensor = None
  
         spatial_tensor = torch.FloatTensor(spatial_coords).to(self.device)
         
         # Create dataset and dataloader (use normalized data for embedding)
         spot_ids = list(range(len(st_data_normalized)))
         dataset = SpatialDataset(st_data_normalized, st_data_raw, spatial_coords, spot_ids)
-        dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=False)
+        
+        # ✅ 优化DataLoader性能：多进程+pin_memory
+        dataloader = DataLoader(
+            dataset, 
+            batch_size=batch_size, 
+            shuffle=True, 
+            drop_last=False,
+            num_workers=4,  # 多进程加载数据
+            pin_memory=True,  # 加速CPU→GPU传输
+            persistent_workers=True  # 保持worker进程，避免重复创建开销
+        )
         
         # Optimizer
         optimizer = torch.optim.Adam(self.gat_model.parameters(), lr=lr)
@@ -533,9 +581,7 @@ class GATDeconvolution:
                 if current_gene_cosine < best_gene_cosine:
                     best_gene_cosine = current_gene_cosine
                 patience_counter = 0
-                if self.output_dir:  # 只在有输出目录时保存
-                    os.makedirs(self.output_dir, exist_ok=True)
-                    self.save_model(f"{self.output_dir}/best_gat_model.pth")
+                # 不保存模型权重文件
             else:
                 patience_counter += 1
             
@@ -559,10 +605,8 @@ class GATDeconvolution:
                                      weight_regs, sparsity_regs, diversity_losses, hetero_losses, 
                                      proportion_losses, sample_name)
         
-        # Save final model (only if output_dir exists)
-        if self.output_dir:
-            os.makedirs(self.output_dir, exist_ok=True)
-            self.save_model(f"{self.output_dir}/final_gat_model.pth")
+        # 注意：最佳模型已在训练循环中保存为 best_gat_model.pth
+        # 不需要再保存 final_gat_model.pth，避免重复
         
         # Evaluate and visualize results (use normalized data for embedding)
         eval_outputs = self.evaluate_and_visualize(st_data_normalized, self.st_adata, spatial_tensor, sample_name)
@@ -638,6 +682,9 @@ class GATDeconvolution:
             scale_basis = getattr(self, "scale_basis", "all")
             if scale_basis == "none":
                 reconstructed_full_expr = mixed_expr_full
+            elif scale_basis == "fixed_10":
+                # 固定缩放因子10：比例×10 = 细胞数量
+                reconstructed_full_expr = mixed_expr_full * 10.0
             else:
                 # 使用 spot_total_counts 进行缩放（与 deconv_model.py 保持一致）
                 if self.spot_total_counts is None:

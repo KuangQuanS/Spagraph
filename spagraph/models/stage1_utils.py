@@ -221,7 +221,7 @@ def compute_cluster_centers_and_expressions(
     embeddings: np.ndarray,
     sc_train_data: np.ndarray,
     sc_train_labels: np.ndarray,
-    sc_X_full_train_count: np.ndarray,
+    sc_X_full_train_count: Optional[np.ndarray] = None,
     aggregation_method: str = 'weighted'
 ) -> Tuple[Dict, Dict, Dict, Dict]:
     """
@@ -231,7 +231,7 @@ def compute_cluster_centers_and_expressions(
         embeddings: Cell embeddings in latent space [n_cells, latent_dim]
         sc_train_data: Marker gene expression [n_cells, n_marker_genes]
         sc_train_labels: Cluster labels [n_cells]
-        sc_X_full_train_count: Full gene expression [n_cells, n_all_genes]
+        sc_X_full_train_count: Full gene expression [n_cells, n_all_genes] (可选，如果为None则不计算全基因聚合表达)
         aggregation_method: 'mean', 'median', or 'weighted'
             - 'mean': Simple average
             - 'median': Median aggregation
@@ -240,7 +240,7 @@ def compute_cluster_centers_and_expressions(
     Returns:
         cluster_prototypes: Dict of cluster centers in latent space
         cluster_expressions: Dict of cluster expressions (marker genes)
-        cluster_expressions_full_count: Dict of cluster expressions (all genes)
+        cluster_expressions_full_count: Dict of cluster expressions (all genes, 如果sc_X_full_train_count=None则为空dict)
         cluster_cell_weights: Dict of cell weights per cluster (None for mean/median)
     """
 
@@ -260,13 +260,13 @@ def compute_cluster_centers_and_expressions(
         # Get cluster data
         cluster_embeddings = embeddings[cluster_mask]
         cluster_data = sc_train_data[cluster_mask]
-        cluster_full_data = sc_X_full_train_count[cluster_mask]
+        cluster_full_data = sc_X_full_train_count[cluster_mask] if sc_X_full_train_count is not None else None
         
         if aggregation_method == 'mean':
             # Simple mean aggregation
             cluster_center = np.mean(cluster_embeddings, axis=0)
             cluster_expression = np.mean(cluster_data, axis=0)
-            cluster_expr_full = np.mean(cluster_full_data, axis=0)
+            cluster_expr_full = np.mean(cluster_full_data, axis=0) if cluster_full_data is not None else None
             cluster_cell_weights[cluster_id] = None
 
             
@@ -274,14 +274,15 @@ def compute_cluster_centers_and_expressions(
             # Median aggregation
             cluster_center = np.median(cluster_embeddings, axis=0)
             cluster_expression = np.median(cluster_data, axis=0)
-            cluster_expr_full = np.median(cluster_full_data, axis=0)
+            cluster_expr_full = np.median(cluster_full_data, axis=0) if cluster_full_data is not None else None
             cluster_cell_weights[cluster_id] = None
 
             
         elif aggregation_method == 'weighted':
             # Weighted aggregation
-            # 1. UMI weight
-            cell_umi = cluster_full_data.sum(axis=1)
+            # 1. UMI weight (如果没有全基因数据，使用marker基因数据)
+            umi_data = cluster_full_data if cluster_full_data is not None else cluster_data
+            cell_umi = umi_data.sum(axis=1)
             w_umi = np.log1p(cell_umi) / np.mean(np.log1p(cell_umi))
             w_umi = np.clip(w_umi, 0.1, 10.0)
             
@@ -313,7 +314,7 @@ def compute_cluster_centers_and_expressions(
             # 5. Compute weighted aggregates
             cluster_center = np.sum(cluster_embeddings * w_combined[:, np.newaxis], axis=0)
             cluster_expression = np.sum(cluster_data * w_combined[:, np.newaxis], axis=0)
-            cluster_expr_full = np.sum(cluster_full_data * w_combined[:, np.newaxis], axis=0)
+            cluster_expr_full = np.sum(cluster_full_data * w_combined[:, np.newaxis], axis=0) if cluster_full_data is not None else None
             
         else:
             raise ValueError(f"Unknown aggregation method: {aggregation_method}. "
@@ -322,7 +323,8 @@ def compute_cluster_centers_and_expressions(
         # Save results
         cluster_prototypes[cluster_id] = cluster_center
         cluster_expressions[cluster_id] = cluster_expression
-        cluster_expressions_full_count[cluster_id] = cluster_expr_full
+        if cluster_expr_full is not None:
+            cluster_expressions_full_count[cluster_id] = cluster_expr_full
  
     return cluster_prototypes, cluster_expressions, cluster_expressions_full_count, cluster_cell_weights
 

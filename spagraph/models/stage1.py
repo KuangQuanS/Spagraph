@@ -180,14 +180,14 @@ class coEncoder:
         # ✅ First filter to match sc_clusters.index (some cells may be filtered during clustering)
         sc_adata_count = sc_adata[sc_clusters.index].copy()
         
-        # ✅ Preserve raw counts AFTER filtering (must match sc_clusters.index length)
-        sc_raw_all = sc_adata_count.X.toarray() if hasattr(sc_adata_count.X, 'toarray') else sc_adata_count.X
+        # ✅ 提取所有基因的原始count（用于后续scaling和重建表达）
+        sc_all_genes_raw = sc_adata_count.X.toarray() if hasattr(sc_adata_count.X, 'toarray') else sc_adata_count.X
 
         # Normalize and log1p transform for VAE training
         sc.pp.normalize_total(sc_adata_count, target_sum=1e4)
         sc.pp.log1p(sc_adata_count)
   
-        # Extract full gene expression (log1p norm) for training features
+        # Extract full gene expression (log1p norm) for training features (not used anymore)
         sc_X_full_count = sc_adata_count.X.toarray() if hasattr(sc_adata_count.X, 'toarray') else sc_adata_count.X
         sc_all_genes = list(sc_adata_count.var.index)
         
@@ -277,7 +277,8 @@ class coEncoder:
         ])
         
         # ✅ Keep ALL SC data (train + test) for cluster embedding computation
-        sc_X_full_all_count = sc_raw_all  # All cells (raw counts, no norm/log)
+        # 注意：保存所有基因的原始count（用于后续scaling和重建表达）
+        # sc_all_genes_raw: [n_cells, n_all_genes] 所有基因的原始count
         sc_all_indices = np.arange(len(sc_X_final))  # All indices
         sc_all_labels = sc_y  # All labels
         
@@ -292,7 +293,7 @@ class coEncoder:
                 for gene in self.genes:
                     f.write(f"{gene}\n")
 
-        return train_X, test_X, train_modality, test_modality, y_train, y_test, sc_X_final, sc_X_full_all_count, sc_all_labels
+        return train_X, test_X, train_modality, test_modality, y_train, y_test, sc_X_final, sc_all_genes_raw, sc_all_labels
     
     def build_vae(self, input_dim: int, hidden_dims=[512, 256], latent_dim=128, dropout=0.2, loss_type='mse', use_dual_decoder=False):
         """Build VAE model
@@ -464,7 +465,7 @@ class coEncoder:
         sc_adata, st_adata = self.load_data()
         
         # 2. Prepare data based on marker genes (with test split for early stopping)
-        train_X, test_X, train_modality, test_modality, y_train, y_test, sc_X_final, sc_X_full_all_count, sc_all_labels = self.prepare_marker_gene_data(
+        train_X, test_X, train_modality, test_modality, y_train, y_test, sc_X_final, sc_all_genes_raw, sc_all_labels = self.prepare_marker_gene_data(
             sc_adata, st_adata, top_n_per_type=top_n_per_type, resolution=resolution, 
             precomputed_marker_file=precomputed_marker_file, marker_selection_method=marker_selection_method
         )
@@ -509,8 +510,8 @@ class coEncoder:
         self.train_modality = train_modality  
         self.y_train = y_train
         # ✅ Save ALL SC data (train + test) for cluster embedding computation
-        self.sc_X_final = sc_X_final  # ALL SC marker gene data
-        self.sc_X_full_all_count = sc_X_full_all_count  # ALL SC full gene data (count)
+        self.sc_X_final = sc_X_final  # ALL SC marker gene data (log1p normalized)
+        self.sc_all_genes_raw = sc_all_genes_raw  # ALL SC 所有基因 raw counts [n_cells, n_all_genes]
         self.sc_all_labels = sc_all_labels  # ALL SC cluster labels
         
         # ✅ Use trained VAE to compute embeddings for ALL SC cells
@@ -531,12 +532,13 @@ class coEncoder:
             embeddings = np.vstack(all_embeddings)
         
         # ✅ Compute cluster centers and expressions using ALL SC data
+        # 注意：静态模式仍需要cluster聚合表达，所以这里传递全基因原始count
         cluster_prototypes, cluster_expressions, cluster_expressions_full_count, cluster_cell_weights = \
             compute_cluster_centers_and_expressions(
                 embeddings=embeddings,
-                sc_train_data=sc_X_final,  # Use ALL marker gene data
+                sc_train_data=sc_X_final,  # Use ALL marker gene data (log1p)
                 sc_train_labels=sc_all_labels,  # Use ALL labels
-                sc_X_full_train_count=sc_X_full_all_count,  # Use ALL full gene data
+                sc_X_full_train_count=sc_all_genes_raw,  # 传递所有基因原始count（用于静态模式的cluster聚合）
                 aggregation_method=aggregation_method
             )
         
@@ -546,6 +548,12 @@ class coEncoder:
         self.cluster_expressions_full = cluster_expressions_full_count
         self.cluster_expressions_full_count = cluster_expressions_full_count
         self.cluster_cell_weights = cluster_cell_weights
+        
+        # ✅ 5.5. 保存SC的embeddings和原始表达（供动态cluster使用）
+        # 这些数据会传递给Stage2，用于预计算k-nearest cells或在训练中使用
+        self.sc_cell_embeddings = embeddings  # [n_sc_cells, latent_dim]
+        self.sc_cell_expressions_raw = sc_all_genes_raw  # [n_sc_cells, n_all_genes] 所有基因原始count
+        self.sc_cell_labels = sc_all_labels  # [n_sc_cells] cluster labels
         
         # 6. Extract celltype-cluster mapping (if celltype available in sc_adata)
         cluster_to_celltype = {}
@@ -630,6 +638,10 @@ class coEncoder:
             'celltype_expressions': expressions_array,
             'celltype_expressions_full': expressions_full_list,
             'hvg_genes_union': getattr(self, 'hvg_genes_union', None),
+            # ===== 动态cluster所需数据 =====
+            'sc_cell_embeddings': self.sc_cell_embeddings,  # [n_sc_cells, latent_dim]
+            'sc_cell_expressions_raw': self.sc_cell_expressions_raw,  # [n_sc_cells, n_all_genes] 所有基因原始count
+            'sc_cell_labels': self.sc_cell_labels,  # [n_sc_cells] cluster labels
         }
 
 def main():

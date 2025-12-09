@@ -410,9 +410,16 @@ def compute_mmd(x, y, kernel='rbf', gamma=None):
 # ================================
 
 class HeterogeneousGATDeconvolution(nn.Module):
-    """异构图注意力网络解卷积模型"""
+    """异构图注意力网络解卷积模型
+    
+    支持两种cluster表示模式：
+    1. 静态模式（默认）: 使用cluster平均表达
+    2. 动态模式: 每个spot使用该spot最近的k个细胞的加权表达
+    """
     def __init__(self, embedding_dim=128,n_cell_types=9,gat_hidden_dim=64,gat_layers=3,gat_heads=4,
-                 dropout=0.1,k_spatial=6,k_celltype=10, celltype_prototypes=None):
+                 dropout=0.1,k_spatial=6,k_celltype=10, celltype_prototypes=None,
+                 use_dynamic_cluster_repr=False, k_cells_per_cluster=10, use_learnable_weights=True,
+                 sc_cell_embeddings=None, sc_cell_expressions=None, sc_cell_labels=None):
         super().__init__()
         
         self.embedding_dim = embedding_dim
@@ -422,6 +429,34 @@ class HeterogeneousGATDeconvolution(nn.Module):
         self.gat_heads = gat_heads
         self.k_spatial = k_spatial
         self.k_celltype = k_celltype  # 每个spot连接最近的k个celltype
+        
+        # 动态cluster表示参数
+        self.use_dynamic_cluster_repr = use_dynamic_cluster_repr
+        self.k_cells_per_cluster = k_cells_per_cluster
+        self.use_learnable_weights = use_learnable_weights
+        
+        # 如果启用动态模式，只保存单细胞表达（原始count）
+        # k-nearest cells索引应该在第一阶段预计算好
+        if use_dynamic_cluster_repr:
+            if sc_cell_expressions is None:
+                raise ValueError(
+                    "Dynamic cluster representation requires sc_cell_expressions (raw counts).\n"
+                    "k-nearest cell indices should be pre-computed in stage1."
+                )
+            self.register_buffer('sc_cell_expressions', torch.FloatTensor(sc_cell_expressions))
+            
+            # MLP用于学习cell权重（仅在use_learnable_weights=True时需要）
+            # 输入 [spot_embedding || cell_embedding] -> 输出权重分数
+            if use_learnable_weights:
+                mlp_input_dim = embedding_dim * 2
+                self.cell_weight_mlp = nn.Sequential(
+                    nn.Linear(mlp_input_dim, gat_hidden_dim),
+                    nn.ReLU(),
+                    nn.Dropout(dropout),
+                    nn.Linear(gat_hidden_dim, 1)
+                )
+            else:
+                self.cell_weight_mlp = None  # 使用均匀权重，不需要MLP
         
         # 1. 节点特征投影层
         # Spot节点：从VAE embedding到GAT输入
@@ -659,6 +694,12 @@ class HeterogeneousGATDeconvolution(nn.Module):
         # Handle any NaN from all -inf rows (shouldn't happen with k_celltype)
         deconv_weights = torch.nan_to_num(deconv_weights, 0.0)
         
+        # ========== 动态Cluster表示（可选） ==========
+        # k-nearest cell indices已在第一阶段预计算，这里不再计算
+        # 直接返回None，实际的动态权重计算在Loss中完成
+        dynamic_cluster_weights = None
+        dynamic_cluster_indices = None
+        
         return {
             'spot_features': spot_features,
             'celltype_features': celltype_features,
@@ -667,8 +708,96 @@ class HeterogeneousGATDeconvolution(nn.Module):
             'deconv_weights': deconv_weights,        # Normalized weights (sparse)
             'sparse_mask': sparse_mask,              # For debugging
             'edge_index': edge_index,
-            'edge_attr': edge_attr
+            'edge_attr': edge_attr,
+            'dynamic_cluster_weights': dynamic_cluster_weights,  # [n_spots, n_cell_types, k] or None
+            'dynamic_cluster_indices': dynamic_cluster_indices   # [n_spots, n_cell_types, k] or None
         }
+    
+    def compute_cell_weights_from_knn(self, 
+                                     spot_embeddings: torch.Tensor,
+                                     knn_cell_indices: torch.Tensor,
+                                     sc_cell_embeddings: torch.Tensor) -> torch.Tensor:
+        """根据预计算的k-nearest cells索引，计算cell权重（向量化优化版本）
+        
+        两种模式：
+        1. 可学习模式（use_learnable_weights=True）：用MLP计算context-dependent权重
+        2. 均匀平均模式（use_learnable_weights=False）：每个cell权重=1/k（简单平均）
+        
+        关键逻辑：
+        1. 使用第一阶段预计算好的k-nearest cell索引
+        2. 获取这些细胞的embeddings（仅MLP模式需要）
+        3. 用MLP计算权重 或 直接返回均匀权重
+        4. Softmax归一化，确保每个cluster的k个cell权重和为1（百分比）
+        
+        优化：一次性gather所有cell embeddings，batch计算MLP
+        
+        Args:
+            spot_embeddings: [batch_size, embedding_dim] 当前batch的spot embeddings
+            knn_cell_indices: [batch_size, n_cell_types, k] 预计算的k-nearest cell索引
+            sc_cell_embeddings: [n_cells, embedding_dim] 所有单细胞的embeddings
+        
+        Returns:
+            cell_weights: [batch_size, n_cell_types, k] 归一化的cell权重（百分比矩阵）
+        
+        Note:
+            - knn_cell_indices中-1表示padding（cluster细胞数<k），对应权重会被置0
+            - 每个cluster的k个权重softmax归一化，和为1
+        """
+        batch_size, n_cell_types, k = knn_cell_indices.shape
+        embedding_dim = spot_embeddings.shape[1]
+        device = spot_embeddings.device
+        
+        # ✅ 向量化优化：创建mask并处理padding
+        valid_mask = (knn_cell_indices >= 0)  # [batch_size, n_cell_types, k]
+        
+        # ✅ 均匀权重模式：直接返回1/k（跳过MLP）
+        if not self.use_learnable_weights:
+            # 计算每个cluster的有效cell数量
+            num_valid_cells = valid_mask.sum(dim=-1, keepdim=True).float()  # [batch_size, n_cell_types, 1]
+            num_valid_cells = torch.clamp(num_valid_cells, min=1.0)  # 避免除零
+            
+            # 均匀权重：有效cell权重=1/num_valid，padding cell权重=0
+            uniform_weights = valid_mask.float() / num_valid_cells  # [batch_size, n_cell_types, k]
+            return uniform_weights
+        
+        # ✅ MLP可学习权重模式
+        safe_indices = torch.clamp(knn_cell_indices, min=0)  # 将-1替换为0（后面mask会屏蔽）
+        
+        # ✅ 一次性gather所有cell embeddings
+        # safe_indices: [batch_size, n_cell_types, k]
+        # sc_cell_embeddings: [n_cells, embedding_dim]
+        # → cell_embeds: [batch_size, n_cell_types, k, embedding_dim]
+        cell_embeds = sc_cell_embeddings[safe_indices]  # Broadcasting gather
+        
+        # ✅ Broadcast spot embeddings
+        # spot_embeddings: [batch_size, embedding_dim]
+        # → [batch_size, 1, 1, embedding_dim] → [batch_size, n_cell_types, k, embedding_dim]
+        spot_embeds_expanded = spot_embeddings.unsqueeze(1).unsqueeze(2).expand(
+            batch_size, n_cell_types, k, embedding_dim
+        )
+        
+        # ✅ 拼接: [batch_size, n_cell_types, k, 2*embedding_dim]
+        combined = torch.cat([spot_embeds_expanded, cell_embeds], dim=-1)
+        
+        # ✅ Batch MLP计算（一次处理所有）
+        # Reshape to [batch_size*n_cell_types*k, 2*embedding_dim]
+        combined_flat = combined.reshape(-1, 2 * embedding_dim)
+        weight_scores_flat = self.cell_weight_mlp(combined_flat).squeeze(-1)  # [batch_size*n_cell_types*k]
+        
+        # Reshape back: [batch_size, n_cell_types, k]
+        weight_scores = weight_scores_flat.reshape(batch_size, n_cell_types, k)
+        
+        # ✅ Masked softmax：对每个cluster的k个cell归一化
+        # 将padding位置设为-inf，softmax后变为0
+        weight_scores = weight_scores.masked_fill(~valid_mask, float('-inf'))
+        
+        # Softmax沿k维度归一化：[batch_size, n_cell_types, k]
+        cell_weights = F.softmax(weight_scores, dim=-1)  # 每个cluster的k个权重和为1
+        
+        # 将-inf softmax后的nan替换为0（全padding的cluster）
+        cell_weights = torch.nan_to_num(cell_weights, nan=0.0)
+        
+        return cell_weights
 
 
 # ================================
@@ -706,11 +835,11 @@ class SpatialDeconvolutionLoss(nn.Module):
         self.lambda_reg = lambda_reg              # 权重正则化权重
         self.lambda_sparse = lambda_sparse        # 稀疏性正则化权重
         self.lambda_proportion = lambda_proportion  # 细胞类型比例一致性权重
-        self.scale_basis = scale_basis            # 用于缩放的基因集合: marker / hvg / all / none
+        self.scale_basis = scale_basis            # 用于缩放的基因集合: marker / hvg / all / none / fixed_10
         
-        # 当 scale_basis='none' 时允许为 None（不进行缩放）
-        if spot_total_counts is None and scale_basis != 'none':
-            raise ValueError("spot_total_counts is required for reconstruction when scale_basis != 'none'!")
+        # 当 scale_basis='none' 或 'fixed_10' 时允许为 None（不需要spot_total_counts）
+        if spot_total_counts is None and scale_basis not in ['none', 'fixed_10']:
+            raise ValueError("spot_total_counts is required for reconstruction when scale_basis not in ['none', 'fixed_10']!")
         if spot_total_counts is not None:
             self.register_buffer('spot_total_counts', torch.FloatTensor(spot_total_counts))
         else:
@@ -738,6 +867,66 @@ class SpatialDeconvolutionLoss(nn.Module):
                                torch.FloatTensor(sc_celltype_proportions))
         else:
             self.sc_celltype_proportions = None
+    
+    def compute_dynamic_mixed_expression(self, 
+                                        attention_weights: torch.Tensor,
+                                        dynamic_cluster_weights: torch.Tensor,
+                                        dynamic_cluster_indices: torch.Tensor,
+                                        sc_cell_expressions: torch.Tensor) -> torch.Tensor:
+        """使用动态cluster权重计算混合表达（向量化优化版本）
+        
+        关键逻辑：
+        1. 每个cluster的表达 = Σ(cell百分比 × cell原始count表达) 
+           - cell百分比来自 dynamic_cluster_weights（已归一化为1）
+           - cell表达是原始count（raw counts，不做normalize/log1p）
+        2. Spot表达 = Σ(spot对cluster权重 × cluster动态表达)
+        
+        优化：使用gather和batch矩阵乘法，避免双重循环
+        
+        Args:
+            attention_weights: [n_spots, n_cell_types] spot对cluster的权重
+            dynamic_cluster_weights: [n_spots, n_cell_types, k] 每个cluster的k个cell百分比（和为1）
+            dynamic_cluster_indices: [n_spots, n_cell_types, k] 每个cluster的k个cell全局索引
+            sc_cell_expressions: [n_cells, n_all_genes] 单细胞所有基因原始count
+        
+        Returns:
+            mixed_expr_full: [n_spots, n_all_genes] 混合表达（原始count scale）
+        """
+        n_spots, n_cell_types, k = dynamic_cluster_weights.shape
+        n_genes = sc_cell_expressions.shape[1]
+        device = attention_weights.device
+        
+        # ✅ 内存优化：逐cluster处理，避免一次性分配巨大tensor
+        # 原来：[n_spots, n_cell_types, k, n_genes] 太大！
+        # 现在：逐个cluster处理，内存占用 = [n_spots, k, n_genes]
+        
+        cluster_dynamic_expr = torch.zeros(n_spots, n_cell_types, n_genes, device=device)
+        
+        for cluster_id in range(n_cell_types):
+            # 当前cluster的索引和权重
+            cluster_indices = dynamic_cluster_indices[:, cluster_id, :]  # [n_spots, k]
+            cluster_weights = dynamic_cluster_weights[:, cluster_id, :]  # [n_spots, k]
+            
+            # 处理padding：将-1替换为0
+            safe_indices = torch.clamp(cluster_indices, min=0).long()  # [n_spots, k]
+            
+            # Gather该cluster的cell表达: [n_spots, k, n_genes]
+            cell_expr = sc_cell_expressions[safe_indices.reshape(-1)].reshape(n_spots, k, n_genes)
+            
+            # 计算加权和: [n_spots, k] × [n_spots, k, n_genes] → [n_spots, n_genes]
+            cluster_dynamic_expr[:, cluster_id, :] = torch.einsum('sk,skg->sg', 
+                                                                   cluster_weights, 
+                                                                   cell_expr)
+        
+        # ✅ 最终混合：用attention_weights加权
+        # attention_weights: [n_spots, n_cell_types]
+        # cluster_dynamic_expr: [n_spots, n_cell_types, n_genes]
+        # → mixed_expr_full: [n_spots, n_genes]
+        mixed_expr_full = torch.einsum('sc,scg->sg', 
+                                       attention_weights, 
+                                       cluster_dynamic_expr)
+        
+        return mixed_expr_full
         
     def forward(self, 
                attention_weights: torch.Tensor,
@@ -746,36 +935,78 @@ class SpatialDeconvolutionLoss(nn.Module):
                spot_embedding: torch.Tensor = None,
                celltype_embedding: torch.Tensor = None,
                edge_index: torch.Tensor = None,
-               batch_spot_total_counts: torch.Tensor = None) -> Dict[str, torch.Tensor]:
+               batch_spot_total_counts: torch.Tensor = None,
+               knn_cell_indices: torch.Tensor = None,
+               sc_cell_embeddings: torch.Tensor = None,
+               sc_cell_expressions: torch.Tensor = None,
+               gat_model: nn.Module = None) -> Dict[str, torch.Tensor]:
         """
         计算总损失
         
         Args:
-            attention_weights: 注意力权重 [n_spots, n_cell_types]（已softmax）
+            attention_weights: 注意力权重 [batch_size, n_cell_types]（已softmax）
             celltype_expression: 细胞类型表达 [n_cell_types, n_marker_genes] (未使用，已废弃)
-            true_spot_expression: 真实spot表达 [n_spots, n_marker_genes] (marker genes only)
-            spot_embedding: spot embedding [n_spots, embedding_dim]（可选）
+            true_spot_expression: 真实spot表达 [batch_size, n_marker_genes] (marker genes only)
+            spot_embedding: spot embedding [batch_size, embedding_dim]（可选）
             celltype_embedding: 细胞类型embedding [n_cell_types, embedding_dim]（可选）
             edge_index: 图的边索引 [2, num_edges]（可选，用于计算空间异质性）
             batch_spot_total_counts: 当前batch的spot总counts [batch_size]（优先使用）
             
+            # 动态cluster模式参数（第一阶段预计算）
+            knn_cell_indices: [batch_size, n_cell_types, k] 预计算的k-nearest cell索引（可选）
+            sc_cell_embeddings: [n_cells, embedding_dim] 单细胞embeddings（动态模式需要，用于MLP）
+            sc_cell_expressions: [n_cells, n_all_genes] 单细胞所有基因原始count（后续按基因名截取）
+            gat_model: GAT模型实例（动态模式需要，用于调用cell_weight_mlp）
+            
         Returns:
             损失字典
         """
-        n_spots = attention_weights.shape[0]
+        batch_size = attention_weights.shape[0]
 
-        mixed_expr_full = torch.matmul(
-            attention_weights,               # [n_spots, n_cell_types]
-            self.celltype_expressions_full   # [n_cell_types, n_all_genes]
-        )  # [n_spots, n_all_genes]
+        # ========== 计算混合表达（支持静态和动态模式） ==========
+        if knn_cell_indices is not None:
+            # ✅ 动态模式：使用预计算的k-nearest cells + MLP学习权重
+            if sc_cell_embeddings is None or sc_cell_expressions is None or gat_model is None:
+                raise ValueError(
+                    "Dynamic cluster mode requires: knn_cell_indices, sc_cell_embeddings, "
+                    "sc_cell_expressions, and gat_model"
+                )
+            
+            # 1) 用MLP计算cell权重（归一化为百分比）
+            # gat_model.compute_cell_weights_from_knn() 会调用 cell_weight_mlp
+            dynamic_cluster_weights = gat_model.compute_cell_weights_from_knn(
+                spot_embeddings=spot_embedding,
+                knn_cell_indices=knn_cell_indices,
+                sc_cell_embeddings=sc_cell_embeddings
+            )  # [batch_size, n_cell_types, k]
+            
+            # 2) 用动态权重计算混合表达
+            # sc_cell_expressions 必须是原始count（raw counts，不做normalize/log1p）
+            mixed_expr_full = self.compute_dynamic_mixed_expression(
+                attention_weights=attention_weights,
+                dynamic_cluster_weights=dynamic_cluster_weights, 
+                dynamic_cluster_indices=knn_cell_indices,
+                sc_cell_expressions=sc_cell_expressions
+            )
+        else:
+            # ✅ 静态模式：使用cluster平均表达
+            # celltype_expressions_full 也应该是原始count（raw counts）
+            mixed_expr_full = torch.matmul(
+                attention_weights,               # [batch_size, n_cell_types]
+                self.celltype_expressions_full   # [n_cell_types, n_all_genes] raw counts
+            )  # [batch_size, n_all_genes]
 
         # 3) 根据 scale_basis 决定是否缩放
         if self.scale_basis == "none":
             # 不使用缩放，直接使用混合表达
             reconstructed_spot_full = mixed_expr_full
+        elif self.scale_basis == "fixed_10":
+            # 固定缩放因子10：比例×10 = 细胞数量
+            # 例如：cluster1占比0.3 → 0.3×10=3个细胞
+            reconstructed_spot_full = mixed_expr_full * 10.0
         else:
             # 使用 spot_total_counts 进行缩放
-            batch_spot_total_counts = self.spot_total_counts[:n_spots]
+            batch_spot_total_counts = self.spot_total_counts[:batch_size]
             spot_counts = batch_spot_total_counts.unsqueeze(-1)  # [batch_size, 1]
 
             if self.scale_basis == "all":
@@ -789,10 +1020,10 @@ class SpatialDeconvolutionLoss(nn.Module):
                 mixed_basis_totals = mixed_expr_full[:, self.marker_gene_indices].sum(dim=1, keepdim=True)
 
             scale = spot_counts / (mixed_basis_totals + 1e-8)
-            reconstructed_spot_full = mixed_expr_full * scale  # [n_spots, n_all_genes]
+            reconstructed_spot_full = mixed_expr_full * scale  # [batch_size, n_all_genes]
         
         # 提取 marker 基因: 只在 marker 基因上计算 loss
-        reconstructed_spot_marker = reconstructed_spot_full[:, self.marker_gene_indices]  # [n_spots, n_marker_genes]
+        reconstructed_spot_marker = reconstructed_spot_full[:, self.marker_gene_indices]  # [batch_size, n_marker_genes]
         
         # ============ 1. Pearson Correlation Loss ============
         # 计算Pearson相关系数(基于基因表达的相关性)
@@ -826,7 +1057,7 @@ class SpatialDeconvolutionLoss(nn.Module):
         # ============ 4. Weight Regularization Loss ============
         # 确保权重和为1(softmax已保证,但作为额外约束)
         weight_sum_loss = F.mse_loss(attention_weights.sum(dim=1), 
-                                     torch.ones(n_spots, device=attention_weights.device))
+                                     torch.ones(batch_size, device=attention_weights.device))
         
         # ============ 5. Sparsity Regularization Loss ============
         # 鼓励稀疏的注意力分布（每个spot只使用少数细胞类型）

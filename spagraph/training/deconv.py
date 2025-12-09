@@ -62,6 +62,12 @@ class Stage1Artifacts:
     # ST 数据相关（在 run_deconv 中计算并保存，用于重建基因表达时缩放）
     spot_total_counts: Optional[Any] = None  # [n_spots] array
     
+    # ===== 动态cluster所需数据（可选）=====
+    sc_cell_embeddings: Optional[Any] = None  # [n_sc_cells, latent_dim] SC细胞的VAE embeddings
+    sc_cell_expressions_raw: Optional[Any] = None  # [n_sc_cells, n_all_genes] SC细胞所有基因原始count（后续按barcode和基因名截取）
+    sc_cell_labels: Optional[Any] = None  # [n_sc_cells] SC细胞的cluster标签
+    knn_cell_indices: Optional[Any] = None  # [n_spots, n_clusters, k] 预计算的k-nearest cell索引
+    
     # 元信息
     n_clusters: Optional[int] = None
     n_genes: Optional[int] = None
@@ -99,7 +105,11 @@ class Stage1Artifacts:
             celltype_prototypes=results.get('celltype_prototypes'),
             celltype_expressions=results.get('celltype_expressions'),
             celltype_expressions_full=results.get('celltype_expressions_full'),
-            hvg_genes_union=results.get('hvg_genes_union')
+            hvg_genes_union=results.get('hvg_genes_union'),
+            # 动态cluster数据
+            sc_cell_embeddings=results.get('sc_cell_embeddings'),
+            sc_cell_expressions_raw=results.get('sc_cell_expressions_raw'),
+            sc_cell_labels=results.get('sc_cell_labels')
         )
 
 
@@ -132,6 +142,11 @@ def run_deconv(
     lambda_proportion: float = 0.1,
     # Output options
     save_reconstructed_genes: bool = False,  # 是否保存重构的全基因表达
+    # Dynamic cluster representation (optional)
+    use_dynamic_cluster_repr: bool = False,  # 启用动态cluster表示（用k个最近细胞代替cluster平均）
+    k_cells_per_cluster: int = 10,  # 每个cluster使用多少个最近细胞
+    precompute_knn: bool = True,  # 是否在训练前预计算k-nearest cells（推荐True）
+    use_learnable_weights: bool = True,  # 是否用MLP学习cell权重（False则用均匀平均）
     # Other
     weight_threshold: float = 0.001,
     scale_basis: str = 'all',
@@ -178,7 +193,12 @@ def run_deconv(
         
         # 其他
         weight_threshold: 权重稀疏化阈值
-        scale_basis: 缩放基准 ('all', 'marker', 'hvg', 'none')
+        scale_basis: 缩放基准 ('all', 'marker', 'hvg', 'none', 'fixed_10')
+                    - 'all': 使用全部基因总量缩放
+                    - 'marker': 使用marker基因总量缩放
+                    - 'hvg': 使用HVG交集总量缩放
+                    - 'none': 不缩放
+                    - 'fixed_10': 固定缩放因子10（比例×10 = 每个spot的细胞数）
         device: 计算设备
         seed: 随机种子
     
@@ -202,7 +222,7 @@ def run_deconv(
     
     # 🔍 自动网格搜索 k_celltype（默认启用）
     if k_celltype_range == "auto":
-        k_celltype_range = [15, 20, 25, 30, 35]
+        k_celltype_range = [20]
     
     # 网格搜索启用条件：列表且长度 > 1
     if k_celltype_range is not None and len(k_celltype_range) > 1:
@@ -230,6 +250,11 @@ def run_deconv(
             lambda_sparse=lambda_sparse,
             lambda_proportion=lambda_proportion,
             save_reconstructed_genes=save_reconstructed_genes,
+            # 动态cluster参数（重要！）
+            use_dynamic_cluster_repr=use_dynamic_cluster_repr,
+            k_cells_per_cluster=k_cells_per_cluster,
+            precompute_knn=precompute_knn,
+            use_learnable_weights=use_learnable_weights,
             weight_threshold=weight_threshold,
             scale_basis=scale_basis,
             device=device,
@@ -291,18 +316,6 @@ def run_deconv(
     n_clusters = trainer.celltype_prototypes.shape[0]
     n_genes = len(trainer.marker_genes)
     
-    # # 自动调整 k_celltype：根据聚类数自适应调整邻居数
-    # if n_clusters < 30 and k_celltype == 20:  # 聚类数少，减少邻居数
-    #     adjusted_k = 15
-    #     print(f"⚠️  {n_clusters} clusters detected (< 40), auto-adjusting k_celltype: {k_celltype} → {adjusted_k}")
-    #     trainer.k_celltype = adjusted_k
-    # elif n_clusters > 53 and k_celltype == 20:  # 聚类数多，增加邻居数
-    #     adjusted_k = 30
-    #     print(f"⚠️  {n_clusters} clusters detected (> 60), auto-adjusting k_celltype: {k_celltype} → {adjusted_k}")
-    #     trainer.k_celltype = adjusted_k
-    # else:
-    #     trainer.k_celltype = k_celltype
-
     trainer.k_celltype = k_celltype
 
     if not _silent_header:  # 网格搜索时不重复打印
@@ -337,6 +350,9 @@ def run_deconv(
     # 计算 spot counts
     if scale_basis == 'none':
         spot_total_counts = None
+    elif scale_basis == 'fixed_10':
+        # 固定缩放因子10：比例×10 = 细胞数量
+        spot_total_counts = np.full(st_X_raw.shape[0], 10.0)
     elif scale_basis == 'all':
         spot_total_counts = np.asarray(st_raw_all.sum(axis=1)).ravel()
     elif scale_basis == 'hvg' and trainer.hvg_genes_union:
@@ -353,6 +369,46 @@ def run_deconv(
     # 保存 spot_total_counts 到 vae 对象，便于后续使用（如重建基因表达）
     vae.spot_total_counts = spot_total_counts
     
+    # ===== 动态cluster表示：预计算k-nearest cells =====
+    knn_cell_indices = None
+    if use_dynamic_cluster_repr:
+        if vae.sc_cell_embeddings is None or vae.sc_cell_expressions_raw is None or vae.sc_cell_labels is None:
+            raise ValueError(
+                "Dynamic cluster representation requires sc_cell_embeddings, sc_cell_expressions_raw, "
+                "and sc_cell_labels from stage1. Please ensure stage1 was run with recent version."
+            )
+        
+        if precompute_knn:
+            if not _silent_header:
+                print(f"\n预计算k-nearest cells (k={k_cells_per_cluster})...")
+            
+            # 导入预计算工具
+            from ..utils.knn_utils import precompute_knn_cells_torch
+            import torch
+            
+            # 计算ST embeddings（用于找最近细胞）
+            st_data_tensor = torch.FloatTensor(st_X_embed).to(trainer.device)
+            with torch.no_grad():
+                st_embeddings_mu, _ = trainer.vae_encoder(st_data_tensor)
+                st_embeddings = st_embeddings_mu.cpu()  # [n_spots, latent_dim]
+            
+            # 预计算k-nearest cells
+            sc_embeddings_torch = torch.FloatTensor(vae.sc_cell_embeddings).to(trainer.device)
+            sc_labels_torch = torch.LongTensor(vae.sc_cell_labels).to(trainer.device)
+            
+            knn_cell_indices = precompute_knn_cells_torch(
+                spot_embeddings=st_embeddings,
+                sc_cell_embeddings=sc_embeddings_torch,
+                sc_cell_labels=sc_labels_torch,
+                k_cells_per_cluster=k_cells_per_cluster
+            )  # [n_spots, n_clusters, k]
+            
+            # 保存到vae对象
+            vae.knn_cell_indices = knn_cell_indices.cpu().numpy()
+            
+            if not _silent_header:
+                print(f"✓ 预计算完成: {knn_cell_indices.shape}")
+    
     # 构建 GAT 模型
     trainer.build_gat_model(
         n_cell_types=n_clusters,
@@ -368,7 +424,12 @@ def run_deconv(
         loss_lambda_reg=lambda_reg,
         loss_lambda_sparse=lambda_sparse,
         loss_lambda_proportion=lambda_proportion,
-        spot_total_counts=spot_total_counts
+        spot_total_counts=spot_total_counts,
+        # 动态cluster参数
+        use_dynamic_cluster_repr=use_dynamic_cluster_repr,
+        k_cells_per_cluster=k_cells_per_cluster,
+        use_learnable_weights=use_learnable_weights,
+        sc_cell_expressions=vae.sc_cell_expressions_raw if use_dynamic_cluster_repr else None
     )
     
     # 训练
@@ -381,7 +442,10 @@ def run_deconv(
         n_epochs=n_epochs,
         lr=lr,
         batch_size=batch_size,
-        print_every=print_every
+        print_every=print_every,
+        # 动态cluster参数
+        knn_cell_indices=vae.knn_cell_indices if use_dynamic_cluster_repr and precompute_knn else None,
+        sc_cell_embeddings=vae.sc_cell_embeddings if use_dynamic_cluster_repr else None
     )
     
     # 保存超参数到 txt 文件（合并 Stage 1 配置，如果存在）
@@ -515,9 +579,9 @@ def run_deconv_auto_k(
         print(f"  Trial {i}/{len(k_celltype_range)} (k={k})...", end=" ", flush=True)
         
         # 运行 deconv（纯内存模式，不保存文件，不打印训练过程）
-        # 从 kwargs 中移除可能冲突的参数
+        # 从 kwargs 中提取 print_every，避免重复传递
         deconv_kwargs = kwargs.copy()
-        deconv_kwargs.pop('print_every', None)  # 移除 print_every 避免冲突
+        print_every_val = deconv_kwargs.pop('print_every', 9999)
         
         result = run_deconv(
             vae=vae,
@@ -525,7 +589,7 @@ def run_deconv_auto_k(
             output_dir=None,  # 不保存文件，纯内存
             k_celltype=k,
             k_celltype_range=[],  # 禁用递归网格搜索（空列表表示禁用）
-            print_every=9999,  # 不打印训练过程
+            print_every=print_every_val,  # 使用超参数的值，默认不打印
             _silent_header=True,  # 不打印配置头部
             **deconv_kwargs
         )
@@ -596,7 +660,12 @@ def run_deconv_auto_k(
             
             # 缩放到原始 counts（如果有 scale_basis）
             scale_basis = kwargs.get('scale_basis', 'all')
-            if scale_basis != 'none' and vae.spot_total_counts is not None:
+            if scale_basis == 'none':
+                reconstructed_full_expr = mixed_expr_full
+            elif scale_basis == 'fixed_10':
+                # 固定缩放因子10：比例×10 = 细胞数量
+                reconstructed_full_expr = mixed_expr_full * 10.0
+            elif vae.spot_total_counts is not None:
                 spot_counts = vae.spot_total_counts[:len(deconv_weights)]
                 
                 if scale_basis == 'all':

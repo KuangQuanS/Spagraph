@@ -284,7 +284,7 @@ class GATDeconvolution:
                        loss_lambda_reg=0.5, loss_lambda_sparse=0.01,
                        loss_lambda_proportion=1.0, spot_total_counts=None,
                        use_dynamic_cluster_repr=False, k_cells_per_cluster=10, 
-                       use_learnable_weights=True, sc_cell_expressions=None):
+                       sc_cell_expressions=None):
         """Build GAT deconvolution model
         
         Args:
@@ -292,8 +292,7 @@ class GATDeconvolution:
                               Used for scaling: reconstructed = s_i × Σ(w_ic × R_c)
             use_dynamic_cluster_repr: 是否启用动态cluster表示
             k_cells_per_cluster: 每个cluster使用多少个最近细胞
-            use_learnable_weights: 是否使用MLP学习cell权重（False则用均匀平均）
-            sc_cell_expressions: [n_cells, n_marker_genes] 单细胞marker基因原始count（动态模式需要）
+            sc_cell_expressions: [n_cells, n_all_genes] 单细胞全基因原始count（动态模式需要）
         """
         # Get embedding dimension from VAE encoder
         embedding_dim = self.latent_dim
@@ -314,8 +313,7 @@ class GATDeconvolution:
             # 动态cluster参数
             use_dynamic_cluster_repr=use_dynamic_cluster_repr,
             k_cells_per_cluster=k_cells_per_cluster,
-            use_learnable_weights=use_learnable_weights,
-            sc_cell_expressions=sc_cell_expressions
+            sc_cell_expressions=sc_cell_expressions  # [n_cells, n_all_genes] 全基因
         ).to(self.device)
         
         # 计算单细胞数据中各cluster的比例
@@ -587,7 +585,7 @@ class GATDeconvolution:
             
             # Print every N epochs（网格搜索时 print_every=9999 不会触发）
             if (epoch) % print_every == 0:
-                print(f"  Epoch {epoch}/{n_epochs}: Total={avg_total_loss:.4f}, MSE={current_mse:.4f}, Pearson={current_pearson:.4f}, Cosine={current_cosine:.4f}")
+                print(f"  Epoch {epoch}/{n_epochs}: Total={avg_total_loss:.4f}, MSE={current_mse:.4f}, Pearson={current_pearson:.4f}, Cosine={current_cosine:.4f}, Gene_Pearson={current_gene_pearson:.4f}, Gene_Cosine={current_gene_cosine:.4f}")
             
             # Early stopping
             if patience_counter >= patience:
@@ -609,7 +607,14 @@ class GATDeconvolution:
         # 不需要再保存 final_gat_model.pth，避免重复
         
         # Evaluate and visualize results (use normalized data for embedding)
-        eval_outputs = self.evaluate_and_visualize(st_data_normalized, self.st_adata, spatial_tensor, sample_name)
+        eval_outputs = self.evaluate_and_visualize(
+            st_data_normalized, 
+            self.st_adata, 
+            spatial_tensor, 
+            sample_name,
+            knn_cell_indices=self.knn_cell_indices,
+            sc_cell_embeddings=self.sc_cell_embeddings
+        )
         
         return {
             'best_pearson': best_pearson,
@@ -626,11 +631,17 @@ class GATDeconvolution:
                              st_data: np.ndarray,
                              st_adata,
                              spatial_coords: torch.Tensor,
-                             sample_name: str):
+                             sample_name: str,
+                             knn_cell_indices=None,
+                             sc_cell_embeddings=None):
         """Evaluate model and visualize results, generate deconvolution matrices
         
         Note: No longer needs cells_per_spot parameter.
         Uses spot_total_counts stored during build_gat_model.
+        
+        Args:
+            knn_cell_indices: [n_spots, n_cell_types, k] 预计算的k-nearest cell索引（动态模式）
+            sc_cell_embeddings: [n_cells, embedding_dim] 单细胞embeddings（动态模式）
         """
         self.gat_model.eval()
         
@@ -644,11 +655,14 @@ class GATDeconvolution:
             spot_embeddings = mu
             
             # GAT forward pass
+            scale_basis = getattr(self, "scale_basis", "all")
+            normalize_attention = (scale_basis != "none")
             gat_outputs = self.gat_model(
                 spot_embeddings=spot_embeddings,
                 spatial_coords=spatial_coords,
                 celltype_prototypes=self.celltype_prototypes,
-                use_embedding_knn=self.use_embedding_knn
+                use_embedding_knn=self.use_embedding_knn,
+                normalize_attention=normalize_attention
             )
             
             # Get prediction results
@@ -675,9 +689,48 @@ class GATDeconvolution:
         if self.celltype_expressions_full is not None and all(expr is not None for expr in self.celltype_expressions_full):
 
             celltype_expr_full = np.array(self.celltype_expressions_full)  # [n_clusters, n_all_genes]
-            celltype_expr_marker = self.celltype_expressions.cpu().numpy()  # [n_clusters, n_marker_genes]
             
-            mixed_expr_full = np.dot(deconv_weights, celltype_expr_full)  # [n_spots, n_all_genes]
+            # ✅ 判断是否使用动态cluster表示进行重建
+            if (self.gat_model.use_dynamic_cluster_repr and 
+                knn_cell_indices is not None and 
+                hasattr(self.gat_model, 'sc_cell_expressions') and
+                self.gat_model.sc_cell_expressions is not None):
+                
+                # ========== 动态cluster重建 ==========
+                # 1. 转换为tensor
+                deconv_weights_tensor = torch.FloatTensor(deconv_weights).to(self.device)  # [n_spots, n_clusters]
+                knn_indices_tensor = torch.LongTensor(knn_cell_indices).to(self.device)  # [n_spots, n_clusters, k]
+                spot_embeddings_tensor = spot_embeddings  # 已经在GPU上
+                
+                # 2. 计算动态cluster权重（每个spot的每个cluster的k个cell的权重）
+                # 使用均匀权重
+                n_spots, n_cell_types, k = knn_indices_tensor.shape
+                dynamic_weights = torch.ones(n_spots, n_cell_types, k, device=self.device) / k
+                
+                # 3. 处理padding（将-1索引对应的权重置零）
+                padding_mask = (knn_indices_tensor == -1)
+                dynamic_weights = dynamic_weights.masked_fill(padding_mask, 0.0)
+                # 重新归一化
+                weight_sums = dynamic_weights.sum(dim=-1, keepdim=True)
+                dynamic_weights = dynamic_weights / (weight_sums + 1e-8)
+                
+                # 4. 使用动态权重计算混合表达（全基因）
+                # self.gat_model.sc_cell_expressions: [n_cells, n_all_genes]（全基因原始count）
+                # 直接使用compute_dynamic_mixed_expression进行全基因重建
+                if hasattr(self.loss_fn, 'compute_dynamic_mixed_expression'):
+                    mixed_expr_full_tensor = self.loss_fn.compute_dynamic_mixed_expression(
+                        attention_weights=deconv_weights_tensor,
+                        dynamic_cluster_weights=dynamic_weights,
+                        dynamic_cluster_indices=knn_indices_tensor,
+                        sc_cell_expressions=self.gat_model.sc_cell_expressions  # [n_cells, n_all_genes]
+                    )  # [n_spots, n_all_genes]
+                    mixed_expr_full = mixed_expr_full_tensor.detach().cpu().numpy()
+                else:
+                    # 如果loss_fn没有该方法，回退到静态方法
+                    mixed_expr_full = np.dot(deconv_weights, celltype_expr_full)  # [n_spots, n_all_genes]
+            else:
+                # ========== 静态cluster重建（原始逻辑）==========
+                mixed_expr_full = np.dot(deconv_weights, celltype_expr_full)  # [n_spots, n_all_genes]
             
             scale_basis = getattr(self, "scale_basis", "all")
             if scale_basis == "none":
@@ -720,7 +773,7 @@ class GATDeconvolution:
                     columns=all_gene_names,
                     index=spot_barcodes
                 )
-                full_expr_file = f"{self.output_dir}/{sample_name}_reconstructed_all_genes.csv"
+                full_expr_file = f"{self.output_dir}/{sample_name}_reconstructed.csv"
                 full_expr_df.to_csv(full_expr_file)
         else:
             pass
@@ -761,7 +814,7 @@ class GATDeconvolution:
         composition_file = None
         if self.output_dir:
             os.makedirs(self.output_dir, exist_ok=True)
-            composition_file = f"{self.output_dir}/{sample_name}_cell_composition.csv"
+            composition_file = f"{self.output_dir}/{sample_name}_composition.csv"
             composition_by_celltype.to_csv(composition_file)
 
         # Skip cluster-level composition to reduce file clutter

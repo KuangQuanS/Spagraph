@@ -199,6 +199,7 @@ def compute_clusters_and_marker_genes(adata,
                 print(f"   {cluster}: 0 genes")
     
     print(f"Total: {len(marker_genes)} marker genes")
+    print(f"   Number of clusters: {len(adata_full.obs['leiden'].unique())}")
     
     clusters_to_drop = [cluster for cluster, genes in lasso_selected.items() if len(genes) == 0]
     if clusters_to_drop:

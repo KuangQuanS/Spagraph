@@ -118,35 +118,35 @@ def run_deconv(
     st_file: Optional[str] = None,
     output_dir: Optional[str] = None,
     # Training parameters
-    n_epochs: int = 250,
+    n_epochs: int = 300,
     lr: float = 5e-3,
     batch_size: int = 512,
     print_every: int = 25,
     # Graph parameters
     k_spatial: int = 5,
     k_celltype: int = 20,
-    k_celltype_range: Optional[list] = [15, 20, 25, 30, 35],  # 自动网格搜索，默认 [15,20,25,30]，设为 [] 禁用
+    k_celltype_range: Optional[list] = [20, 25, 30, 35, 40],  #  [] 禁用
     # GAT architecture
     gat_hidden_dim: int = 512,
     gat_layers: int = 4,
     gat_heads: int = 4,
     dropout: float = 0.1,
     # Loss weights
-    lambda_pearson: float = 5.0,
-    lambda_mse: float = 0.01,
+    lambda_pearson: float = 1,
+    lambda_mse: float = 0,
     lambda_cosine: float = 5.0,
-    lambda_gene_pearson: float = 1.0,
-    lambda_gene_cosine: float = 1.0,
+    lambda_gene_pearson: float = 1,
+    lambda_gene_cosine: float = 5.0,
     lambda_reg: float = 0.1,
-    lambda_sparse: float = 1,
-    lambda_proportion: float = 0.1,
+    lambda_sparse: float = 0,
+    lambda_proportion: float = 0.01,
     # Output options
     save_reconstructed_genes: bool = False,  # 是否保存重构的全基因表达
+    save_all_trials: bool = False,  # 网格搜索时是否保存所有k_celltype的deconv矩阵（命名为xxx_k15.csv等）
     # Dynamic cluster representation (optional)
     use_dynamic_cluster_repr: bool = True,  # 启用动态cluster表示（用k个最近细胞代替cluster平均）
     k_cells_per_cluster: int = 10,  # 每个cluster使用多少个最近细胞
     precompute_knn: bool = True,  # 是否在训练前预计算k-nearest cells（推荐True）
-    use_learnable_weights: bool = False,  # 是否用MLP学习cell权重（False则用均匀平均）
     # Other
     weight_threshold: float = 0.001,
     scale_basis: str = 'all',
@@ -191,7 +191,6 @@ def run_deconv(
         print(f"Dynamic Cluster:    {use_dynamic_cluster_repr}")
         if use_dynamic_cluster_repr:
             print(f"  K Cells/Cluster:  {k_cells_per_cluster}")
-            print(f"  Learnable Weights: {use_learnable_weights}")
             print(f"  Precompute KNN:   {precompute_knn}")
         print(f"Scale Basis:        {scale_basis}")
         print(f"Weight Threshold:   {weight_threshold}")
@@ -225,10 +224,10 @@ def run_deconv(
             lambda_sparse=lambda_sparse,
             lambda_proportion=lambda_proportion,
             save_reconstructed_genes=save_reconstructed_genes,
+            save_all_trials=save_all_trials,
             use_dynamic_cluster_repr=use_dynamic_cluster_repr,
             k_cells_per_cluster=k_cells_per_cluster,
             precompute_knn=precompute_knn,
-            use_learnable_weights=use_learnable_weights,
             weight_threshold=weight_threshold,
             scale_basis=scale_basis,
             device=device,
@@ -385,7 +384,6 @@ def run_deconv(
         # 动态cluster参数
         use_dynamic_cluster_repr=use_dynamic_cluster_repr,
         k_cells_per_cluster=k_cells_per_cluster,
-        use_learnable_weights=use_learnable_weights,
         sc_cell_expressions=vae.sc_cell_expressions_raw if use_dynamic_cluster_repr else None
     )
     
@@ -405,26 +403,12 @@ def run_deconv(
         sc_cell_embeddings=vae.sc_cell_embeddings if use_dynamic_cluster_repr else None
     )
     
-    # 保存超参数到 txt 文件（合并 Stage 1 配置，如果存在）
+    # 保存超参数到 txt 文件
     if save_outputs:
         import datetime
-        config_path = f"{output_dir}/config.txt"
-        
-        # 尝试读取 Stage 1 配置
-        stage1_config_path = f"{output_dir}/stage1_config.txt"
-        stage1_config_content = ""
-        if os.path.exists(stage1_config_path):
-            with open(stage1_config_path, 'r') as f:
-                stage1_config_content = f.read()
-            # 删除 Stage 1 的独立配置文件
-            os.remove(stage1_config_path)
+        config_path = f"{output_dir}/config_deconv.txt"
         
         with open(config_path, 'w') as f:
-            # 如果有 Stage 1 配置，先写入
-            if stage1_config_content:
-                f.write(stage1_config_content)
-                f.write("\n\n")
-            
             # 写入 Stage 2 配置
             f.write("="*60 + "\n")
             f.write("Stage 2: GAT Deconvolution Configuration\n")
@@ -463,7 +447,7 @@ def run_deconv(
             f.write(f"  Enabled:       {use_dynamic_cluster_repr}\n")
             if use_dynamic_cluster_repr:
                 f.write(f"  K Cells/Cluster: {k_cells_per_cluster}\n")
-                f.write(f"  Learnable Weights: {use_learnable_weights}\n")
+
                 f.write(f"  Precompute KNN: {precompute_knn}\n\n")
             else:
                 f.write("\n")
@@ -508,6 +492,7 @@ def run_deconv_auto_k(
     st_file: Optional[str] = None,
     output_dir: Optional[str] = None,
     k_celltype_range: list = None,
+    save_all_trials: bool = False,
     **kwargs
 ) -> Dict[str, Any]:
     """Stage 2 with automatic k_celltype grid search (纯内存版本)
@@ -562,7 +547,8 @@ def run_deconv_auto_k(
         cosine = result['metrics']['cosine']
         mse = result['metrics']['mse']
         gene_pearson = result['metrics']['gene_pearson']
-        score = mse + cosine + gene_pearson
+        gene_cosine = result['metrics']['gene_cosine']
+        score = gene_cosine + cosine
         
         # 保存摘要（不保存完整的 deconv 矩阵，节省内存）
         trial_summary = {
@@ -571,6 +557,7 @@ def run_deconv_auto_k(
             'cosine': cosine,
             'mse': mse,
             'gene_pearson': gene_pearson,
+            'gene_cosine': gene_cosine,
             'score': score
         }
         all_trials.append(trial_summary)
@@ -584,15 +571,39 @@ def run_deconv_auto_k(
         
         # 打印结果（紧凑格式）
         status = "*" if is_best else " "
-        print(f"{status} Score={score:.4f} (M={mse:.4f}, C={cosine:.4f}, GP={gene_pearson:.4f})")
+        print(f"{status} Score={score:.4f} (C={cosine:.4f}, GC={gene_cosine:.4f})")
+        
+        # 如果启用 save_all_trials 且提供了 output_dir，保存当前trial的deconv矩阵
+        if save_all_trials and output_dir is not None:
+            os.makedirs(output_dir, exist_ok=True)
+            import pandas as pd
+            deconv_df = result['deconv']
+            trial_path = os.path.join(output_dir, f"{result['sample_name']}_cell_composition_k{k}.csv")
+            deconv_df.to_csv(trial_path)
+            print(f"  → Saved: {result['sample_name']}_cell_composition_k{k}.csv")
     
     # 打印最终结果（简化）
     print(f"\nBest: k={best_k}, Score={best_score:.4f}\n")
     
-    # 如果提供了 output_dir，保存最优结果（不重新训练）
+    # 如果提供了 output_dir，需要重新运行最优配置以正确保存所有文件（包括重建基因表达）
     if output_dir is not None:
         os.makedirs(output_dir, exist_ok=True)
-        print(f"Saving best result (k={best_k}) to {output_dir}...")
+        print(f"Re-running optimal k={best_k} with output_dir to save all files...")
+        
+        # 重新运行最优配置（这次会保存所有文件，包括 save_reconstructed_genes）
+        deconv_kwargs = kwargs.copy()
+        deconv_kwargs.pop('print_every', None)  # 移除，使用默认值
+        
+        best_result = run_deconv(
+            vae=vae,
+            st_file=st_file,
+            output_dir=output_dir,  # 这次设置正确的 output_dir
+            k_celltype=best_k,
+            k_celltype_range=[],  # 禁用递归网格搜索
+            print_every=kwargs.get('print_every', 9999),  # 不打印训练过程（已找到最优）
+            _silent_header=True,
+            **deconv_kwargs
+        )
         
         # 保存 deconv 矩阵
         import pandas as pd
@@ -600,80 +611,15 @@ def run_deconv_auto_k(
         deconv_df = best_result['deconv']
         deconv_path = os.path.join(output_dir, f"{best_result['sample_name']}_cell_composition.csv")
         deconv_df.to_csv(deconv_path)
+        deconv_path = os.path.join(output_dir, f"{best_result['sample_name']}_cell_composition.csv")
+        deconv_df.to_csv(deconv_path)
         print(f"Deconvolution matrix saved to: {deconv_path}")
         
-        # 如果启用了 save_reconstructed_genes，直接用 deconv 矩阵重建基因表达
-        save_reconstructed_genes = kwargs.get('save_reconstructed_genes', False)
-        if save_reconstructed_genes and vae.celltype_expressions_full is not None:
-            print(f"Computing reconstructed gene expression...")
-            
-            # 使用原始的 cluster-level 权重（未合并）
-            # best_result 中包含 'deconv_weights_raw'：[n_spots, n_clusters]
-            deconv_weights = best_result.get('deconv_weights_raw')
-            if deconv_weights is None:
-                # 备用方案：从 deconv_df 提取（可能不匹配）
-                print("⚠️  Warning: deconv_weights_raw not found, using deconv_df (may cause shape mismatch)")
-                deconv_weights = deconv_df.values
-            
-            # 获取细胞类型的完整基因表达（来自 Stage 1）
-            celltype_expr_full = vae.celltype_expressions_full  # [n_clusters, n_all_genes]
-            
-            # 重建：deconv @ celltype_expressions
-            mixed_expr_full = np.dot(deconv_weights, celltype_expr_full)  # [n_spots, n_all_genes]
-            
-            # 缩放到原始 counts（如果有 scale_basis）
-            scale_basis = kwargs.get('scale_basis', 'all')
-            if scale_basis == 'none':
-                reconstructed_full_expr = mixed_expr_full
-            elif scale_basis == 'fixed_10':
-                # 固定缩放因子10：比例×10 = 细胞数量
-                reconstructed_full_expr = mixed_expr_full * 10.0
-            elif vae.spot_total_counts is not None:
-                spot_counts = vae.spot_total_counts[:len(deconv_weights)]
-                
-                if scale_basis == 'all':
-                    mixed_totals = mixed_expr_full.sum(axis=1, keepdims=True)
-                elif scale_basis == 'hvg' and vae.hvg_genes_union is not None:
-                    hvg_indices = [i for i, g in enumerate(vae.all_genes) if g in vae.hvg_genes_union]
-                    mixed_totals = mixed_expr_full[:, hvg_indices].sum(axis=1, keepdims=True)
-                else:  # marker
-                    marker_indices = [i for i, g in enumerate(vae.all_genes) if g in vae.marker_genes]
-                    mixed_totals = mixed_expr_full[:, marker_indices].sum(axis=1, keepdims=True)
-                
-                scale = spot_counts[:, np.newaxis] / (mixed_totals + 1e-8)
-                reconstructed_full_expr = mixed_expr_full * scale
-            else:
-                reconstructed_full_expr = mixed_expr_full
-            
-            # 保存为 CSV
-            reconstructed_df = pd.DataFrame(
-                reconstructed_full_expr,
-                columns=vae.all_genes,
-                index=deconv_df.index
-            )
-            reconstructed_path = os.path.join(output_dir, f"{best_result['sample_name']}_reconstructed_all_genes.csv")
-            reconstructed_df.to_csv(reconstructed_path)
-            print(f"Reconstructed genes saved to: {reconstructed_path}")
-        
-        # 保存配置文件（合并 Stage 1 配置，如果存在）
+        # 保存配置文件
         import datetime
-        config_path = os.path.join(output_dir, 'config.txt')
-        
-        # 尝试读取 Stage 1 配置
-        stage1_config_path = os.path.join(output_dir, 'stage1_config.txt')
-        stage1_config_content = ""
-        if os.path.exists(stage1_config_path):
-            with open(stage1_config_path, 'r') as f:
-                stage1_config_content = f.read()
-            # 删除 Stage 1 的独立配置文件
-            os.remove(stage1_config_path)
+        config_path = os.path.join(output_dir, 'config_deconv.txt')
         
         with open(config_path, 'w') as f:
-            # 如果有 Stage 1 配置，先写入
-            if stage1_config_content:
-                f.write(stage1_config_content)
-                f.write("\n\n")
-            
             # 写入 Stage 2 配置
             f.write("="*60 + "\n")
             f.write("Stage 2: GAT Deconvolution (Auto K Grid Search)\n")
@@ -735,27 +681,24 @@ def run_deconv_auto_k(
             # 动态cluster参数
             use_dynamic_cluster_repr = kwargs.get('use_dynamic_cluster_repr', False)
             k_cells_per_cluster = kwargs.get('k_cells_per_cluster', 10)
-            use_learnable_weights = kwargs.get('use_learnable_weights', True)
             precompute_knn = kwargs.get('precompute_knn', True)
             
             f.write(f"Dynamic Cluster Representation:\n")
             f.write(f"  Enabled:       {use_dynamic_cluster_repr}\n")
             if use_dynamic_cluster_repr:
                 f.write(f"  K Cells/Cluster: {k_cells_per_cluster}\n")
-                f.write(f"  Learnable Weights: {use_learnable_weights}\n")
                 f.write(f"  Precompute KNN: {precompute_knn}\n\n")
             else:
                 f.write("\n")
             
             f.write(f"Output Options:\n")
             f.write(f"  Save Reconstructed Genes: {save_reconstructed_genes}\n\n")
-            f.write(f"All Trials (Score = MSE + Cosine + Gene_Pearson):\n")
+            f.write(f"All Trials (Score = Cosine + Gene_Cosine):\n")
             for trial in all_trials:
                 marker = "*" if trial['k_celltype'] == best_k else " "
                 f.write(f"  {marker} k={trial['k_celltype']:2d}: "
-                       f"MSE={trial['mse']:.6f}, "
                        f"Cosine={trial['cosine']:.6f}, "
-                       f"Gene_P={trial['gene_pearson']:.6f}, "
+                       f"Gene_C={trial['gene_cosine']:.6f}, "
                        f"Score={trial['score']:.6f}\n")
             f.write(f"\nFinal Results:\n")
             f.write(f"  Best Pearson:      {best_result['metrics']['pearson']:.6f}\n")

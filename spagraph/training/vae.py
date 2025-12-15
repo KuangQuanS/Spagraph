@@ -22,7 +22,7 @@ def train_vae(
     st_file: str,
     output_dir: Optional[str] = None,
     as_artifacts: bool = True,
-    n_epochs: int = 200,
+    n_epochs: int = 300,
     resolution: float = 4.0,
     top_n_per_type: int = 100,
     hidden_dims: Optional[list] = None,
@@ -143,7 +143,7 @@ def train_vae(
     # 保存超参数到 txt 文件
     if save_to_disk:
         import datetime
-        config_path = f"{output_dir}/stage1_config.txt"
+        config_path = f"{output_dir}/config_vae.txt"
         with open(config_path, 'w') as f:
             f.write("="*60 + "\n")
             f.write("Stage 1: VAE Training Configuration\n")

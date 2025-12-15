@@ -155,6 +155,7 @@ class coEncoder:
             sc.pp.neighbors(sc_adata_clustered, n_neighbors=10, n_pcs=40)
             sc.tl.leiden(sc_adata_clustered, resolution=resolution)
             sc_clusters = sc_adata_clustered.obs['leiden'].copy()
+            print(f"   Number of clusters: {len(sc_clusters.unique())}")
         else:
             # Auto-cluster using Leiden
             cluster_save_path = f"{self.output_dir}/marker_genes.txt" if (self.save_to_disk and self.output_dir) else None
@@ -250,13 +251,6 @@ class coEncoder:
         sc_train, sc_test, y_train, y_test = train_test_split(
             sc_X_final, sc_y, test_size=0.05, stratify=sc_y, random_state=42
         )
-        
-        # Split full gene SC data with same indices
-        # sc_train_indices = np.arange(len(sc_X_final))
-
-        # sc_train_idx, sc_test_idx = train_test_split(
-        #     sc_train_indices, test_size=0.01, stratify=sc_y, random_state=42
-        # )
         
         st_train, st_test = train_test_split(
             st_X_final, test_size=0.05, random_state=42
@@ -502,7 +496,7 @@ class coEncoder:
             output_dir=self.output_dir if self.save_to_disk else None,
             print_every=print_every,
             patience=20,
-            min_delta=0.001
+            min_delta=1
         )
         
         # Save training data for cluster center computation

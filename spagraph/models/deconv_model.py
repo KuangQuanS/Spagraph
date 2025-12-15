@@ -418,8 +418,9 @@ class HeterogeneousGATDeconvolution(nn.Module):
     """
     def __init__(self, embedding_dim=128,n_cell_types=9,gat_hidden_dim=64,gat_layers=3,gat_heads=4,
                  dropout=0.1,k_spatial=6,k_celltype=10, celltype_prototypes=None,
-                 use_dynamic_cluster_repr=False, k_cells_per_cluster=10, use_learnable_weights=True,
-                 sc_cell_embeddings=None, sc_cell_expressions=None, sc_cell_labels=None):
+                 use_dynamic_cluster_repr=False, k_cells_per_cluster=10,
+                 sc_cell_expressions=None,
+                 normalize_attention=True):
         super().__init__()
         
         self.embedding_dim = embedding_dim
@@ -433,30 +434,18 @@ class HeterogeneousGATDeconvolution(nn.Module):
         # 动态cluster表示参数
         self.use_dynamic_cluster_repr = use_dynamic_cluster_repr
         self.k_cells_per_cluster = k_cells_per_cluster
-        self.use_learnable_weights = use_learnable_weights
+        self.normalize_attention = normalize_attention
         
-        # 如果启用动态模式，只保存单细胞表达（原始count）
+        # 如果启用动态模式，保存单细胞全基因表达（原始count）
         # k-nearest cells索引应该在第一阶段预计算好
         if use_dynamic_cluster_repr:
             if sc_cell_expressions is None:
                 raise ValueError(
-                    "Dynamic cluster representation requires sc_cell_expressions (raw counts).\n"
+                    "Dynamic cluster representation requires sc_cell_expressions (raw counts of all genes).\n"
                     "k-nearest cell indices should be pre-computed in stage1."
                 )
+            # sc_cell_expressions: [n_cells, n_all_genes] 全基因原始count
             self.register_buffer('sc_cell_expressions', torch.FloatTensor(sc_cell_expressions))
-            
-            # MLP用于学习cell权重（仅在use_learnable_weights=True时需要）
-            # 输入 [spot_embedding || cell_embedding] -> 输出权重分数
-            if use_learnable_weights:
-                mlp_input_dim = embedding_dim * 2
-                self.cell_weight_mlp = nn.Sequential(
-                    nn.Linear(mlp_input_dim, gat_hidden_dim),
-                    nn.ReLU(),
-                    nn.Dropout(dropout),
-                    nn.Linear(gat_hidden_dim, 1)
-                )
-            else:
-                self.cell_weight_mlp = None  # 使用均匀权重，不需要MLP
         
         # 1. 节点特征投影层
         # Spot节点：从VAE embedding到GAT输入
@@ -629,11 +618,16 @@ class HeterogeneousGATDeconvolution(nn.Module):
                spot_embeddings: torch.Tensor,
                spatial_coords: torch.Tensor,
                celltype_prototypes: torch.Tensor,
-               use_embedding_knn: bool = False) -> Dict[str, torch.Tensor]:
+               use_embedding_knn: bool = False,
+               normalize_attention: bool = None) -> Dict[str, torch.Tensor]:
         """Forward pass"""
         n_spots = spot_embeddings.shape[0]
         n_cell_types = celltype_prototypes.shape[0]
         device = spot_embeddings.device
+        
+        # Handle normalize_attention parameter
+        if normalize_attention is None:
+            normalize_attention = self.normalize_attention
         
         # 1. Build heterogeneous graph
         edge_index, edge_attr, node_features = self.build_heterogeneous_graph(
@@ -688,8 +682,14 @@ class HeterogeneousGATDeconvolution(nn.Module):
         attention_scores_masked = attention_scores.clone()
         attention_scores_masked[~sparse_mask] = float('-inf')
         
-        # Softmax normalization (only over connected celltypes)
-        deconv_weights = F.softmax(attention_scores_masked, dim=1)
+        # Attention weight normalization (optional)
+        if normalize_attention:
+            # Softmax normalization (only over connected celltypes)
+            deconv_weights = F.softmax(attention_scores_masked, dim=1)
+        else:
+            # No normalization: use raw scores, set non-connected to 0
+            deconv_weights = attention_scores_masked.clone()
+            deconv_weights[~sparse_mask] = 0.0
         
         # Handle any NaN from all -inf rows (shouldn't happen with k_celltype)
         deconv_weights = torch.nan_to_num(deconv_weights, 0.0)
@@ -750,54 +750,14 @@ class HeterogeneousGATDeconvolution(nn.Module):
         # ✅ 向量化优化：创建mask并处理padding
         valid_mask = (knn_cell_indices >= 0)  # [batch_size, n_cell_types, k]
         
-        # ✅ 均匀权重模式：直接返回1/k（跳过MLP）
-        if not self.use_learnable_weights:
-            # 计算每个cluster的有效cell数量
-            num_valid_cells = valid_mask.sum(dim=-1, keepdim=True).float()  # [batch_size, n_cell_types, 1]
-            num_valid_cells = torch.clamp(num_valid_cells, min=1.0)  # 避免除零
-            
-            # 均匀权重：有效cell权重=1/num_valid，padding cell权重=0
-            uniform_weights = valid_mask.float() / num_valid_cells  # [batch_size, n_cell_types, k]
-            return uniform_weights
+        # ✅ 均匀权重模式：直接返回1/k（基于有效cell数量）
+        # 计算每个cluster的有效cell数量
+        num_valid_cells = valid_mask.sum(dim=-1, keepdim=True).float()  # [batch_size, n_cell_types, 1]
+        num_valid_cells = torch.clamp(num_valid_cells, min=1.0)  # 避免除零
         
-        # ✅ MLP可学习权重模式
-        safe_indices = torch.clamp(knn_cell_indices, min=0)  # 将-1替换为0（后面mask会屏蔽）
-        
-        # ✅ 一次性gather所有cell embeddings
-        # safe_indices: [batch_size, n_cell_types, k]
-        # sc_cell_embeddings: [n_cells, embedding_dim]
-        # → cell_embeds: [batch_size, n_cell_types, k, embedding_dim]
-        cell_embeds = sc_cell_embeddings[safe_indices]  # Broadcasting gather
-        
-        # ✅ Broadcast spot embeddings
-        # spot_embeddings: [batch_size, embedding_dim]
-        # → [batch_size, 1, 1, embedding_dim] → [batch_size, n_cell_types, k, embedding_dim]
-        spot_embeds_expanded = spot_embeddings.unsqueeze(1).unsqueeze(2).expand(
-            batch_size, n_cell_types, k, embedding_dim
-        )
-        
-        # ✅ 拼接: [batch_size, n_cell_types, k, 2*embedding_dim]
-        combined = torch.cat([spot_embeds_expanded, cell_embeds], dim=-1)
-        
-        # ✅ Batch MLP计算（一次处理所有）
-        # Reshape to [batch_size*n_cell_types*k, 2*embedding_dim]
-        combined_flat = combined.reshape(-1, 2 * embedding_dim)
-        weight_scores_flat = self.cell_weight_mlp(combined_flat).squeeze(-1)  # [batch_size*n_cell_types*k]
-        
-        # Reshape back: [batch_size, n_cell_types, k]
-        weight_scores = weight_scores_flat.reshape(batch_size, n_cell_types, k)
-        
-        # ✅ Masked softmax：对每个cluster的k个cell归一化
-        # 将padding位置设为-inf，softmax后变为0
-        weight_scores = weight_scores.masked_fill(~valid_mask, float('-inf'))
-        
-        # Softmax沿k维度归一化：[batch_size, n_cell_types, k]
-        cell_weights = F.softmax(weight_scores, dim=-1)  # 每个cluster的k个权重和为1
-        
-        # 将-inf softmax后的nan替换为0（全padding的cluster）
-        cell_weights = torch.nan_to_num(cell_weights, nan=0.0)
-        
-        return cell_weights
+        # 均匀权重：有效cell权重=1/num_valid，padding cell权重=0
+        uniform_weights = valid_mask.float() / num_valid_cells  # [batch_size, n_cell_types, k]
+        return uniform_weights
 
 
 # ================================
@@ -1038,10 +998,19 @@ class SpatialDeconvolutionLoss(nn.Module):
             corr = numerator / (denominator + 1e-8)
             return corr
         
-        # Log-transform (避免高表达基因主导)
-        reconstructed_log = torch.log1p(reconstructed_spot_marker)
-        true_log = torch.log1p(true_spot_expression)
-        
+        # # Log-transform (避免高表达基因主导)
+        # reconstructed_log = torch.log1p(reconstructed_spot_marker)
+        # true_log = torch.log1p(true_spot_expression)
+
+
+        # normalize_total 到 1e4 并 log1p
+        def normalize_total(mat, target_sum=1e4):
+            scale = target_sum / (mat.sum(dim=1, keepdim=True) + 1e-8)
+            return mat * scale
+
+        reconstructed_log = torch.log1p(normalize_total(reconstructed_spot_marker, 1e4))
+        true_log = torch.log1p(normalize_total(true_spot_expression, 1e4))
+
         pearson_corr = pearson_correlation(reconstructed_log, true_log)
         L_pearson = 1.0 - pearson_corr.mean()  # 1 - 相关系数,越小越好
         

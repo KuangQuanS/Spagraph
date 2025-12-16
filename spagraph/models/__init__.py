@@ -1,4 +1,4 @@
-"""Core model implementations for Spagraph (copied from SC_MAP_ST)."""
+"""Core model implementations for Spagraph."""
 
 from .deconv_model import (
     VAE,

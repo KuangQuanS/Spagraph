@@ -9,13 +9,6 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, Optional, Union
 
-_current_dir = Path(__file__).parent.parent.parent
-_sc_map_st_dir = _current_dir / "SC_MAP_ST"
-if str(_sc_map_st_dir) not in sys.path:
-    sys.path.insert(0, str(_sc_map_st_dir))
-if str(_current_dir) not in sys.path:
-    sys.path.insert(0, str(_current_dir))
-
 from spagraph.cellcom.cellcom import main as cellcom_main, parse_args
 
 
@@ -29,15 +22,16 @@ def run_cellcom(
     # Graph parameters
     n_spot_neighbors: int = 6,
     # LR communication parameters
-    mean_expr_threshold: float = 3.0,
+    mean_expr_threshold: float = 1.0,
     min_comm_edges: int = 1,
-    spot_cell_expr_csv: Optional[str] = None,
+    spot_cell_expr_csv: Optional[str] = None,  # 可选，优先使用deconv_dir中的动态表达
+    use_hvg_for_communication: bool = True,  # 只使用高变基因计算通讯（默认启用）
     # GAT parameters
     gat_hidden_dims: str = '512,256,128',
     gat_heads: int = 8,
     gat_dropout: float = 0.3,
     # Model parameters
-    output_dim: int = 120,
+    output_dim: int = 128,
     lambda_mask_recon: float = 1.0,
     lambda_node_recon: float = 0.5,
     attention_threshold: float = 1.0,
@@ -52,18 +46,30 @@ def run_cellcom(
     weight_decay: float = 1e-5,
     seed: int = 42,
     device: str = 'cuda',
+    sample_rate: float = 1.0,
+    val_split: float = 0.1,
+    early_stop_patience: int = 20,
+    early_stop_min_delta: float = 0.1,
     # Legacy support
     args: Optional[Union[argparse.Namespace, Dict[str, Any]]] = None,
     **overrides: Any,
 ) -> None:
     """Run Stage 3 (cell communication) analysis.
     
-    This function analyzes cell-cell communication based on ligand-receptor
-    interactions using the deconvolution results from Stage 1 & 2.
+    Analyzes cell-cell communication based on ligand-receptor interactions
+    using the deconvolution results from Stage 2.
+    
+    ✅ 极简依赖（只需 2 个文件）：
+    - 必需: *_spot_cell_expr.csv (Stage 2 生成，包含动态表达)
+    - 必需: *_cluster_composition.csv (deconv 比例矩阵)
+    
+    特征构建：自动从 spot_cell_expr.csv 选择 2000 个高变基因（使用 scanpy）
     
     Args:
-        deconv_dir: Stage1+Stage2 output directory (contains final_vae.pth, etc.)
-        st_h5ad: Path to spatial transcriptomics h5ad file
+        deconv_dir: Stage 2 output directory, must contain:
+            - *_spot_cell_expr.csv (自动生成，需设置 save_reconstructed_genes=True)
+            - *_cluster_composition.csv (deconv 结果)
+        st_h5ad: Spatial transcriptomics h5ad file path
         output_dir: Output directory for results
         mlp_latent_dim: MLP latent dimension
         mlp_hidden_dims: MLP hidden dimensions (comma-separated)
@@ -136,6 +142,7 @@ def run_cellcom(
         mean_expr_threshold=mean_expr_threshold,
         min_comm_edges=min_comm_edges,
         spot_cell_expr_csv=spot_cell_expr_csv,
+        use_hvg_for_communication=use_hvg_for_communication,
         gat_hidden_dims=gat_hidden_dims,
         gat_heads=gat_heads,
         gat_dropout=gat_dropout,
@@ -153,6 +160,10 @@ def run_cellcom(
         weight_decay=weight_decay,
         seed=seed,
         device=device,
+        sample_rate=sample_rate,
+        val_split=val_split,
+        early_stop_patience=early_stop_patience,
+        early_stop_min_delta=early_stop_min_delta,
     )
     
     # Apply any additional overrides

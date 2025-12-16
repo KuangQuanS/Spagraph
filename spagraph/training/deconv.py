@@ -124,8 +124,7 @@ def run_deconv(
     print_every: int = 25,
     # Graph parameters
     k_spatial: int = 5,
-    k_celltype: int = 20,
-    k_celltype_range: Optional[list] = [20, 25, 30, 35, 40],  #  [] 禁用
+    k_celltype: Any = 20,  # int: 单次运行, list: 网格搜索（如 [20, 25, 30]）
     # GAT architecture
     gat_hidden_dim: int = 512,
     gat_layers: int = 4,
@@ -155,6 +154,79 @@ def run_deconv(
     _silent_header: bool = False,  # 内部参数：禁止打印配置头部
 ) -> Dict[str, Any]:
     """Stage 2: GAT Deconvolution
+    
+    用于空间转录组的反卷积分析，基于 GAT 图神经网络预测每个 spot 的细胞类型组成。
+    
+    Args:
+        vae: Stage1Artifacts，包含第一阶段训练的 VAE 模型和聚类信息
+        st_file: 空间转录组 h5ad 文件路径（如果为 None，从 vae 中获取）
+        output_dir: 输出目录（保存 deconv 矩阵、配置文件等）
+        
+        # 训练参数
+        n_epochs: 训练轮数
+        lr: 学习率
+        batch_size: 批次大小
+        print_every: 每隔多少轮打印一次训练信息
+        
+        # 图构建参数
+        k_spatial: 空间邻居数量
+        k_celltype: **动态 cluster 的 k 值**
+            - 整数（如 20）: 单次运行，每个 cluster 使用 k 个最近细胞
+            - 列表（如 [20, 25, 30]）: 网格搜索，自动选择最优 k
+        
+        # GAT 架构参数
+        gat_hidden_dim: GAT 隐藏层维度
+        gat_layers: GAT 层数
+        gat_heads: 注意力头数
+        dropout: Dropout 概率
+        
+        # 损失函数权重
+        lambda_pearson, lambda_mse, lambda_cosine: spot 级别的损失权重
+        lambda_gene_pearson, lambda_gene_cosine: 基因级别的损失权重
+        lambda_reg, lambda_sparse, lambda_proportion: 正则化损失权重
+        
+        # 输出选项
+        save_reconstructed_genes: 是否保存重构的全基因表达（包括 spot-cell 级别）
+        save_all_trials: 网格搜索时是否保存所有 k 的 deconv 矩阵
+        
+        # 动态 cluster 表示
+        use_dynamic_cluster_repr: 是否启用动态 cluster（用 k 个最近细胞代替平均）
+        k_cells_per_cluster: 每个 cluster 使用多少个最近细胞（被 k_celltype 覆盖）
+        precompute_knn: 是否预计算 k-nearest cells（推荐 True）
+        
+        # 其他
+        weight_threshold: deconv 权重阈值（小于此值的权重置零）
+        scale_basis: 缩放基准（'all', 'hvg', 'marker', 'none', 'fixed_10'）
+        device: 计算设备（'cuda' 或 'cpu'）
+        seed: 随机种子
+        
+    Returns:
+        字典，包含:
+        - 'deconv': deconv 矩阵（DataFrame, [n_spots, n_clusters]）
+        - 'metrics': 评估指标（pearson, mse, cosine 等）
+        - 'sample_name': 样本名称
+        - 如果是网格搜索:
+            - 'best_k': 最优 k_celltype
+            - 'best_score': 最优评分
+            - 'all_trials': 所有试验的摘要
+    
+    Examples:
+        >>> # 单次运行
+        >>> results = spg.deconv(
+        ...     vae=vae,
+        ...     st_h5ad="data/st.h5ad",
+        ...     output_dir="output/",
+        ...     k_celltype=20  # 单个值
+        ... )
+        
+        >>> # 网格搜索
+        >>> results = spg.deconv(
+        ...     vae=vae,
+        ...     st_h5ad="data/st.h5ad",
+        ...     output_dir="output/",
+        ...     k_celltype=[20, 25, 30, 35]  # 列表触发网格搜索
+        ... )
+        >>> print(f"Best k: {results['best_k']}")
     """
     # 参数检查
     if st_file is None:
@@ -173,10 +245,12 @@ def run_deconv(
         print(f"LR:                 {lr}")
         print(f"Batch Size:         {batch_size}")
         print(f"K Spatial:          {k_spatial}")
-        if k_celltype_range is not None and len(k_celltype_range) > 1:
-            print(f"K Celltype:         Grid Search {k_celltype_range}")
+        # 判断 k_celltype 是列表还是整数
+        if isinstance(k_celltype, (list, tuple)) and len(k_celltype) > 1:
+            print(f"K Celltype:         Grid Search {k_celltype}")
         else:
-            print(f"K Celltype:         {k_celltype if k_celltype_range is None or len(k_celltype_range) == 0 else k_celltype_range[0]}")
+            k_value = k_celltype[0] if isinstance(k_celltype, (list, tuple)) else k_celltype
+            print(f"K Celltype:         {k_value}")
         print(f"GAT Architecture:   {gat_layers}L × {gat_hidden_dim}D × {gat_heads}H")
         print(f"Dropout:            {dropout}")
         print(f"Loss Weights:")
@@ -198,14 +272,14 @@ def run_deconv(
         print(f"Save to Disk:       {bool(output_dir)}")
         print(f"{'='*60}\n")
     
-    # 网格搜索启用条件：列表且长度 > 1
-    if k_celltype_range is not None and len(k_celltype_range) > 1:
+    # 网格搜索启用条件：k_celltype 是列表且长度 > 1
+    if isinstance(k_celltype, (list, tuple)) and len(k_celltype) > 1:
         # 启用网格搜索
         return run_deconv_auto_k(
             vae=vae,
             st_file=st_file,
             output_dir=output_dir,
-            k_celltype_range=k_celltype_range,
+            k_celltype_range=k_celltype,  # 传递列表
             n_epochs=n_epochs,
             lr=lr,
             batch_size=batch_size,
@@ -235,10 +309,13 @@ def run_deconv(
         )
     
     # 单次运行（禁用网格搜索）
-    # 如果 k_celltype_range 是单元素列表，使用该值覆盖 k_celltype
-    if k_celltype_range is not None and len(k_celltype_range) == 1:
-        k_celltype = k_celltype_range[0]
-    # 如果是空列表或 None，使用函数参数的 k_celltype 默认值
+    # 如果 k_celltype 是单元素列表，提取为整数
+    if isinstance(k_celltype, (list, tuple)):
+        if len(k_celltype) == 1:
+            k_celltype = k_celltype[0]
+        else:
+            # 空列表，使用默认值 20
+            k_celltype = 20
 
     save_outputs = bool(output_dir)
     if save_outputs:
@@ -495,22 +572,25 @@ def run_deconv_auto_k(
     save_all_trials: bool = False,
     **kwargs
 ) -> Dict[str, Any]:
-    """Stage 2 with automatic k_celltype grid search (纯内存版本)
+    """Stage 2 with automatic k_celltype grid search (内部函数，由 run_deconv 自动调用)
     
-    遍历 k_celltype 候选值，选择 spot_pearson + spot_cosine 最小的结果。
+    注意：用户不应直接调用此函数，应使用 run_deconv(k_celltype=[20, 25, 30])
+    
+    遍历 k_celltype 候选值，选择评分最优的结果。
     所有训练都在内存中进行，只保存最优结果到磁盘（如果提供 output_dir）。
     
     Args:
         vae: Stage1Artifacts 对象
         st_file: ST h5ad 文件路径
         output_dir: 输出目录（仅保存最优结果的 deconv 矩阵和配置）
-        k_celltype_range: k_celltype 候选值列表，默认 [15, 20, 25, 30]
+        k_celltype_range: k_celltype 候选值列表
+        save_all_trials: 是否保存所有试验的 deconv 矩阵（命名为 xxx_k20.csv）
         **kwargs: 传递给 run_deconv 的其他参数
         
     Returns:
         最优结果的字典，包含:
         - 'best_k': 最优的 k_celltype
-        - 'best_score': 最优的 pearson + cosine
+        - 'best_score': 最优评分
         - 'all_trials': 所有尝试的摘要列表
         - 其他 run_deconv 返回的字段（使用最优 k）
     """
@@ -535,8 +615,7 @@ def run_deconv_auto_k(
             vae=vae,
             st_file=st_file,
             output_dir=None,  # 不保存文件，纯内存
-            k_celltype=k,
-            k_celltype_range=[],  # 禁用递归网格搜索（空列表表示禁用）
+            k_celltype=k,  # 传递整数，不会触发网格搜索
             print_every=print_every_val,  # 使用超参数的值，默认不打印
             _silent_header=True,  # 不打印配置头部
             **deconv_kwargs
@@ -598,8 +677,7 @@ def run_deconv_auto_k(
             vae=vae,
             st_file=st_file,
             output_dir=output_dir,  # 这次设置正确的 output_dir
-            k_celltype=best_k,
-            k_celltype_range=[],  # 禁用递归网格搜索
+            k_celltype=best_k,  # 传递整数，不会触发网格搜索
             print_every=kwargs.get('print_every', 9999),  # 不打印训练过程（已找到最优）
             _silent_header=True,
             **deconv_kwargs

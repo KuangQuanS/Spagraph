@@ -22,7 +22,8 @@ def calculate_lr_scores(
     cell_full_expr: pd.DataFrame,
     lr_pairs: List[Tuple[str, str]],
     output_dir: str,
-    n_neighbors: int = 20
+    n_neighbors: int = 20,
+    hvg_genes: Optional[List[str]] = None
 ) -> Tuple[np.ndarray, str, Dict[str, Any]]:
     """
     Calculate KNN neighborhoods and LR communication scores.
@@ -102,6 +103,18 @@ def calculate_lr_scores(
     # ========== 优化1：预构建基因索引字典 ==========
     # 避免在循环中重复查找基因索引
     gene_name_to_idx = {gene.upper(): idx for idx, gene in enumerate(gene_names_in_npz)}
+    
+    # ✅ 如果提供了HVG列表，只使用HVG进行通讯计算
+    if hvg_genes is not None:
+        hvg_genes_upper = set(g.upper() for g in hvg_genes)
+        allowed_gene_indices = set()
+        for gene_name in gene_names_in_npz:
+            if gene_name.upper() in hvg_genes_upper:
+                allowed_gene_indices.add(gene_names_in_npz.index(gene_name))
+        logging.info(f"✅ 使用高变基因进行通讯计算: {len(allowed_gene_indices)}/{len(gene_names_in_npz)} 个基因")
+    else:
+        allowed_gene_indices = None
+        logging.info("使用全部基因进行通讯计算")
 
     # ========== 过滤不参与通讯的基因 ==========
     logging.info("过滤不参与通讯的基因...")
@@ -157,6 +170,10 @@ def calculate_lr_scores(
         # 筛选活跃基因：归一化后的表达值 > threshold
         active_mask = cell_expr_normalized > mean_expr_threshold
         active_gene_indices = set(np.where(active_mask)[0]) - filtered_gene_indices
+        
+        # ✅ 如果启用HVG限制，进一步过滤只保留HVG
+        if allowed_gene_indices is not None:
+            active_gene_indices = active_gene_indices & allowed_gene_indices
         
         # 配体和受体使用相同的活跃基因集合
         cell_active_genes_ligand[spot_cell_name] = active_gene_indices

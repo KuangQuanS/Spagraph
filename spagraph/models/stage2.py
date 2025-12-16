@@ -1,4 +1,5 @@
 import os
+import logging
 import numpy as np
 import pandas as pd
 import scanpy as sc
@@ -735,9 +736,11 @@ class GATDeconvolution:
             scale_basis = getattr(self, "scale_basis", "all")
             if scale_basis == "none":
                 reconstructed_full_expr = mixed_expr_full
+                scale = np.ones((n_spots, 1))
             elif scale_basis == "fixed_10":
                 # 固定缩放因子10：比例×10 = 细胞数量
                 reconstructed_full_expr = mixed_expr_full * 10.0
+                scale = np.full((n_spots, 1), 10.0)
             else:
                 # 使用 spot_total_counts 进行缩放（与 deconv_model.py 保持一致）
                 if self.spot_total_counts is None:
@@ -768,6 +771,8 @@ class GATDeconvolution:
             # 只在启用时保存重构的全基因表达
             if self.save_reconstructed_genes and self.output_dir:
                 os.makedirs(self.output_dir, exist_ok=True)
+                
+                # 1. 保存spot级别的重构表达（原有功能）
                 full_expr_df = pd.DataFrame(
                     reconstructed_full_expr,
                     columns=all_gene_names,
@@ -775,6 +780,86 @@ class GATDeconvolution:
                 )
                 full_expr_file = f"{self.output_dir}/{sample_name}_reconstructed.csv"
                 full_expr_df.to_csv(full_expr_file)
+                
+                # 2. ✅ 新增：保存spot-cell级别的动态表达（用于第三阶段cellcom）
+                if (self.gat_model.use_dynamic_cluster_repr and 
+                    knn_cell_indices is not None and 
+                    hasattr(self.gat_model, 'sc_cell_expressions') and
+                    self.gat_model.sc_cell_expressions is not None):
+                    
+                    logging.info("正在计算spot-cell级别的动态表达...")
+                    spot_cell_expr_dict = {}
+                    
+                    # deconv_weights: [n_spots, n_clusters]
+                    # dynamic_weights: [n_spots, n_clusters, k]
+                    # knn_indices_tensor: [n_spots, n_clusters, k]
+                    n_spots, n_clusters, k = dynamic_weights.shape
+                    
+                    # cluster到celltype的映射
+                    cluster_to_celltype_map = {}
+                    if self.cluster_to_celltype:
+                        cluster_to_celltype_map = {str(k): str(v) for k, v in self.cluster_to_celltype.items()}
+                    cluster_list = list(self.label_encoder.classes_)
+                    
+                    for spot_idx in range(n_spots):
+                        spot_name = spot_barcodes[spot_idx]
+                        
+                        for cluster_idx, cluster_id in enumerate(cluster_list):
+                            # 获取celltype名称
+                            celltype_name = cluster_to_celltype_map.get(str(cluster_id), f"Cluster_{cluster_id}")
+                            
+                            # 该cluster在该spot的deconv权重（比例）
+                            cluster_proportion = deconv_weights[spot_idx, cluster_idx]
+                            
+                            if cluster_proportion < 1e-6:
+                                continue
+                            
+                            # 获取该cluster的k个nearest cells的索引和权重
+                            cell_indices = knn_indices_tensor[spot_idx, cluster_idx]  # [k]
+                            cell_weights = dynamic_weights[spot_idx, cluster_idx]  # [k]
+                            
+                            # 过滤掉padding（索引为-1）
+                            valid_mask = (cell_indices != -1).cpu()
+                            cell_indices = cell_indices[valid_mask]
+                            cell_weights = cell_weights[valid_mask]
+                            
+                            if len(cell_indices) == 0:
+                                continue
+                            
+                            # 重新归一化权重
+                            cell_weights = cell_weights / (cell_weights.sum() + 1e-8)
+                            
+                            # 计算该spot-cell的表达：加权平均k个cells的表达
+                            # sc_cell_expressions: [n_cells, n_all_genes]
+                            cell_exprs = self.gat_model.sc_cell_expressions[cell_indices]  # [k, n_genes]
+                            weighted_expr = (cell_exprs * cell_weights.unsqueeze(1)).sum(dim=0)  # [n_genes]
+                            
+                            # 缩放：使用全局计算的 scale 因子，确保与 reconstructed_full_expr 一致
+                            # scale: [n_spots, 1]
+                            spot_scale = scale[spot_idx, 0]
+                            scaled_expr = weighted_expr.cpu().numpy() * cluster_proportion * spot_scale
+                            
+                            # 累加到该spot-celltype
+                            key = f"{spot_name}_{celltype_name}"
+                            if key in spot_cell_expr_dict:
+                                spot_cell_expr_dict[key] += scaled_expr
+                            else:
+                                spot_cell_expr_dict[key] = scaled_expr.copy()
+                    
+                    # 转为DataFrame
+                    spot_cell_expr_df = pd.DataFrame.from_dict(
+                        spot_cell_expr_dict, orient='index', columns=all_gene_names
+                    )
+                    spot_cell_expr_df.index.name = 'spot_cell'
+                    
+                    # 过滤全为0的行
+                    row_sums = spot_cell_expr_df.sum(axis=1)
+                    spot_cell_expr_df = spot_cell_expr_df[row_sums > 0]
+                    
+                    # 保存
+                    spot_cell_file = f"{self.output_dir}/{sample_name}_spot_cell_expr.csv"
+                    spot_cell_expr_df.to_csv(spot_cell_file)
+                    logging.info(f"✅ 已保存spot-cell动态表达: {spot_cell_file}, 形状={spot_cell_expr_df.shape}")
         else:
             pass
 

@@ -1,6 +1,6 @@
 """Stage 1 (VAE) training for Spagraph.
 
-Wraps the original SC_MAP_ST/stage1.py implementation behind a clean API.
+Wraps the spagraph/models/stage1.py implementation behind a clean API.
 """
 
 import os

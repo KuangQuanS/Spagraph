@@ -53,6 +53,8 @@ def parse_args():
                        help='最小通讯边数阈值，少于此值的spot将被过滤 (default: 1)')
     parser.add_argument('--spot_cell_expr_csv', type=str, default=None,
                        help='预计算的spot-cell全基因表达CSV文件路径，如果提供则跳过构建步骤')
+    parser.add_argument('--use_hvg_for_communication', type=lambda x: str(x).lower() == 'true', default=True,
+                       help='只使用高变基因计算LR通讯（而非全部基因），减少计算量并保持特征一致性 (default: True)')
 
     # GAT参数
     parser.add_argument('--gat_hidden_dims', type=str, default='512,256,128', help='GAT隐层维度')
@@ -109,47 +111,14 @@ def main(args=None):
     logging.info("阶段1: 加载数据和构建激活基因特征")
     logging.info("="*80)
     
-    # ✅ 使用 deconv_dir 构建所有路径
+    # ========== 加载必要的数据 ==========
     deconv_dir = args.deconv_dir
-    vae_weight_path = os.path.join(deconv_dir, 'final_vae.pth')
-    vae_npz_path = os.path.join(deconv_dir, 'final_vae_cluster_data.npz')
     
-    # 1. 尝试从 stage1 的 npz 文件加载 cluster 信息（用于细胞类型映射）
-    cluster_to_celltype = {}
+    logging.info("="*80)
+    logging.info("阶段1: 加载数据")
+    logging.info("="*80)
     
-    if os.path.exists(vae_npz_path):
-        cluster_data = np.load(vae_npz_path, allow_pickle=True)
-        
-        cluster_ids = cluster_data['cluster_ids']
-        celltype_mapping_array = cluster_data['cluster_to_celltype']
-        cluster_to_celltype = {str(row['cluster_id']): str(row['celltype']) 
-                                for row in celltype_mapping_array}
-        
-        # 加载全基因表达用于构建spot-cell表达
-        expressions_full_array = cluster_data['cluster_expressions_full']  # all genes
-        checkpoint_temp = torch.load(vae_weight_path, map_location='cpu', weights_only=False)
-        all_genes = checkpoint_temp.get('all_genes', None)
-        
-        if all_genes is None:
-            raise ValueError("VAE checkpoint 中找不到 all_genes 列表")
-        
-        cluster_index_names = [f"Cluster_{cid}" for cid in cluster_ids]
-        cluster_full_expr = pd.DataFrame(
-            expressions_full_array,
-            index=cluster_index_names,
-            columns=all_genes
-        )
-        logging.info(f"已从 NPZ 加载 cluster 全基因表达: {cluster_full_expr.shape}")
-        
-    else:
-        # NPZ 文件不存在，无法继续
-        raise FileNotFoundError(f"找不到 Stage 1 NPZ 文件: {vae_npz_path}\n")
-
-    # 2. 构建激活基因特征（用于MLP输入）
-    logging.info("构建激活基因特征...")
-    # 激活基因将在基于重构表达数据后计算
-    
-    # 4. CellChat数据库（用于LR通讯计算）
+    # 1. CellChat数据库（用于LR通讯计算）
     logging.info("加载CellChat LR数据库用于通讯计算...")
     cellchat_file = 'cellchat_human.csv'
     lr_db = pd.read_csv(cellchat_file)
@@ -160,22 +129,21 @@ def main(args=None):
         lr_pairs.append((lig, rec))
     logging.info(f"已加载LR对: {len(lr_pairs)}个")
 
-    # 5. 加载ST数据
+    # 2. 加载ST数据
     adata = sc.read_h5ad(args.st_h5ad)
     logging.info(f"已加载ST数据: {adata.shape}")
     
-    # 6. 加载spot坐标
+    # 3. 加载spot坐标
     spot_coords = adata.obsm['spatial'] if 'spatial' in adata.obsm else None
     if spot_coords is not None:
         logging.info(f"已加载spot坐标: {spot_coords.shape}")
-        # 全局记录spot数，后续统计使用
         n_spots = len(spot_coords)
         logging.info(f"spot数量: {n_spots}")
     else:
         raise ValueError("找不到spot坐标")
 
-    # 7. 加载spot-cluster反卷积比例矩阵
-    cluster_composition_file = os.path.join(deconv_dir, '*_cluster_composition.csv')
+    # 4. 加载spot-cluster反卷积比例矩阵
+    cluster_composition_file = os.path.join(deconv_dir, '*_composition.csv')
     cluster_composition_files = glob.glob(cluster_composition_file)
     cluster_composition = pd.read_csv(cluster_composition_files[0], index_col=0)
 
@@ -183,157 +151,147 @@ def main(args=None):
     n_clusters = cluster_composition.shape[1]
     logging.info(f"cluster数量: {n_clusters}")
     
-    # ========== 阶段1：加载VAE编码器（仅用于获取细胞类型映射） ==========
+    # ========== 阶段2：加载 spot-cell 全基因表达 ==========
     logging.info("="*80)
-    logging.info("阶段1: 加载 deconv checkpoint（仅用于获取基因列表与cluster映射）")
-    logging.info("="*80)
-    
-    # 仅加载VAE checkpoint以获取基因列表和细胞类型映射
-    if os.path.exists(vae_weight_path):
-        checkpoint = torch.load(vae_weight_path, map_location=device, weights_only=False)
-        all_genes = checkpoint.get('all_genes', None)
-        if all_genes is None:
-            raise ValueError("VAE checkpoint 中找不到 all_genes 列表")
-    else:
-        raise FileNotFoundError(f"找不到VAE权重文件: {vae_weight_path}")
-  
-    # ========== 阶段2：构建spot-cell全基因表达 ==========
-    logging.info("="*80)
-    logging.info("阶段2: 构建spot-cell全基因表达")
+    logging.info("阶段2: 加载 spot-cell 全基因表达")
     logging.info("="*80)
     
     spot_names = adata.obs_names.tolist()
     spot_total_counts = np.array(adata.X.sum(axis=1)).flatten()
     logging.info(f"Spot总数: {len(spot_names)}, 平均counts={spot_total_counts.mean():.1f}")
     
-    # 统一cluster名称格式（在if-else之前定义，因为后面需要）
-    cluster_names = [f"Cluster_{c}" if not c.startswith('Cluster_') else c 
-                     for c in cluster_composition.columns]
+    # ✅ 查找第二阶段生成的 spot-cell 动态表达文件
+    stage2_spot_cell_file = None
+    for pattern in ['*_spot_cell_expr.csv']:
+        matches = glob.glob(os.path.join(deconv_dir, pattern))
+        if matches:
+            stage2_spot_cell_file = matches[0]
+            break
     
-    # 检查是否提供了预计算的CSV文件
-    if args.spot_cell_expr_csv is not None and os.path.exists(args.spot_cell_expr_csv):
-        logging.info(f"检测到预计算的spot-cell表达文件: {args.spot_cell_expr_csv}")
-        logging.info("跳过构建步骤，直接加载...")
-        
-        # 直接加载预计算的CSV文件
-        spot_cell_expr_df = pd.read_csv(args.spot_cell_expr_csv, index_col=0)
-        logging.info(f"已加载预计算的spot-cell全基因表达: {spot_cell_expr_df.shape}")
-        
-        # 验证数据格式
-        if spot_cell_expr_df.index.name != 'spot_cell':
-            logging.warning("警告: CSV文件index名称不是'spot_cell'，可能存在格式问题")
-        
-    else:
-        # 正常构建流程
-        # 构建每个spot-cell的全基因表达
-        spot_cell_full_expr = {}
-        for spot_idx, spot_name in enumerate(spot_names):
-            spot_total_count = spot_total_counts[spot_idx]
-            
-            for cell_name, celltype in cluster_to_celltype.items():
-                cluster_key = f"Cluster_{cell_name}"
-                if cluster_key not in cluster_full_expr.index:
-                    continue
-                
-                # 获取cluster在该spot的权重
-                if cluster_key in cluster_names:
-                    cluster_idx = cluster_names.index(cluster_key)
-                    cluster_weight = cluster_composition.iloc[spot_idx, cluster_idx]
-                else:
-                    cluster_weight = 0.0
-                
-                if cluster_weight < 1e-6:
-                    continue
-                
-                # 计算: (cluster_full_expr / 1e4) × cluster_weight × spot_total_count
-                cluster_expr_normalized = cluster_full_expr.loc[cluster_key].values / 1e4
-                spot_cell_expr = cluster_expr_normalized * cluster_weight * spot_total_count
-                
-                # 累加到该spot的celltype表达
-                key = f"{spot_name}_{celltype}"
-                if key in spot_cell_full_expr:
-                    spot_cell_full_expr[key] += spot_cell_expr
-                else:
-                    spot_cell_full_expr[key] = spot_cell_expr.copy()
-        
-        # 转为DataFrame
-        spot_cell_expr_df = pd.DataFrame.from_dict(
-            spot_cell_full_expr, orient='index', columns=cluster_full_expr.columns
+    # 优先使用第二阶段生成的，否则使用用户手动指定的
+    manual_spot_cell_file = args.spot_cell_expr_csv if (args.spot_cell_expr_csv and os.path.exists(args.spot_cell_expr_csv)) else None
+    spot_cell_file_to_load = stage2_spot_cell_file or manual_spot_cell_file
+    
+    if not spot_cell_file_to_load:
+        error_msg = (
+            f"\n{'='*80}\n"
+            f"❌ 找不到 spot-cell 表达文件\n"
+            f"{'='*80}\n"
+            f"需要的文件: *_spot_cell_expr.csv\n"
+            f"搜索目录: {deconv_dir}\n\n"
+            f"解决方案:\n"
+            f"  重新运行 Stage 2 (deconv) 并设置 save_reconstructed_genes=True\n"
+            f"  这会自动生成 spot-cell 动态表达文件\n\n"
+            f"  示例:\n"
+            f"    spg.deconv(\n"
+            f"        vae=vae,\n"
+            f"        st_h5ad='data/st.h5ad',\n"
+            f"        output_dir='{deconv_dir}',\n"
+            f"        save_reconstructed_genes=True  # ← 必须设置\n"
+            f"    )\n"
+            f"{'='*80}\n"
         )
-        spot_cell_expr_df.index.name = 'spot_cell'
-        
-        # 删除全为0的spot-cell（直接过滤，不需要额外的稀有细胞类型过滤）
-        row_sums = spot_cell_expr_df.sum(axis=1)
+        raise FileNotFoundError(error_msg)
+    
+    # 加载 spot-cell 表达
+    if stage2_spot_cell_file:
+        logging.info(f"✅ 使用第二阶段生成的 spot-cell 动态表达: {spot_cell_file_to_load}")
+    else:
+        logging.info(f"使用用户提供的 spot-cell 表达: {spot_cell_file_to_load}")
+    
+    spot_cell_expr_df = pd.read_csv(spot_cell_file_to_load, index_col=0)
+    logging.info(f"已加载 spot-cell 全基因表达: {spot_cell_expr_df.shape}")
+    
+    # 验证数据格式
+    if spot_cell_expr_df.index.name != 'spot_cell':
+        logging.warning("警告: CSV文件index名称不是'spot_cell'，可能存在格式问题")
+    
+    # 过滤全为0的行（如果有）
+    row_sums = spot_cell_expr_df.sum(axis=1)
+    if (row_sums == 0).any():
+        n_zeros = (row_sums == 0).sum()
+        logging.warning(f"过滤掉 {n_zeros} 个表达全为0的 spot-cell")
         spot_cell_expr_df = spot_cell_expr_df[row_sums > 0]
-
-        csv_path = os.path.join(args.output_dir, 'spot_cell_full_expr.csv')
-        spot_cell_expr_df.to_csv(csv_path)
-        logging.info(f"已保存spot-cell全基因表达: {csv_path}, 形状={spot_cell_expr_df.shape}")
     
-    # ========== 基于重构表达数据计算激活基因 ==========
-    logging.info("基于重构表达数据计算激活基因...")
+    logging.info(f"最终 spot-cell 数量: {len(spot_cell_expr_df)}")
     
-    # 使用阈值方法选择激活基因：每个cell中表达值 > threshold 的基因
-    mean_expr_threshold = args.mean_expr_threshold
-    logging.info(f"激活基因选择阈值: normalize_total(1e4) > {mean_expr_threshold}")
+    # ========== 基于 spot-cell 表达选择高变基因 ==========
+    logging.info("="*80)
+    logging.info("阶段3: 选择高变基因作为特征")
+    logging.info("="*80)
     
-    activated_genes_set = set()
-    for spot_cell_name in spot_cell_expr_df.index:
-        expr = spot_cell_expr_df.loc[spot_cell_name].values
-        
-        # 对单个cell进行normalize_total
-        total_count = expr.sum()
-        if total_count > 0:
-            expr_normalized = expr / total_count * 1e4  # [n_genes]
-        else:
-            expr_normalized = expr  # 表达全为0的情况
-        
-        # 筛选表达值 > threshold 的基因
-        active_mask = expr_normalized > mean_expr_threshold
-        active_gene_names = spot_cell_expr_df.columns[active_mask].tolist()
-        activated_genes_set.update(active_gene_names)
+    # ✅ 使用 scanpy 选择高变基因（替代基于阈值的激活基因选择）
+    # 创建临时 AnnData 对象用于高变基因选择
+    temp_adata = sc.AnnData(X=spot_cell_expr_df.values, obs=pd.DataFrame(index=spot_cell_expr_df.index))
+    temp_adata.var_names = spot_cell_expr_df.columns
     
-    activated_genes = sorted(list(activated_genes_set))
-    logging.info(f"激活基因数量: {len(activated_genes)} (基于重构表达数据从{len(spot_cell_expr_df)}个cell中选择)")
+    # normalize_total + log1p + highly_variable_genes
+    sc.pp.normalize_total(temp_adata, target_sum=1e4)
+    sc.pp.log1p(temp_adata)
     
-    # 检查激活基因是否在cluster表达中可用
-    available_activated_genes = [g for g in activated_genes if g in cluster_full_expr.columns]
-    logging.info(f"激活基因在cluster表达中的可用性: {len(available_activated_genes)}/{len(activated_genes)}")
+    n_top_genes = 2000
+    sc.pp.highly_variable_genes(temp_adata, n_top_genes=n_top_genes, flavor='seurat_v3')
     
-    # 为MLP创建输入特征：使用激活基因的cluster表达（无需log1p，这里保持原值）
-    activated_cluster_expr = cluster_full_expr[available_activated_genes].copy()
+    activated_genes = temp_adata.var_names[temp_adata.var['highly_variable']].tolist()
+    logging.info(f"已选择 {len(activated_genes)} 个高变基因（从 {spot_cell_expr_df.shape[1]} 个基因中）")
+    
+    # 所有高变基因都可用（因为是从 spot_cell_expr_df 中选出来的）
+    available_activated_genes = activated_genes
+    logging.info(f"可用的高变基因: {len(available_activated_genes)}")
+    
+    # ✅ 为MLP创建输入特征：从 spot_cell_expr_df 推导 cluster 表达
+    # 从 spot_cell_expr_df 的 index 中提取 celltype 信息
+    # index 格式: "spot_name_celltype"
+    celltype_expr_dict = {}
+    for idx in spot_cell_expr_df.index:
+        # 提取 celltype（最后一个下划线后的部分）
+        parts = idx.rsplit('_', 1)
+        if len(parts) == 2:
+            celltype = parts[1]
+            if celltype not in celltype_expr_dict:
+                celltype_expr_dict[celltype] = []
+            celltype_expr_dict[celltype].append(spot_cell_expr_df.loc[idx, available_activated_genes].values)
+    
+    # 计算每个 celltype 的平均表达
+    activated_cluster_expr_data = []
+    activated_cluster_names = []
+    for celltype, expr_list in celltype_expr_dict.items():
+        avg_expr = np.mean(expr_list, axis=0)
+        activated_cluster_expr_data.append(avg_expr)
+        activated_cluster_names.append(celltype)
+    
+    activated_cluster_expr = pd.DataFrame(
+        activated_cluster_expr_data,
+        index=activated_cluster_names,
+        columns=available_activated_genes
+    )
+    logging.info(f"从 spot-cell 表达推导出 {len(activated_cluster_names)} 个 celltype 的激活基因表达")
 
     # 为Dataset接口创建占位符（实际不会使用）
     cluster_expr = pd.DataFrame(
-        np.zeros((len(cluster_to_celltype), len(available_activated_genes)), dtype=np.float32),
-        index=[f"Cluster_{cid}" for cid in cluster_to_celltype.keys()],
+        np.zeros((len(activated_cluster_names), len(available_activated_genes)), dtype=np.float32),
+        index=activated_cluster_names,
         columns=available_activated_genes
     )
 
-    cluster_to_cell = {}
-    for cluster_id, celltype_name in cluster_to_celltype.items():
-        cluster_name = f"Cluster_{cluster_id}"
-        cluster_to_cell[cluster_name] = celltype_name
-    logging.info(f"已构建cluster-cell映射: {len(cluster_to_cell)} 个cluster映射到 {len(set(cluster_to_cell.values()))} 个cell类型")
-    
     # 提取实际存在的celltype（从spot_cell_expr_df的index中解析）
-    cell_names = sorted(set([idx.split('_', 1)[1] for idx in spot_cell_expr_df.index]))
+    cell_names = sorted(set([idx.rsplit('_', 1)[1] for idx in spot_cell_expr_df.index]))
     logging.info(f"实际存在的细胞类型数: {len(cell_names)}")
-    # 使用spot-cell全表达对每个cell类型做均值，避免全部为0的占位符
+    
+    # 使用spot-cell全表达对每个cell类型做均值，构建cell_expr
     cell_expr_mean = spot_cell_expr_df.copy()
-    cell_expr_mean['celltype'] = [idx.split('_', 1)[1] for idx in spot_cell_expr_df.index]
+    cell_expr_mean['celltype'] = [idx.rsplit('_', 1)[1] for idx in spot_cell_expr_df.index]
     cell_expr = cell_expr_mean.groupby('celltype')[available_activated_genes].mean().reindex(cell_names).fillna(0.0)
     
-    cell_full_expr = cell_expr_mean.groupby('celltype')[cluster_full_expr.columns].mean().reindex(cell_names).fillna(0.0)
+    # cell_full_expr 使用所有基因
+    all_gene_cols = [col for col in spot_cell_expr_df.columns if col != 'celltype']
+    cell_full_expr = cell_expr_mean.groupby('celltype')[all_gene_cols].mean().reindex(cell_names).fillna(0.0)
 
-    composition = pd.DataFrame(0.0, index=cluster_composition.index, columns=cell_names)
-    for spot_idx in range(len(cluster_composition)):
-        for cluster_idx, cluster_name in enumerate(cluster_names):
-            celltype = cluster_to_cell.get(cluster_name)
-            if celltype and celltype in cell_names:  # 只处理实际存在的细胞类型
-                composition.iloc[spot_idx, composition.columns.get_loc(celltype)] += cluster_composition.iloc[spot_idx, cluster_idx]
-    
+    # 直接使用 cluster_composition 作为 composition（假设列名已经是 celltype）
+    # 如果列名与 cell_names 不完全匹配，重新索引以对齐
+    composition = cluster_composition.reindex(columns=cell_names, fill_value=0.0)
     logging.info(f"Composition矩阵形状: {composition.shape}")
+    logging.info(f"Composition列（celltype）: {list(composition.columns)}")
     
     # ========== 阶段3.5：预计算KNN邻域和LR通讯得分 ==========
     logging.info("="*80)
@@ -348,7 +306,8 @@ def main(args=None):
         adata=adata,
         cell_full_expr=spot_cell_expr_df,  
         output_dir=args.output_dir,
-        n_neighbors=args.n_spot_neighbors
+        n_neighbors=args.n_spot_neighbors,
+        hvg_genes=available_activated_genes if args.use_hvg_for_communication else None
     )
     
     dataset = STHeteroSubgraphDataset(

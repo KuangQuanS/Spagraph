@@ -966,7 +966,9 @@ class SpatialDeconvolutionLoss(nn.Module):
             reconstructed_spot_full = mixed_expr_full * 10.0
         else:
             # 使用 spot_total_counts 进行缩放
-            batch_spot_total_counts = self.spot_total_counts[:batch_size]
+            # ✅ 修复：使用传入的 batch_spot_total_counts（对应当前 batch 的实际 spots）
+            if batch_spot_total_counts is None:
+                raise ValueError("batch_spot_total_counts is required when scale_basis != 'none' or 'fixed_10'")
             spot_counts = batch_spot_total_counts.unsqueeze(-1)  # [batch_size, 1]
 
             if self.scale_basis == "all":

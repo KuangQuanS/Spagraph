@@ -785,7 +785,7 @@ class SpatialDeconvolutionLoss(nn.Module):
                  lambda_reg=0.5, lambda_sparse=0.01,
                  lambda_proportion=1.0, sc_celltype_proportions=None, spot_total_counts=None,
                  celltype_expressions_full=None, marker_gene_indices=None,
-                 hvg_gene_indices=None, scale_basis: str = "hvg"):
+                 hvg_gene_indices=None, scale_basis: str = "hvg", library_size: float = 1.0):
         super().__init__()
         self.lambda_pearson = lambda_pearson      # Pearson损失权重
         self.lambda_mse = lambda_mse              # MSE损失权重
@@ -796,6 +796,7 @@ class SpatialDeconvolutionLoss(nn.Module):
         self.lambda_sparse = lambda_sparse        # 稀疏性正则化权重
         self.lambda_proportion = lambda_proportion  # 细胞类型比例一致性权重
         self.scale_basis = scale_basis            # 用于缩放的基因集合: marker / hvg / all / none / fixed_10
+        self.library_size = library_size          # 手动文库因子
         
         # 当 scale_basis='none' 或 'fixed_10' 时允许为 None（不需要spot_total_counts）
         if spot_total_counts is None and scale_basis not in ['none', 'fixed_10']:
@@ -982,7 +983,7 @@ class SpatialDeconvolutionLoss(nn.Module):
                 mixed_basis_totals = mixed_expr_full[:, self.marker_gene_indices].sum(dim=1, keepdim=True)
 
             scale = spot_counts / (mixed_basis_totals + 1e-8)
-            reconstructed_spot_full = mixed_expr_full * scale  # [batch_size, n_all_genes]
+            reconstructed_spot_full = mixed_expr_full * scale * self.library_size  # ✅ 乘以 library_size
         
         # 提取 marker 基因: 只在 marker 基因上计算 loss
         reconstructed_spot_marker = reconstructed_spot_full[:, self.marker_gene_indices]  # [batch_size, n_marker_genes]

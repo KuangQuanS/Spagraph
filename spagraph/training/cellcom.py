@@ -22,10 +22,12 @@ def run_cellcom(
     # Graph parameters
     n_spot_neighbors: int = 6,
     # LR communication parameters
-    mean_expr_threshold: float = 1.0,
+    mean_expr_threshold: float = 1.0,  # deprecated, not used as fallback
+    active_expr_threshold: float = 3.0,  # 活跃基因阈值（CP10k）
+    lr_score_threshold: float = 0,  # LR得分阈值（log1p 空间）
     min_comm_edges: int = 1,
     spot_cell_expr_csv: Optional[str] = None,  # 可选，优先使用deconv_dir中的动态表达
-    use_hvg_for_communication: bool = True,  # 只使用高变基因计算通讯（默认启用）
+    use_hvg_for_communication: bool = True,  # 只使用高变基因计算通讯（默认启用）、
     # GAT parameters
     gat_hidden_dims: str = '512,256,128',
     gat_heads: int = 8,
@@ -140,6 +142,8 @@ def run_cellcom(
         mlp_hidden_dims=mlp_hidden_dims,
         n_spot_neighbors=n_spot_neighbors,
         mean_expr_threshold=mean_expr_threshold,
+        active_expr_threshold=active_expr_threshold,
+        lr_score_threshold=lr_score_threshold,
         min_comm_edges=min_comm_edges,
         spot_cell_expr_csv=spot_cell_expr_csv,
         use_hvg_for_communication=use_hvg_for_communication,

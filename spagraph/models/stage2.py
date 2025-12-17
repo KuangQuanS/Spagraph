@@ -54,7 +54,8 @@ class GATDeconvolution:
     2. 内存模式：通过 stage1_artifacts 直接传入
     """
     def __init__(self, stage1_model_path: str = None, output_dir: str = "./stage2_results/", 
-                 device: str = None, weight_threshold: float = 0.01, stage1_artifacts=None, seed: int = 42):
+                 device: str = None, weight_threshold: float = 0.01, stage1_artifacts=None, seed: int = 42,
+                 use_ols_scaling: bool = False, library_size: float = 1.0):
 
         # Set random seed first
         import random
@@ -82,6 +83,8 @@ class GATDeconvolution:
         
         # Output options
         self.save_reconstructed_genes = False  # 是否保存重构的全基因表达
+        self.use_ols_scaling = use_ols_scaling  # 是否使用 OLS 最小二乘缩放（默认 False 使用 sum-based）
+        self.library_size = library_size  # 手动文库因子，在 scale 基础上再乘此值（默认 1.0 不改变）
 
         # Model components
         self.vae_encoder = None
@@ -135,6 +138,7 @@ class GATDeconvolution:
         self.cluster_to_celltype = artifacts.cluster_to_celltype
         self.all_genes = artifacts.all_genes
         self.hvg_genes_union = artifacts.hvg_genes_union
+        self.auto_library_size = getattr(artifacts, 'auto_library_size', 1.0)  # ✅ 加载自动计算的library_size
         
         # 加载聚类中心和表达
         if artifacts.celltype_prototypes is not None:
@@ -364,7 +368,8 @@ class GATDeconvolution:
             celltype_expressions_full=celltype_expr_full,
             marker_gene_indices=marker_gene_indices,
             hvg_gene_indices=hvg_gene_indices,
-            scale_basis=getattr(self, "scale_basis", "hvg")
+            scale_basis=getattr(self, "scale_basis", "hvg"),
+            library_size=self.library_size  # ✅ 传递 library_size 到 loss function
         ).to(self.device)  # ✅ Move loss function to device
         
     def train_epoch_batched(self, 
@@ -747,20 +752,100 @@ class GATDeconvolution:
                     raise ValueError("spot_total_counts not set; cannot compute scale factor.")
                 spot_counts = self.spot_total_counts[:len(spot_barcodes)]
                 
+                # 获取基因子集（用于计算 scale）
                 if scale_basis == "all":
-                    # 使用全部基因总量
-                    mixed_basis_totals = mixed_expr_full.sum(axis=1, keepdims=True)
+                    # 使用全部基因
+                    basis_indices = list(range(len(self.all_genes)))
                 elif scale_basis == "hvg" and self.hvg_genes_union is not None:
                     # 使用 HVG 交集
-                    hvg_indices = [i for i, g in enumerate(self.all_genes) if g in self.hvg_genes_union]
-                    mixed_basis_totals = mixed_expr_full[:, hvg_indices].sum(axis=1, keepdims=True)
+                    basis_indices = [i for i, g in enumerate(self.all_genes) if g in self.hvg_genes_union]
                 else:
                     # 默认：使用 marker 子集
-                    marker_indices = [i for i, g in enumerate(self.all_genes) if g in self.marker_genes]
-                    mixed_basis_totals = mixed_expr_full[:, marker_indices].sum(axis=1, keepdims=True)
+                    basis_indices = [i for i, g in enumerate(self.all_genes) if g in self.genes]
                 
-                scale = spot_counts[:, np.newaxis] / (mixed_basis_totals + 1e-8)
-                reconstructed_full_expr = mixed_expr_full * scale
+                # 提取子集用于计算 scale
+                mixed_basis = mixed_expr_full[:, basis_indices]  # [n_spots, n_basis_genes]
+                
+                # 获取真实观测（用于 OLS）
+                if scale_basis == "all":
+                    # 确保 obs_basis_raw 与 mixed_basis 的基因完全对齐
+                    # mixed_basis 是基于 self.all_genes 的
+                    # obs_basis_raw 必须也是基于 self.all_genes 的
+                    
+                    # 1. 找出 self.all_genes 中哪些在 st_adata 中存在
+                    valid_gene_indices = [i for i, g in enumerate(self.all_genes) if g in st_adata.var_names]
+                    valid_genes = [self.all_genes[i] for i in valid_gene_indices]
+                    
+                    # 2. 提取 ST 数据中存在的基因
+                    st_subset = st_adata[:, valid_genes]
+                    obs_basis_subset = st_subset.X.toarray() if hasattr(st_subset.X, 'toarray') else st_subset.X
+                    
+                    # 3. 提取 mixed_basis 中对应的列
+                    mixed_basis_subset = mixed_basis[:, valid_gene_indices]
+                    
+                    # 4. 使用对齐后的子集进行计算
+                    obs_basis_raw = obs_basis_subset
+                    mixed_basis = mixed_basis_subset
+                    
+                elif scale_basis == "hvg" and self.hvg_genes_union is not None:
+                    # 类似处理 HVG
+                    valid_hvg_indices = [i for i, g in enumerate(self.hvg_genes_union) if g in st_adata.var_names]
+                    valid_hvgs = [self.hvg_genes_union[i] for i in valid_hvg_indices]
+                    
+                    # 提取 ST
+                    st_subset = st_adata[:, valid_hvgs]
+                    obs_basis_raw = st_subset.X.toarray() if hasattr(st_subset.X, 'toarray') else st_subset.X
+                    
+                    # 提取 mixed (注意 mixed_basis 已经是 hvg 子集了，这里需要再次对齐)
+                    # mixed_basis 现在的列对应 self.hvg_genes_union
+                    mixed_basis = mixed_basis[:, valid_hvg_indices]
+                    
+                else:
+                    # Marker 模式通常基因都在，但为了保险也可以加检查
+                    valid_marker_indices = [i for i, g in enumerate(self.genes) if g in st_adata.var_names]
+                    valid_markers = [self.genes[i] for i in valid_marker_indices]
+                    
+                    st_subset = st_adata[:, valid_markers]
+                    obs_basis_raw = st_subset.X.toarray() if hasattr(st_subset.X, 'toarray') else st_subset.X
+                    
+                    # mixed_basis 对应 self.genes
+                    mixed_basis = mixed_basis[:, valid_marker_indices]
+                
+                # ========== 选择缩放方法 ==========
+                if self.use_ols_scaling:
+                    # ✅ OLS（最小二乘）缩放：s = (m·y) / (m·m)
+                    print("🔧 使用 OLS 最小二乘缩放")
+                    eps = 1e-8
+                    numer = (mixed_basis * obs_basis_raw).sum(axis=1)  # [n_spots]
+                    denom = (mixed_basis * mixed_basis).sum(axis=1) + eps  # [n_spots]
+                    scale = numer / denom  # [n_spots]
+                    
+                    # 数值稳健处理：裁剪到合理范围
+                    scale_min, scale_max = 0.01, 100.0
+                    n_clipped_low = (scale < scale_min).sum()
+                    n_clipped_high = (scale > scale_max).sum()
+                    scale = np.clip(scale, scale_min, scale_max)
+                    
+                    if n_clipped_low > 0 or n_clipped_high > 0:
+                        print(f"⚠️  OLS scale 裁剪: {n_clipped_low} spots < {scale_min}, {n_clipped_high} spots > {scale_max}")
+                    
+                    scale = scale[:, np.newaxis]  # [n_spots, 1]
+                else:
+                    # 原始 sum-based 缩放
+                    print("🔧 使用 sum-based 缩放")
+                    mixed_basis_totals = mixed_basis.sum(axis=1, keepdims=True)  # [n_spots, 1]
+                    scale = spot_counts[:, np.newaxis] / (mixed_basis_totals + 1e-8)
+                
+                # 输出 scale 统计（便于诊断）
+                scale_vals = scale.ravel()
+                print(f"📊 Scale 统计: mean={scale_vals.mean():.4f}, median={np.median(scale_vals):.4f}, "
+                           f"min={scale_vals.min():.4f}, max={scale_vals.max():.4f}, "
+                           f"Q25={np.percentile(scale_vals, 25):.4f}, Q75={np.percentile(scale_vals, 75):.4f}")
+                
+                # ✅ 应用 library_size 因子（在 scale 之后）
+                reconstructed_full_expr = mixed_expr_full * scale * self.library_size
+                if self.library_size != 1.0:
+                    print(f"📚 Library size factor: {self.library_size}")
             
             # Get full gene names
             if self.all_genes is not None:
@@ -834,10 +919,10 @@ class GATDeconvolution:
                             cell_exprs = self.gat_model.sc_cell_expressions[cell_indices]  # [k, n_genes]
                             weighted_expr = (cell_exprs * cell_weights.unsqueeze(1)).sum(dim=0)  # [n_genes]
                             
-                            # 缩放：使用全局计算的 scale 因子，确保与 reconstructed_full_expr 一致
+                            # 缩放：使用全局计算的 scale 因子和 library_size 因子，确保与 reconstructed_full_expr 一致
                             # scale: [n_spots, 1]
                             spot_scale = scale[spot_idx, 0]
-                            scaled_expr = weighted_expr.cpu().numpy() * cluster_proportion * spot_scale
+                            scaled_expr = weighted_expr.cpu().numpy() * cluster_proportion * spot_scale * self.library_size
                             
                             # 累加到该spot-celltype
                             key = f"{spot_name}_{celltype_name}"

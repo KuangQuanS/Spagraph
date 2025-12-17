@@ -48,7 +48,12 @@ def parse_args():
     
     # LR通讯参数
     parser.add_argument('--mean_expr_threshold', type=float, default=3.0, 
-                       help='激活基因选择和LR通讯的平均表达阈值 (normalize_total 1e4后，default: 5.0)')
+                       help='（已弃用）通用阈值：保留以兼容旧脚本，不再作为默认回退使用')
+
+    parser.add_argument('--active_expr_threshold', type=float, default=3.0,
+                       help='活跃基因阈值（CP10k，线性空间）。默认=3.0')
+    parser.add_argument('--lr_score_threshold', type=float, default=3.0,
+                       help='LR 通讯得分阈值（log1p 空间）。默认=3.0')
     parser.add_argument('--min_comm_edges', type=int, default=1, 
                        help='最小通讯边数阈值，少于此值的spot将被过滤 (default: 1)')
     parser.add_argument('--spot_cell_expr_csv', type=str, default=None,

@@ -73,8 +73,13 @@ def calculate_lr_scores(
 
     # ✅ 计算并保存LR通讯得分矩阵（使用 output_dir）
     logging.info("开始计算LR通讯得分...")
-    logging.info(f"   - 活跃基因筛选: normalize_total(1e4) > {args.mean_expr_threshold}")
-    logging.info(f"   - 通讯得分过滤阈值: {args.mean_expr_threshold} (与活跃基因阈值一致)")
+
+    # 阈值选择：使用独立参数（不再回退到 mean_expr_threshold）
+    active_expr_threshold = getattr(args, 'active_expr_threshold', 3.0)
+    lr_score_threshold = getattr(args, 'lr_score_threshold', 3.0)
+
+    logging.info(f"   - 活跃基因筛选 (CP10k): normalize_total(1e4) > {active_expr_threshold}")
+    logging.info(f"   - LR 通讯得分阈值 (log1p space): {lr_score_threshold}")
     logging.info(f"   - 通讯得分计算: 配体×受体表达相乘后取sqrt，再log1p变换（处理长尾分布）")
 
     # ✅ 调试：检查KNN mask状态
@@ -146,7 +151,7 @@ def calculate_lr_scores(
     cell_active_genes_ligand = {}  # spot_cell_key -> set of active ligand gene indices
     cell_active_genes_receptor = {}  # spot_cell_key -> set of active receptor gene indices
 
-    mean_expr_threshold = args.mean_expr_threshold  # 表达阈值
+    # 使用之前计算的 active_expr_threshold 作为活跃基因筛选阈值（CP10k 空间）
     
     # 过滤掉不参与通讯的基因索引（提前计算）
     filtered_gene_indices = set()
@@ -167,8 +172,8 @@ def calculate_lr_scores(
         else:
             cell_expr_normalized = cell_expr  # 表达全为0的情况
         
-        # 筛选活跃基因：归一化后的表达值 > threshold
-        active_mask = cell_expr_normalized > mean_expr_threshold
+        # 筛选活跃基因：归一化后的表达值 > active_expr_threshold（CP10k）
+        active_mask = cell_expr_normalized > active_expr_threshold
         active_gene_indices = set(np.where(active_mask)[0]) - filtered_gene_indices
         
         # ✅ 如果启用HVG限制，进一步过滤只保留HVG
@@ -310,8 +315,8 @@ def calculate_lr_scores(
                         # ✅ 对通讯得分应用log1p变换，处理长尾分布
                         score = np.log1p(score)
 
-                        # ✅ 过滤低于阈值的通讯事件
-                        if score >= args.mean_expr_threshold:
+                        # ✅ 过滤低于阈值的通讯事件（使用 lr_score_threshold，log1p 空间）
+                        if score >= lr_score_threshold:
                             # ✅ 计算距离，用于后续伪标签生成
                             distance = np.sqrt((spot_coords[i, 0] - spot_coords[j, 0])**2 +
                                               (spot_coords[i, 1] - spot_coords[j, 1])**2)
@@ -335,9 +340,9 @@ def calculate_lr_scores(
     logging.info(f"   - 处理的邻居对: {total_pairs}")
     logging.info(f"   - 跳过同类型细胞对: {same_celltype_skipped}")
 
-    # ✅ 如果设置了阈值，输出过滤统计
-    if args.mean_expr_threshold > 0:
-        logging.info(f"   - 通讯得分阈值过滤: score >= {args.mean_expr_threshold}")
+    # ✅ 如果设置了阈值，输出过滤统计（显示 LR 阈值，log1p 空间）
+    if lr_score_threshold > 0:
+        logging.info(f"   - 通讯得分阈值过滤: score >= {lr_score_threshold} (log1p space)")
 
     # ✅ 使用 output_dir 保存 LR 通讯得分
     csv_path = os.path.join(output_dir, "lr_scores.csv")

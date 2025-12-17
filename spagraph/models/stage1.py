@@ -138,6 +138,52 @@ class coEncoder:
             marker_selection_method: Method for marker gene selection ('l1', 'variance', 'correlation')
         """
 
+        # ✅ 0. 最开始就计算 auto_library_size（用原始count）
+        try:
+            # 复制原始数据用于HVG计算
+            sc_hvg_adata = sc_adata.copy()
+            sc.pp.normalize_total(sc_hvg_adata, target_sum=1e4)
+            sc.pp.log1p(sc_hvg_adata)
+            sc.pp.highly_variable_genes(
+                sc_hvg_adata,
+                n_top_genes=min(2000, sc_hvg_adata.shape[1]),
+                flavor="seurat"
+            )
+            sc_hvg_genes = list(sc_hvg_adata.var.index[sc_hvg_adata.var["highly_variable"]])
+            
+            if len(sc_hvg_genes) > 0:
+                # 找出在ST中也存在的HVG
+                sc_hvg_in_st = [g for g in sc_hvg_genes if g in st_adata.var_names]
+                
+                if len(sc_hvg_in_st) > 0:
+                    # 用原始count计算总和
+                    sc_hvg_subset = sc_adata[:, sc_hvg_in_st]
+                    sc_hvg_raw = sc_hvg_subset.X.toarray() if hasattr(sc_hvg_subset.X, 'toarray') else sc_hvg_subset.X
+                    sc_hvg_total_count = sc_hvg_raw.sum()
+                    
+                    st_hvg_subset = st_adata[:, sc_hvg_in_st]
+                    st_hvg_raw = st_hvg_subset.X.toarray() if hasattr(st_hvg_subset.X, 'toarray') else st_hvg_subset.X
+                    st_hvg_total_count = st_hvg_raw.sum()
+                    
+                    if st_hvg_total_count > 0 and sc_hvg_total_count > 0:
+                        self.auto_library_size =  sc_hvg_total_count / st_hvg_total_count
+                        print(f"✅ 自动计算 library_size factor: {self.auto_library_size:.4f}")
+                        print(f"   - SC HVG 总count: {sc_hvg_total_count:.0f}")
+                        print(f"   - ST HVG 总count: {st_hvg_total_count:.0f}")
+                        print(f"   - 使用HVG基因数: {len(sc_hvg_in_st)}")
+                    else:
+                        self.auto_library_size = 1.0
+                        print("⚠️  无法计算 library_size (count=0)，使用默认值 1.0")
+                else:
+                    self.auto_library_size = 1.0
+                    print("⚠️  SC HVG 在 ST 中无交集，library_size 使用默认值 1.0")
+            else:
+                self.auto_library_size = 1.0
+                print("⚠️  SC HVG 为空，library_size 使用默认值 1.0")
+        except Exception as e:
+            self.auto_library_size = 1.0
+            print(f"⚠️  计算 library_size 失败: {e}，使用默认值 1.0")
+
         # 1. Compute clusters and marker genes  
         if precomputed_marker_file is not None:
             # Load precomputed marker genes
@@ -212,6 +258,7 @@ class coEncoder:
         
         st_X = st_subset.X.toarray() if hasattr(st_subset.X, 'toarray') else st_subset.X
 
+        # ✅ 计算 SC/ST HVG 交集（保留用于Stage2的scale_basis='hvg'）
         try:
             # SC HVG
             sc_hvg = sc_adata_count.copy()
@@ -231,11 +278,12 @@ class coEncoder:
             )
             st_hvg_genes = list(st_hvg.var.index[st_hvg.var["highly_variable"]])
 
-            # 交集
+            # SC/ST HVG 交集（用于Stage2的scale_basis='hvg'）
             hvg_intersection = list(sorted(set(sc_hvg_genes) & set(st_hvg_genes)))
             self.hvg_genes_union = hvg_intersection
         except Exception as e:
             self.hvg_genes_union = None
+            print(f"⚠️  计算 HVG 交集失败: {e}")
         
         # 4. Ensure SC and ST feature dimensions are consistent
         final_genes = [g for g in self.marker_genes 
@@ -632,6 +680,7 @@ class coEncoder:
             'celltype_expressions': expressions_array,
             'celltype_expressions_full': expressions_full_list,
             'hvg_genes_union': getattr(self, 'hvg_genes_union', None),
+            'auto_library_size': getattr(self, 'auto_library_size', 1.0),  # ✅ 自动计算的library_size
             # ===== 动态cluster所需数据 =====
             'sc_cell_embeddings': self.sc_cell_embeddings,  # [n_sc_cells, latent_dim]
             'sc_cell_expressions_raw': self.sc_cell_expressions_raw,  # [n_sc_cells, n_all_genes] 所有基因原始count

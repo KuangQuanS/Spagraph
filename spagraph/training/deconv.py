@@ -58,6 +58,7 @@ class Stage1Artifacts:
     celltype_expressions: Optional[Any] = None  # numpy array or tensor
     celltype_expressions_full: Optional[Any] = None  # list of arrays
     hvg_genes_union: Optional[Any] = None
+    auto_library_size: Optional[float] = None  # ✅ Stage1自动计算的library_size (ST_HVG_depth / SC_HVG_depth)
     
     # ST 数据相关（在 run_deconv 中计算并保存，用于重建基因表达时缩放）
     spot_total_counts: Optional[Any] = None  # [n_spots] array
@@ -106,6 +107,7 @@ class Stage1Artifacts:
             celltype_expressions=results.get('celltype_expressions'),
             celltype_expressions_full=results.get('celltype_expressions_full'),
             hvg_genes_union=results.get('hvg_genes_union'),
+            auto_library_size=results.get('auto_library_size', 1.0),  # ✅ 传递自动计算的library_size
             # 动态cluster数据
             sc_cell_embeddings=results.get('sc_cell_embeddings'),
             sc_cell_expressions_raw=results.get('sc_cell_expressions_raw'),
@@ -149,6 +151,8 @@ def run_deconv(
     # Other
     weight_threshold: float = 0.001,
     scale_basis: str = 'all',
+    use_ols_scaling: bool = False,  # 是否使用 OLS 最小二乘缩放（纯数学方法，非模型参数）
+    library_size: float = 1.0,  # 手动文库因子，在 scale 基础上再乘此值（默认 1.0）
     device: Optional[str] = None,
     seed: int = 42,
     _silent_header: bool = False,  # 内部参数：禁止打印配置头部
@@ -197,6 +201,8 @@ def run_deconv(
         # 其他
         weight_threshold: deconv 权重阈值（小于此值的权重置零）
         scale_basis: 缩放基准（'all', 'hvg', 'marker', 'none', 'fixed_10'）
+        use_ols_scaling: 是否使用 OLS 最小二乘缩放（True=OLS，False=sum-based，纯数学方法）
+        library_size: 手动文库因子，在 scale 基础上再乘此值（默认 1.0，>1 放大，<1 缩小）
         device: 计算设备（'cuda' 或 'cpu'）
         seed: 随机种子
         
@@ -234,6 +240,12 @@ def run_deconv(
     if st_file is None:
         raise ValueError("st_file is required")
 
+    # ✅ 如果用户未手动指定 library_size，使用 Stage1 自动计算的值
+    if library_size == 1.0 and hasattr(vae, 'auto_library_size') and vae.auto_library_size is not None:
+        library_size = vae.auto_library_size
+        if not _silent_header:
+            print(f"✅ 使用 Stage1 自动计算的 library_size: {library_size:.4f}")
+
     # 打印Stage 2配置信息（在网格搜索前）
     sample_name = Path(st_file).stem
     if not _silent_header:
@@ -267,6 +279,8 @@ def run_deconv(
             print(f"  K Cells/Cluster:  {k_cells_per_cluster}")
             print(f"  Precompute KNN:   {precompute_knn}")
         print(f"Scale Basis:        {scale_basis}")
+        print(f"OLS Scaling:        {'✅ Enabled' if use_ols_scaling else 'Disabled (sum-based)'}")
+        print(f"Library Size:       {library_size}")
         print(f"Weight Threshold:   {weight_threshold}")
         print(f"Seed:               {seed}")
         print(f"Save to Disk:       {bool(output_dir)}")
@@ -304,6 +318,8 @@ def run_deconv(
             precompute_knn=precompute_knn,
             weight_threshold=weight_threshold,
             scale_basis=scale_basis,
+            use_ols_scaling=use_ols_scaling,  # ✅ 传递 OLS 参数到网格搜索
+            library_size=library_size,  # ✅ 传递 library_size 到网格搜索
             device=device,
             seed=seed
         )
@@ -334,7 +350,9 @@ def run_deconv(
         device=device,
         weight_threshold=weight_threshold,
         stage1_artifacts=vae if use_memory_mode else None,
-        seed=seed
+        seed=seed,
+        use_ols_scaling=use_ols_scaling,  # ✅ 传递 OLS 缩放参数
+        library_size=library_size  # ✅ 传递 library_size
     )
     trainer.k_spatial = k_spatial
     trainer.scale_basis = scale_basis

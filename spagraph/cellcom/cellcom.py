@@ -1,7 +1,7 @@
 import argparse
 import glob
-import logging
 import os
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -17,8 +17,8 @@ from .cellcom_model import HeteroSTModel
 from .cellcom_graph_builder import (
     STHeteroSubgraphDataset,
     hetero_subgraph_collate_fn,
+    hetero_subgraph_collate_fn_batched,
     set_seed,
-    setup_logging,
 )
 from .cellcom_evaluate import evaluate_cell_communication, plot_training_loss
 from .lr_scores import calculate_lr_scores
@@ -31,6 +31,40 @@ def _scalar(x):
         return x.item()
     except Exception:
         return float(x)
+
+def _print_stage3_header(args, device: torch.device):
+    sample_name = Path(args.st_h5ad).stem if getattr(args, "st_h5ad", None) else "Unknown"
+    gat_hidden_dims = [x.strip() for x in str(args.gat_hidden_dims).split(",") if x.strip()]
+
+    print(f"\n{'='*60}")
+    print("Stage 3: Cell Communication")
+    print(f"{'='*60}")
+    print(f"Sample:             {sample_name}")
+    print(f"Device:             {device}")
+    print(f"Epochs:             {args.epochs}")
+    print(f"LR:                 {args.learning_rate}")
+    print(f"Batch Size:         {args.batch_size}")
+    print(f"Num Workers:        {getattr(args, 'num_workers', 0)}")
+    print(f"K Spot Neighbors:   {args.n_spot_neighbors}")
+    print(f"Use HVG for Comm:   {args.use_hvg_for_communication}")
+    print(f"Active Expr Thr:    {args.active_expr_threshold}")
+    print(f"LR Score Thr:       {args.lr_score_threshold}")
+    print(f"Min Comm Edges:     {args.min_comm_edges}")
+    print(f"Attention Thr:      {args.attention_threshold}")
+    print(f"MLP:               {args.mlp_hidden_dims} -> {args.mlp_latent_dim}")
+    print(f"GAT Architecture:   {len(gat_hidden_dims)}L × [{', '.join(gat_hidden_dims)}]D × {args.gat_heads}H")
+    print(f"Dropout:            {args.gat_dropout}")
+    print("Loss Weights:")
+    print(f"  Mask Recon:       {args.lambda_mask_recon} (ratio={args.edge_mask_ratio})")
+    print(f"  Node Recon:       {args.lambda_node_recon} (ratio={args.node_mask_ratio})")
+    print(f"Mask Seed:          {args.mask_seed}")
+    if getattr(args, "early_stop_patience", 0) > 0:
+        print(f"Early Stop:         patience={args.early_stop_patience}, min_delta={args.early_stop_min_delta}")
+    else:
+        print("Early Stop:         Disabled")
+    print(f"Seed:               {args.seed}")
+    print(f"Output Dir:         {args.output_dir}")
+    print(f"{'='*60}\n")
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Heterogeneous ST Communication Model Training')
@@ -81,6 +115,7 @@ def parse_args():
 
     # 训练参数
     parser.add_argument('--batch_size', type=int, default=4, help='批次大小 (已支持真正的批处理)')
+    parser.add_argument('--num_workers', type=int, default=0, help='DataLoader worker数量 (default: 0)')
     parser.add_argument('--epochs', type=int, default=100, help='训练轮数')
     parser.add_argument('--learning_rate', type=float, default=1e-4, help='学习率')
     parser.add_argument('--weight_decay', type=float, default=1e-5, help='权重衰减')
@@ -102,29 +137,19 @@ def main(args=None):
     
     # 创建输出目录
     os.makedirs(args.output_dir, exist_ok=True)
-    setup_logging(os.path.join(args.output_dir, 'training.log'))
-    logging.info("="*80)
-    logging.info("="*80)
     set_seed(args.seed)
     
     # 设置设备
     device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
-    logging.info(f'使用设备: {device}')
+    _print_stage3_header(args, device)
     
     # ========== 阶段1：加载数据和构建激活基因特征 ==========
-    logging.info("="*80)
-    logging.info("阶段1: 加载数据和构建激活基因特征")
-    logging.info("="*80)
+    print(f"{'='*60}\nStage 3.1: Load Data\n{'='*60}")
     
     # ========== 加载必要的数据 ==========
     deconv_dir = args.deconv_dir
     
-    logging.info("="*80)
-    logging.info("阶段1: 加载数据")
-    logging.info("="*80)
-    
     # 1. CellChat数据库（用于LR通讯计算）
-    logging.info("加载CellChat LR数据库用于通讯计算...")
     cellchat_file = 'cellchat_human.csv'
     lr_db = pd.read_csv(cellchat_file)
     lr_pairs = []
@@ -132,18 +157,17 @@ def main(args=None):
         lig = str(row['ligand']).strip()
         rec = str(row['receptor']).strip()
         lr_pairs.append((lig, rec))
-    logging.info(f"已加载LR对: {len(lr_pairs)}个")
+    print(f"LR pairs:           {len(lr_pairs)}")
 
     # 2. 加载ST数据
     adata = sc.read_h5ad(args.st_h5ad)
-    logging.info(f"已加载ST数据: {adata.shape}")
+    print(f"ST shape:           {adata.shape}")
     
     # 3. 加载spot坐标
     spot_coords = adata.obsm['spatial'] if 'spatial' in adata.obsm else None
     if spot_coords is not None:
-        logging.info(f"已加载spot坐标: {spot_coords.shape}")
         n_spots = len(spot_coords)
-        logging.info(f"spot数量: {n_spots}")
+        print(f"Spots:              {n_spots}")
     else:
         raise ValueError("找不到spot坐标")
 
@@ -154,16 +178,14 @@ def main(args=None):
 
     # 记录cluster数量
     n_clusters = cluster_composition.shape[1]
-    logging.info(f"cluster数量: {n_clusters}")
+    print(f"Clusters:           {n_clusters}")
     
     # ========== 阶段2：加载 spot-cell 全基因表达 ==========
-    logging.info("="*80)
-    logging.info("阶段2: 加载 spot-cell 全基因表达")
-    logging.info("="*80)
+    print(f"\n{'='*60}\nStage 3.2: Load Spot-Cell Expression\n{'='*60}")
     
     spot_names = adata.obs_names.tolist()
     spot_total_counts = np.array(adata.X.sum(axis=1)).flatten()
-    logging.info(f"Spot总数: {len(spot_names)}, 平均counts={spot_total_counts.mean():.1f}")
+    print(f"Avg spot counts:    {spot_total_counts.mean():.1f}")
     
     # ✅ 查找第二阶段生成的 spot-cell 动态表达文件
     stage2_spot_cell_file = None
@@ -200,30 +222,28 @@ def main(args=None):
     
     # 加载 spot-cell 表达
     if stage2_spot_cell_file:
-        logging.info(f"✅ 使用第二阶段生成的 spot-cell 动态表达: {spot_cell_file_to_load}")
+        print(f"Spot-cell expr:     {spot_cell_file_to_load}")
     else:
-        logging.info(f"使用用户提供的 spot-cell 表达: {spot_cell_file_to_load}")
+        print(f"Spot-cell expr:     {spot_cell_file_to_load}")
     
     spot_cell_expr_df = pd.read_csv(spot_cell_file_to_load, index_col=0)
-    logging.info(f"已加载 spot-cell 全基因表达: {spot_cell_expr_df.shape}")
+    print(f"Spot-cell shape:    {spot_cell_expr_df.shape}")
     
     # 验证数据格式
     if spot_cell_expr_df.index.name != 'spot_cell':
-        logging.warning("警告: CSV文件index名称不是'spot_cell'，可能存在格式问题")
+        print("WARNING: spot-cell CSV index name is not 'spot_cell' (format may be unexpected)")
     
     # 过滤全为0的行（如果有）
     row_sums = spot_cell_expr_df.sum(axis=1)
     if (row_sums == 0).any():
         n_zeros = (row_sums == 0).sum()
-        logging.warning(f"过滤掉 {n_zeros} 个表达全为0的 spot-cell")
+        print(f"WARNING: dropped {n_zeros} all-zero spot-cell rows")
         spot_cell_expr_df = spot_cell_expr_df[row_sums > 0]
     
-    logging.info(f"最终 spot-cell 数量: {len(spot_cell_expr_df)}")
+    print(f"Spot-cells kept:    {len(spot_cell_expr_df)}")
     
     # ========== 基于 spot-cell 表达选择高变基因 ==========
-    logging.info("="*80)
-    logging.info("阶段3: 选择高变基因作为特征")
-    logging.info("="*80)
+    print(f"\n{'='*60}\nStage 3.3: Select HVGs\n{'='*60}")
     
     # ✅ 使用 scanpy 选择高变基因（替代基于阈值的激活基因选择）
     # 创建临时 AnnData 对象用于高变基因选择
@@ -238,70 +258,33 @@ def main(args=None):
     sc.pp.highly_variable_genes(temp_adata, n_top_genes=n_top_genes, flavor='seurat_v3')
     
     activated_genes = temp_adata.var_names[temp_adata.var['highly_variable']].tolist()
-    logging.info(f"已选择 {len(activated_genes)} 个高变基因（从 {spot_cell_expr_df.shape[1]} 个基因中）")
+    print(f"HVG genes:          {len(activated_genes)} / {spot_cell_expr_df.shape[1]}")
     
     # 所有高变基因都可用（因为是从 spot_cell_expr_df 中选出来的）
     available_activated_genes = activated_genes
-    logging.info(f"可用的高变基因: {len(available_activated_genes)}")
     
-    # ✅ 为MLP创建输入特征：从 spot_cell_expr_df 推导 cluster 表达
-    # 从 spot_cell_expr_df 的 index 中提取 celltype 信息
-    # index 格式: "spot_name_celltype"
-    celltype_expr_dict = {}
-    for idx in spot_cell_expr_df.index:
-        # 提取 celltype（最后一个下划线后的部分）
-        parts = idx.rsplit('_', 1)
-        if len(parts) == 2:
-            celltype = parts[1]
-            if celltype not in celltype_expr_dict:
-                celltype_expr_dict[celltype] = []
-            celltype_expr_dict[celltype].append(spot_cell_expr_df.loc[idx, available_activated_genes].values)
-    
-    # 计算每个 celltype 的平均表达
-    activated_cluster_expr_data = []
-    activated_cluster_names = []
-    for celltype, expr_list in celltype_expr_dict.items():
-        avg_expr = np.mean(expr_list, axis=0)
-        activated_cluster_expr_data.append(avg_expr)
-        activated_cluster_names.append(celltype)
-    
-    activated_cluster_expr = pd.DataFrame(
-        activated_cluster_expr_data,
-        index=activated_cluster_names,
-        columns=available_activated_genes
-    )
-    logging.info(f"从 spot-cell 表达推导出 {len(activated_cluster_names)} 个 celltype 的激活基因表达")
-
-    # 为Dataset接口创建占位符（实际不会使用）
-    cluster_expr = pd.DataFrame(
-        np.zeros((len(activated_cluster_names), len(available_activated_genes)), dtype=np.float32),
-        index=activated_cluster_names,
-        columns=available_activated_genes
-    )
-
-    # 提取实际存在的celltype（从spot_cell_expr_df的index中解析）
+    # ✅ 提取实际存在的 celltype（从 spot_cell_expr_df 的 index 中解析）
+    # 说明：cell 节点特征必须来自动态 spot-cell 表达谱（spot_cell_expr_df），不使用 celltype 均值。
     cell_names = sorted(set([idx.rsplit('_', 1)[1] for idx in spot_cell_expr_df.index]))
-    logging.info(f"实际存在的细胞类型数: {len(cell_names)}")
-    
-    # 使用spot-cell全表达对每个cell类型做均值，构建cell_expr
-    cell_expr_mean = spot_cell_expr_df.copy()
-    cell_expr_mean['celltype'] = [idx.rsplit('_', 1)[1] for idx in spot_cell_expr_df.index]
-    cell_expr = cell_expr_mean.groupby('celltype')[available_activated_genes].mean().reindex(cell_names).fillna(0.0)
-    
-    # cell_full_expr 使用所有基因
-    all_gene_cols = [col for col in spot_cell_expr_df.columns if col != 'celltype']
-    cell_full_expr = cell_expr_mean.groupby('celltype')[all_gene_cols].mean().reindex(cell_names).fillna(0.0)
+    print(f"Cell types:         {len(cell_names)}")
+
+    # 占位：仅用于提供基因顺序/维度信息，cell 节点真实特征来自 spot_cell_expr_df
+    activated_cluster_expr = pd.DataFrame(
+        np.zeros((len(cell_names), len(available_activated_genes)), dtype=np.float32),
+        index=cell_names,
+        columns=available_activated_genes
+    )
+    cluster_expr = activated_cluster_expr  # Dataset 仅使用 columns
+    cell_expr = activated_cluster_expr     # Dataset 仅使用 columns/index
+    cell_full_expr = pd.DataFrame(index=cell_names)
 
     # 直接使用 cluster_composition 作为 composition（假设列名已经是 celltype）
     # 如果列名与 cell_names 不完全匹配，重新索引以对齐
     composition = cluster_composition.reindex(columns=cell_names, fill_value=0.0)
-    logging.info(f"Composition矩阵形状: {composition.shape}")
-    logging.info(f"Composition列（celltype）: {list(composition.columns)}")
+    print(f"Composition shape:  {composition.shape}")
     
     # ========== 阶段3.5：预计算KNN邻域和LR通讯得分 ==========
-    logging.info("="*80)
-    logging.info("阶段3.5: 预计算KNN邻域和LR通讯得分")
-    logging.info("="*80)
+    print(f"\n{'='*60}\nStage 3.5: Precompute LR Scores\n{'='*60}")
     
     knn_mask, csv_path, graph_data = calculate_lr_scores(
         spot_coords=spot_coords,
@@ -326,7 +309,8 @@ def main(args=None):
         load_lr_scores_csv=csv_path,
         min_comm_edges=args.min_comm_edges,
         valid_cell_types=cell_names,
-        device=device
+        device=device,
+        spot_cell_expr=spot_cell_expr_df
     )
     
     # ========== 数据集划分：训练集和验证集 ==========
@@ -339,39 +323,39 @@ def main(args=None):
         generator=torch.Generator().manual_seed(args.seed)
     )
     
-    logging.info(f"数据集划分完成:")
-    logging.info(f"   - 训练集: {train_size} 个spots")
-    logging.info(f"   - 验证集: {val_size} 个spots")
-    logging.info(f"   - 验证集比例: {args.val_split:.1%}")
-    
-    # ========== 保存LR对映射文件 ==========
-    logging.info("保存LR对映射文件...")
+    print(f"\nTrain/Val split:    {train_size} / {val_size} (val={args.val_split:.1%})")
     lr_mapping_path = os.path.join(args.output_dir, "lr_pair_mapping.txt")
     with open(lr_mapping_path, 'w') as f:
         f.write("lr_id\tligand\treceptor\n")  # 表头
         for lr_id, (ligand, receptor) in dataset.lr_id_to_pair.items():
             f.write(f"{lr_id}\t{ligand}\t{receptor}\n")
-    logging.info(f"LR对映射文件已保存: {lr_mapping_path} (共{len(dataset.lr_id_to_pair)}个LR对)")
+    print(f"LR mapping saved:   {lr_mapping_path}")
     
     # 创建训练和验证数据加载器
+    num_workers = max(0, args.num_workers)
+    pin_memory = device.type == 'cuda'
     if args.sample_rate < 1.0:
         num_samples = int(len(train_dataset) * args.sample_rate)
         sampler = RandomSampler(train_dataset, num_samples=num_samples, replacement=False)
-        logging.info(f"⚡ 采样训练模式: 每个epoch采样 {args.sample_rate*100:.1f}% 训练数据 ({num_samples}/{len(train_dataset)} spots)")
+        print(f"Sampling:           {args.sample_rate*100:.1f}% ({num_samples}/{len(train_dataset)} spots/epoch)")
         train_dataloader = DataLoader(
             train_dataset,
             batch_size=args.batch_size,
             sampler=sampler,
-            num_workers=0,
-            collate_fn=hetero_subgraph_collate_fn
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            persistent_workers=num_workers > 0,
+            collate_fn=hetero_subgraph_collate_fn_batched
         )
     else:
         train_dataloader = DataLoader(
             train_dataset,
             batch_size=args.batch_size,
             shuffle=True,
-            num_workers=0,
-            collate_fn=hetero_subgraph_collate_fn
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            persistent_workers=num_workers > 0,
+            collate_fn=hetero_subgraph_collate_fn_batched
         )
     
     # 验证集数据加载器（不打乱顺序）
@@ -379,13 +363,13 @@ def main(args=None):
         val_dataset,
         batch_size=args.batch_size,
         shuffle=False,
-        num_workers=0,
-        collate_fn=hetero_subgraph_collate_fn
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=num_workers > 0,
+        collate_fn=hetero_subgraph_collate_fn_batched
     )
     
-    logging.info("="*80)
-    logging.info("阶段3: 构建HeteroGAT模型")
-    logging.info("="*80)
+    print(f"\n{'='*60}\nStage 3.4: Build Model\n{'='*60}")
     gat_hidden_dims = [int(x) for x in args.gat_hidden_dims.split(',')]
     
     n_genes = cluster_expr.shape[1]
@@ -411,14 +395,9 @@ def main(args=None):
         weight_decay=args.weight_decay
     )
     scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-6)
-    logging.info(f"模型构建完成")
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    logging.info(f"   - 总参数数: {total_params:,}")
-    logging.info(f"   - 可训练参数数: {trainable_params:,}")
-    
-    # 当使用 DGI loss 作为主训练目标时，确认 encoder/edge attention 已准备好并共享
-    logging.info("在主训练中将使用 DGI loss，空间边与通讯边保持独立注意力参数")
+    print(f"Params:             {total_params:,} (trainable={trainable_params:,})")
     
     # 训练循环
     train_losses = []
@@ -429,14 +408,7 @@ def main(args=None):
     val_node_losses = []
     
     # ========== 阶段4：训练循环 ==========
-    logging.info("="*80)
-    logging.info("阶段4: 开始训练（DGI作为主要训练目标）")
-    logging.info("="*80)
-    logging.info(f"训练配置:")
-    logging.info(f"  - 边mask重构: ratio={args.edge_mask_ratio}, lambda={args.lambda_mask_recon}")
-    logging.info(f"  - 节点mask重构: ratio={args.node_mask_ratio}, lambda={args.lambda_node_recon}")
-    logging.info(f"  - 验证mask种子: {args.mask_seed}")
-    logging.info("="*80)
+    print(f"\n{'='*60}\nStage 3.5: Train\n{'='*60}")
 
     # 使用外层tqdm跟踪epoch进度
     # 移除position参数避免Jupyter中重复显示，添加leave=True保持最终状态
@@ -449,16 +421,18 @@ def main(args=None):
     early_stop_min_delta = args.early_stop_min_delta
     
     if early_stop_patience > 0:
-        logging.info(f"主训练早停已启用: patience={early_stop_patience}, min_delta={early_stop_min_delta}")
+        print(f"Early stop:         patience={early_stop_patience}, min_delta={early_stop_min_delta}")
     else:
-        logging.info("主训练早停已禁用")
+        print("Early stop:         Disabled")
     
     # 评估 dataloader（对整个数据集进行评估）
     eval_dataloader = DataLoader(
         dataset,
         batch_size=args.batch_size,
         shuffle=False,
-        num_workers=0,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=num_workers > 0,
         collate_fn=hetero_subgraph_collate_fn
     )
 
@@ -484,44 +458,88 @@ def main(args=None):
             if batch_idx < 1 and epoch == 0:
                 pass  # 移除调试信息
 
-            # 累积批次损失
-            batch_loss = 0.0
-            batch_mask = 0.0
-            batch_node = 0.0
+            if isinstance(batch['expr_raw'], list):
+                # 兼容旧的 list-of-subgraphs 批次格式
+                batch_loss = 0.0
+                batch_mask = 0.0
+                batch_node = 0.0
 
-            # 处理每个subgraph
-            for b in range(batch_size):
-                # 提取第b个subgraph的数据
-                expr_raw = batch['expr_raw'][b].to(device)  # [k+1, n_genes]
-                cell_expr_raw = batch['cell_expr_raw'][b].to(device)  # [(k+1)*n_cells, n_marker_genes]
+                for b in range(batch_size):
+                    expr_raw = batch['expr_raw'][b].to(device, non_blocking=pin_memory)
+                    cell_expr_raw = batch['cell_expr_raw'][b].to(device, non_blocking=pin_memory)
+                    edge_index_like = batch['edge_index_like'][b].to(device, non_blocking=pin_memory)
+                    edge_attr_like = batch['edge_attr_like'][b].to(device, non_blocking=pin_memory)
+                    edge_index_cc = batch['edge_index_cc'][b].to(device, non_blocking=pin_memory)
+                    edge_attr_cc = batch['edge_attr_cc'][b]
+                    if edge_attr_cc.dim() == 1:
+                        edge_attr_cc = edge_attr_cc.view(-1, 2) if edge_attr_cc.numel() > 0 else edge_attr_cc.new_zeros((0, 2))
+                    edge_attr_cc = edge_attr_cc.to(device, non_blocking=pin_memory)
+                    edge_attr_cc_input = edge_attr_cc[:, :2]
 
-                edge_index_like = batch['edge_index_like'][b].to(device)  # [2, E_like]
-                edge_attr_like = batch['edge_attr_like'][b].to(device)    # [E_like]
-                edge_index_cc = batch['edge_index_cc'][b].to(device)      # [2, E_cc]
-                edge_attr_cc = batch['edge_attr_cc'][b]
-                # 可能为空边，保证形状为 [E_cc, 2]
+                    _, _, _, _, _, predicted_masked_edges, edge_mask, node_recon_pred, node_mask = model(
+                        expr_raw=expr_raw,
+                        cell_expr_raw=cell_expr_raw,
+                        edge_index_like=edge_index_like,
+                        edge_attr_like=edge_attr_like,
+                        edge_index_cc=edge_index_cc,
+                        edge_attr_cc=edge_attr_cc_input,
+                        return_attention=True,
+                        edge_mask_ratio=args.edge_mask_ratio,
+                        node_mask_ratio=args.node_mask_ratio,
+                        mask_generator=None
+                    )
+
+                    mask_recon_loss = 0.0
+                    if edge_mask is not None and edge_mask.any() and predicted_masked_edges is not None:
+                        target_scores = edge_attr_cc[:, 0][edge_mask]
+                        if target_scores.numel() > 0:
+                            mask_recon_loss = torch.nn.functional.mse_loss(predicted_masked_edges, target_scores)
+
+                    node_recon_loss = 0.0
+                    if node_recon_pred is not None and node_mask is not None and node_mask.any():
+                        node_target = torch.cat([expr_raw, cell_expr_raw], dim=0)
+                        node_recon_loss = torch.nn.functional.mse_loss(
+                            node_recon_pred[node_mask], node_target[node_mask]
+                        )
+
+                    total_loss = (
+                        args.lambda_mask_recon * mask_recon_loss
+                        + args.lambda_node_recon * node_recon_loss
+                    )
+
+                    batch_loss += total_loss
+                    batch_mask += mask_recon_loss
+                    batch_node += node_recon_loss
+
+                avg_batch_loss = batch_loss / batch_size
+                avg_batch_mask = batch_mask / batch_size
+                avg_batch_node = batch_node / batch_size
+            else:
+                # 真正 batch 化（disjoint-union 大图），只前向/反向一次
+                expr_raw = batch['expr_raw'].to(device, non_blocking=pin_memory)
+                cell_expr_raw = batch['cell_expr_raw'].to(device, non_blocking=pin_memory)
+                edge_index_like = batch['edge_index_like'].to(device, non_blocking=pin_memory)
+                edge_attr_like = batch['edge_attr_like'].to(device, non_blocking=pin_memory)
+                edge_index_cc = batch['edge_index_cc'].to(device, non_blocking=pin_memory)
+                edge_attr_cc = batch['edge_attr_cc']
                 if edge_attr_cc.dim() == 1:
                     edge_attr_cc = edge_attr_cc.view(-1, 2) if edge_attr_cc.numel() > 0 else edge_attr_cc.new_zeros((0, 2))
-                edge_attr_cc = edge_attr_cc.to(device)        # [E_cc, 2] = [lr_score, lr_id]
+                edge_attr_cc = edge_attr_cc.to(device, non_blocking=pin_memory)
+                edge_attr_cc_input = edge_attr_cc[:, :2]
 
-                # ✅ 使用真实的通信特征 [lr_score, lr_id] 以学习/输出有意义的注意力
-                edge_attr_cc_input = edge_attr_cc[:, :2]  # [E_cc, 2]
-
-                # ========== 前向传播 ==========
-                spot_repr, cell_repr, combined, spot_proj, cc_attention, predicted_masked_edges, edge_mask, node_recon_pred, node_mask = model(
+                _, _, _, _, _, predicted_masked_edges, edge_mask, node_recon_pred, node_mask = model(
                     expr_raw=expr_raw,
                     cell_expr_raw=cell_expr_raw,
                     edge_index_like=edge_index_like,
                     edge_attr_like=edge_attr_like,
                     edge_index_cc=edge_index_cc,
-                    edge_attr_cc=edge_attr_cc_input,  # 不输入真实强度，避免信息泄露
+                    edge_attr_cc=edge_attr_cc_input,
                     return_attention=True,
                     edge_mask_ratio=args.edge_mask_ratio,
                     node_mask_ratio=args.node_mask_ratio,
                     mask_generator=None
                 )
 
-                # ========== DGI训练：使用对比学习损失 ==========
                 mask_recon_loss = 0.0
                 if edge_mask is not None and edge_mask.any() and predicted_masked_edges is not None:
                     target_scores = edge_attr_cc[:, 0][edge_mask]
@@ -535,21 +553,12 @@ def main(args=None):
                         node_recon_pred[node_mask], node_target[node_mask]
                     )
 
-                total_loss = (
+                avg_batch_mask = mask_recon_loss
+                avg_batch_node = node_recon_loss
+                avg_batch_loss = (
                     args.lambda_mask_recon * mask_recon_loss
                     + args.lambda_node_recon * node_recon_loss
                 )
-
-                # 累积批次损失
-                loss = total_loss
-                batch_loss += loss
-                batch_mask += mask_recon_loss
-                batch_node += node_recon_loss
-
-            # 对整个batch求平均损失，然后反向传播
-            avg_batch_loss = batch_loss / batch_size
-            avg_batch_mask = batch_mask / batch_size
-            avg_batch_node = batch_node / batch_size
 
             # 反向传播
             optimizer.zero_grad()
@@ -574,64 +583,103 @@ def main(args=None):
                 if batch is None or batch.get('batch_size', 0) == 0:
                     continue
                 batch_size = batch['batch_size']
-                batch_loss = 0.0
-                batch_mask = 0.0
-                batch_node = 0.0
+                if isinstance(batch['expr_raw'], list):
+                    batch_loss = 0.0
+                    batch_mask = 0.0
+                    batch_node = 0.0
 
-                for b in range(batch_size):
-                    expr_raw = batch['expr_raw'][b].to(device)
-                    cell_expr_raw = batch['cell_expr_raw'][b].to(device)
-                    edge_index_like = batch['edge_index_like'][b].to(device)
-                    edge_attr_like = batch['edge_attr_like'][b].to(device)
-                    edge_index_cc = batch['edge_index_cc'][b].to(device)
-                    edge_attr_cc = batch['edge_attr_cc'][b]
+                    for b in range(batch_size):
+                        expr_raw = batch['expr_raw'][b].to(device, non_blocking=pin_memory)
+                        cell_expr_raw = batch['cell_expr_raw'][b].to(device, non_blocking=pin_memory)
+                        edge_index_like = batch['edge_index_like'][b].to(device, non_blocking=pin_memory)
+                        edge_attr_like = batch['edge_attr_like'][b].to(device, non_blocking=pin_memory)
+                        edge_index_cc = batch['edge_index_cc'][b].to(device, non_blocking=pin_memory)
+                        edge_attr_cc = batch['edge_attr_cc'][b]
+                        if edge_attr_cc.dim() == 1:
+                            edge_attr_cc = edge_attr_cc.view(-1, 2) if edge_attr_cc.numel() > 0 else edge_attr_cc.new_zeros((0, 2))
+                        edge_attr_cc = edge_attr_cc.to(device, non_blocking=pin_memory)
+                        edge_attr_cc_input = edge_attr_cc[:, :2]
+
+                        _, _, _, _, _, predicted_masked_edges, edge_mask, node_recon_pred, node_mask = model(
+                            expr_raw=expr_raw,
+                            cell_expr_raw=cell_expr_raw,
+                            edge_index_like=edge_index_like,
+                            edge_attr_like=edge_attr_like,
+                            edge_index_cc=edge_index_cc,
+                            edge_attr_cc=edge_attr_cc_input,
+                            return_attention=True,
+                            edge_mask_ratio=args.edge_mask_ratio,
+                            node_mask_ratio=args.node_mask_ratio,
+                            mask_generator=val_mask_gen
+                        )
+
+                        mask_recon_loss = 0.0
+                        if edge_mask is not None and edge_mask.any() and predicted_masked_edges is not None:
+                            target_scores = edge_attr_cc[:, 0][edge_mask]
+                            if target_scores.numel() > 0:
+                                mask_recon_loss = torch.nn.functional.mse_loss(predicted_masked_edges, target_scores)
+
+                        node_recon_loss = 0.0
+                        if node_recon_pred is not None and node_mask is not None and node_mask.any():
+                            node_target = torch.cat([expr_raw, cell_expr_raw], dim=0)
+                            node_recon_loss = torch.nn.functional.mse_loss(
+                                node_recon_pred[node_mask], node_target[node_mask]
+                            )
+
+                        val_loss = (
+                            args.lambda_mask_recon * mask_recon_loss
+                            + args.lambda_node_recon * node_recon_loss
+                        )
+
+                        batch_loss += val_loss
+                        batch_mask += mask_recon_loss
+                        batch_node += node_recon_loss
+
+                    avg_batch_loss = batch_loss / batch_size
+                    avg_batch_mask = batch_mask / batch_size
+                    avg_batch_node = batch_node / batch_size
+                else:
+                    expr_raw = batch['expr_raw'].to(device, non_blocking=pin_memory)
+                    cell_expr_raw = batch['cell_expr_raw'].to(device, non_blocking=pin_memory)
+                    edge_index_like = batch['edge_index_like'].to(device, non_blocking=pin_memory)
+                    edge_attr_like = batch['edge_attr_like'].to(device, non_blocking=pin_memory)
+                    edge_index_cc = batch['edge_index_cc'].to(device, non_blocking=pin_memory)
+                    edge_attr_cc = batch['edge_attr_cc']
                     if edge_attr_cc.dim() == 1:
                         edge_attr_cc = edge_attr_cc.view(-1, 2) if edge_attr_cc.numel() > 0 else edge_attr_cc.new_zeros((0, 2))
-                    edge_attr_cc = edge_attr_cc.to(device)  # [E_cc, 2] = [lr_score, lr_id]
+                    edge_attr_cc = edge_attr_cc.to(device, non_blocking=pin_memory)
+                    edge_attr_cc_input = edge_attr_cc[:, :2]
 
-                    # ✅ 使用真实通信特征，确保验证注意力与LR信息对应
-                    edge_attr_cc_input = edge_attr_cc[:, :2]  # [E_cc, 2]
-
-                    # 前向传播（验证阶段不进行边mask）
-                    spot_repr, cell_repr, combined, spot_proj, cc_attention, predicted_masked_edges, edge_mask, node_recon_pred, node_mask = model(
+                    _, _, _, _, _, predicted_masked_edges, edge_mask, node_recon_pred, node_mask = model(
                         expr_raw=expr_raw,
                         cell_expr_raw=cell_expr_raw,
                         edge_index_like=edge_index_like,
                         edge_attr_like=edge_attr_like,
                         edge_index_cc=edge_index_cc,
-                        edge_attr_cc=edge_attr_cc_input,  # 不输入真实强度
+                        edge_attr_cc=edge_attr_cc_input,
                         return_attention=True,
-                        edge_mask_ratio=args.edge_mask_ratio,  # 验证阶段与训练一致
+                        edge_mask_ratio=args.edge_mask_ratio,
                         node_mask_ratio=args.node_mask_ratio,
                         mask_generator=val_mask_gen
                     )
 
-                    # 边mask重构（只对被mask的边）
-                    mask_recon_loss = 0.0
+                    avg_batch_mask = 0.0
                     if edge_mask is not None and edge_mask.any() and predicted_masked_edges is not None:
                         target_scores = edge_attr_cc[:, 0][edge_mask]
                         if target_scores.numel() > 0:
-                            mask_recon_loss = torch.nn.functional.mse_loss(predicted_masked_edges, target_scores)
+                            avg_batch_mask = torch.nn.functional.mse_loss(predicted_masked_edges, target_scores)
 
-                    node_recon_loss = 0.0
+                    avg_batch_node = 0.0
                     if node_recon_pred is not None and node_mask is not None and node_mask.any():
                         node_target = torch.cat([expr_raw, cell_expr_raw], dim=0)
-                        node_recon_loss = torch.nn.functional.mse_loss(
+                        avg_batch_node = torch.nn.functional.mse_loss(
                             node_recon_pred[node_mask], node_target[node_mask]
                         )
 
-                    val_loss = (
-                        args.lambda_mask_recon * mask_recon_loss
-                        + args.lambda_node_recon * node_recon_loss
+                    avg_batch_loss = (
+                        args.lambda_mask_recon * avg_batch_mask
+                        + args.lambda_node_recon * avg_batch_node
                     )
-
-                    batch_loss += val_loss
-                    batch_mask += mask_recon_loss
-                    batch_node += node_recon_loss
-
-                avg_batch_loss = batch_loss / batch_size
-                avg_batch_mask = batch_mask / batch_size
-                avg_batch_node = batch_node / batch_size
 
                 total_val_loss += _scalar(avg_batch_loss)
                 total_val_mask += _scalar(avg_batch_mask)
@@ -667,7 +715,10 @@ def main(args=None):
                 patience_counter += 1
                 
             if patience_counter >= early_stop_patience:
-                logging.info(f"早停触发: 验证loss在{early_stop_patience}个epoch内未改善 (best={best_val_metric:.6f}, current={val_metric:.6f})")
+                print(
+                    f"Early stop triggered: val loss not improved for {early_stop_patience} epochs "
+                    f"(best={best_val_metric:.6f}, current={val_metric:.6f})"
+                )
                 break
         
         # 更新epoch进度条（只在epoch结束时更新一次）
@@ -677,11 +728,8 @@ def main(args=None):
             'Train_Mask': f'{avg_train_mask:.4f}',
             'Train_Node': f'{avg_train_node:.4f}',
         })
-    logging.info(f"   - 评估数据集大小: {len(dataset)} spots")
-    logging.info(f"   - 评估batch数量: {len(eval_dataloader)} batches（可能包含被过滤的空子图）")
-    
     # 在训练结束后，用训练好的模型对完整数据集进行一次评估，收集注意力得分
-    logging.info("使用训练好的模型对完整数据集进行评估，收集cell-cell注意力得分...")
+    print(f"\nEvaluating:          spots={len(dataset)}, batches={len(eval_dataloader)}")
     
     model.eval()
     all_cc_attention_scores = []
@@ -706,15 +754,15 @@ def main(args=None):
             batch_size = batch['batch_size']
             
             for b in range(batch_size):
-                expr_raw = batch['expr_raw'][b].to(device)
-                cell_expr_raw = batch['cell_expr_raw'][b].to(device)
-                edge_index_like = batch['edge_index_like'][b].to(device)
-                edge_attr_like = batch['edge_attr_like'][b].to(device)
-                edge_index_cc = batch['edge_index_cc'][b].to(device)
+                expr_raw = batch['expr_raw'][b].to(device, non_blocking=pin_memory)
+                cell_expr_raw = batch['cell_expr_raw'][b].to(device, non_blocking=pin_memory)
+                edge_index_like = batch['edge_index_like'][b].to(device, non_blocking=pin_memory)
+                edge_attr_like = batch['edge_attr_like'][b].to(device, non_blocking=pin_memory)
+                edge_index_cc = batch['edge_index_cc'][b].to(device, non_blocking=pin_memory)
                 edge_attr_cc = batch['edge_attr_cc'][b]
                 if edge_attr_cc.dim() == 1:
                     edge_attr_cc = edge_attr_cc.view(-1, 2) if edge_attr_cc.numel() > 0 else edge_attr_cc.new_zeros((0, 2))
-                edge_attr_cc = edge_attr_cc.to(device)
+                edge_attr_cc = edge_attr_cc.to(device, non_blocking=pin_memory)
                 
                 # 模型前向传播
                 # ✅ 推理阶段也传入真实通信特征，收集的注意力才与LR信息一致
@@ -756,7 +804,7 @@ def main(args=None):
                     all_n_spots_sub.append(n_spots_sub_tensor)
                     
                     # 新增：收集发送方和接收方barcode
-                    spot_barcodes_full = batch['spot_barcodes'][b]  # 子图中所有spot的barcode
+                    subgraph_spot_indices = batch['spot_indices'][b]  # 子图中所有spot的全局索引
                     cell_node_to_spot_cell = {cell_node: (spot_local, cell_type) for (spot_local, cell_type), cell_node in spot_cell_mapping.items()}
                     
                     src_barcodes = []
@@ -773,8 +821,8 @@ def main(args=None):
                         src_spot_local, _ = cell_node_to_spot_cell[src_local]
                         dst_spot_local, _ = cell_node_to_spot_cell[dst_local]
                         
-                        src_barcode = spot_barcodes_full[src_spot_local]
-                        dst_barcode = spot_barcodes_full[dst_spot_local]
+                        src_barcode = spot_names[subgraph_spot_indices[src_spot_local]]
+                        dst_barcode = spot_names[subgraph_spot_indices[dst_spot_local]]
                         
                         src_barcodes.append(src_barcode)
                         dst_barcodes.append(dst_barcode)
@@ -783,19 +831,16 @@ def main(args=None):
                     all_dst_barcodes.append(dst_barcodes)  # 列表 of strings
             processed_eval_batches += 1
     
-    logging.info(f"评估阶段实际处理的batch数: {processed_eval_batches}")
-    
-    logging.info(f"评估完成，收集到 {len(all_cc_attention_scores)} 个spots的注意力得分")
+    print(f"Eval batches used:   {processed_eval_batches}")
+
     total_edges_collected = sum(scores.shape[0] for scores in all_cc_attention_scores)
-    logging.info(f"   - 子图内边数（模型实际使用）: {total_edges_collected} 条")
     if len(all_cc_attention_scores) > 0:
-        logging.info(f"   - 平均每个spot子图: {total_edges_collected/len(all_cc_attention_scores):.1f} 条边")
+        print(f"Edges collected:     {total_edges_collected} (avg/spot={total_edges_collected/len(all_cc_attention_scores):.1f})")
     else:
-        logging.info(f"   - 平均每个spot子图: N/A (无注意力得分)")
-    logging.info(f"   - 注意：这是子图内的边数，不包含spot间的跨子图通讯")
+        print("Edges collected:     0")
     
     # 计算degree-scaled attention（反归一化注意力得分）
-    logging.info("计算degree-scaled attention（注意力得分 × 目标节点入度）...")
+    print("Post-process:        degree-scaled attention")
     for i in range(len(all_cc_attention_scores)):
         edge_index = all_edge_index_cc[i]
         attention = all_cc_attention_scores[i]
@@ -814,7 +859,6 @@ def main(args=None):
         
         all_cc_attention_scores[i] = scaled_attention
     
-    logging.info("degree-scaled attention计算完成")
     
     evaluate_cell_communication(
         all_cc_attention_scores=all_cc_attention_scores,
@@ -835,10 +879,8 @@ def main(args=None):
     
     # 绘制损失曲线
     plot_training_loss(train_losses, val_losses, args.output_dir, args.epochs)
-    
-    logging.info("\n" + "="*80)
-    logging.info("训练完成！")
-    logging.info("="*80)
+
+    print(f"\n{'='*60}\nDone\n{'='*60}")
 
 if __name__ == '__main__':
     main()

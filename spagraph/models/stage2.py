@@ -1,5 +1,4 @@
 import os
-import logging
 import numpy as np
 import pandas as pd
 import scanpy as sc
@@ -872,7 +871,7 @@ class GATDeconvolution:
                     hasattr(self.gat_model, 'sc_cell_expressions') and
                     self.gat_model.sc_cell_expressions is not None):
                     
-                    logging.info("正在计算spot-cell级别的动态表达...")
+                    print("正在计算spot-cell级别的动态表达...")
                     spot_cell_expr_dict = {}
                     
                     # deconv_weights: [n_spots, n_clusters]
@@ -944,7 +943,7 @@ class GATDeconvolution:
                     # 保存
                     spot_cell_file = f"{self.output_dir}/{sample_name}_spot_cell_expr.csv"
                     spot_cell_expr_df.to_csv(spot_cell_file)
-                    logging.info(f"✅ 已保存spot-cell动态表达: {spot_cell_file}, 形状={spot_cell_expr_df.shape}")
+                    print(f"✅ 已保存spot-cell动态表达: {spot_cell_file}, 形状={spot_cell_expr_df.shape}")
         else:
             pass
 

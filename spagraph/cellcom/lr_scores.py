@@ -7,7 +7,6 @@ for spatial transcriptomics data analysis.
 """
 
 import os
-import logging
 import numpy as np
 import pandas as pd
 from sklearn.neighbors import kneighbors_graph
@@ -41,53 +40,26 @@ def calculate_lr_scores(
     Returns:
         Tuple of (knn_mask, csv_path, graph_data)
     """
-    logging.info("="*80)
-    logging.info("阶段3.5: 预计算KNN邻域和LR通讯得分")
-    logging.info("="*80)
-
-    # ✅ 调试：检查关键变量状态
-    logging.info(f"spot_coords类型: {type(spot_coords)}, 形状: {spot_coords.shape if spot_coords is not None else 'None'}")
-    logging.info(f"composition类型: {type(composition)}, 形状: {composition.shape if composition is not None else 'None'}")
-    logging.info(f"args.output_dir: {args.output_dir}")
-
     # 获取spots数量
     n_spots = spot_coords.shape[0]
 
     # 构建KNN邻域（用于空间图构建，不限制距离）
-    logging.info(f"构建KNN图: {n_spots} spots, {n_neighbors} neighbors")
     knn = kneighbors_graph(spot_coords, n_neighbors=n_neighbors, mode="connectivity", include_self=False)
     knn_mask = knn.toarray()  # [n_spots, n_spots] - 用于空间图构建
     
-    # ✅ 构建LR通信邻域mask（允许更大范围的通信）
-    # 使用更大的距离阈值，允许细胞间通信在更远距离发生
-    lr_comm_distance_threshold = 150.0  # 150μm - 允许更远距离的LR通信
-    lr_comm_mask = np.zeros((n_spots, n_spots), dtype=bool)
-    
-    for i in range(n_spots):
-        for j in range(n_spots):
-            if i != j:
-                dist = np.sqrt((spot_coords[i, 0] - spot_coords[j, 0])**2 +
-                              (spot_coords[i, 1] - spot_coords[j, 1])**2)
-                if dist <= lr_comm_distance_threshold:
-                    lr_comm_mask[i, j] = True
-
-    # ✅ 计算并保存LR通讯得分矩阵（使用 output_dir）
-    logging.info("开始计算LR通讯得分...")
+    # ✅ 在 KNN 邻居内用距离阈值过滤“过远”的邻居
+    # 说明：KNN 总会保留固定数量邻居，在点稀疏区域可能出现非常远的邻居；这里用距离阈值剪枝。
+    lr_comm_distance_threshold = 500.0  # 单位与 spot_coords 一致（例如 μm）
 
     # 阈值选择：使用独立参数（不再回退到 mean_expr_threshold）
     active_expr_threshold = getattr(args, 'active_expr_threshold', 3.0)
     lr_score_threshold = getattr(args, 'lr_score_threshold', 3.0)
 
-    logging.info(f"   - 活跃基因筛选 (CP10k): normalize_total(1e4) > {active_expr_threshold}")
-    logging.info(f"   - LR 通讯得分阈值 (log1p space): {lr_score_threshold}")
-    logging.info(f"   - 通讯得分计算: 配体×受体表达相乘后取sqrt，再log1p变换（处理长尾分布）")
-
-    # ✅ 调试：检查KNN mask状态
-    logging.info(f"   - KNN mask形状: {knn_mask.shape}")
-    logging.info(f"   - KNN mask中非零元素数: {np.count_nonzero(knn_mask)}")
-    logging.info(f"   - 平均每个spot的邻居数: {np.count_nonzero(knn_mask) / n_spots:.2f}")
-    logging.info(f"   - LR通信mask中非零元素数: {np.count_nonzero(lr_comm_mask)}")
-    logging.info(f"   - LR通信平均每个spot的潜在邻居数: {np.count_nonzero(lr_comm_mask) / n_spots:.2f}")
+    print(
+        "LR scores:          "
+        f"spots={n_spots}, knn={n_neighbors}, dist_thr={lr_comm_distance_threshold}, "
+        f"active_thr={active_expr_threshold}, lr_thr={lr_score_threshold}"
+    )
 
     # ✅ 准备数据结构
     spot_names = adata.obs_names.tolist()
@@ -101,9 +73,7 @@ def calculate_lr_scores(
     # 提取实际存在的细胞类型（从composition的列名）
     cell_types = composition.columns.tolist()
     
-    logging.info(f"   - Spot数量: {n_spots}")
-    logging.info(f"   - 细胞类型数: {len(cell_types)}")
-    logging.info(f"   - Spot-cell总数: {len(spot_cell_names)}")
+    print(f"LR scores:          celltypes={len(cell_types)}, spot-cells={len(spot_cell_names)}")
 
     # ========== 优化1：预构建基因索引字典 ==========
     # 避免在循环中重复查找基因索引
@@ -111,18 +81,18 @@ def calculate_lr_scores(
     
     # ✅ 如果提供了HVG列表，只使用HVG进行通讯计算
     if hvg_genes is not None:
-        hvg_genes_upper = set(g.upper() for g in hvg_genes)
-        allowed_gene_indices = set()
-        for gene_name in gene_names_in_npz:
-            if gene_name.upper() in hvg_genes_upper:
-                allowed_gene_indices.add(gene_names_in_npz.index(gene_name))
-        logging.info(f"✅ 使用高变基因进行通讯计算: {len(allowed_gene_indices)}/{len(gene_names_in_npz)} 个基因")
+        allowed_gene_indices = {
+            gene_name_to_idx[g.upper()]
+            for g in hvg_genes
+            if g.upper() in gene_name_to_idx
+        }
+        print(f"LR scores:          comm genes (HVG) = {len(allowed_gene_indices)}/{len(gene_names_in_npz)}")
     else:
         allowed_gene_indices = None
-        logging.info("使用全部基因进行通讯计算")
+        print("LR scores:          comm genes (ALL)")
 
     # ========== 过滤不参与通讯的基因 ==========
-    logging.info("过滤不参与通讯的基因...")
+    # （静默）过滤不参与通讯的基因
 
     # 定义过滤规则
     filtered_genes = set()
@@ -141,13 +111,7 @@ def calculate_lr_scores(
         # elif gene_upper.startswith('RPS') or gene_upper.startswith('RPL'):
         #     filtered_genes.add(gene_name)
 
-    logging.info(f"   - 过滤基因数: {len(filtered_genes)}/{len(gene_names_in_npz)}")
-    logging.info(f"   - 线粒体基因: {sum(1 for g in filtered_genes if g.upper().startswith('MT-'))}")
-    logging.info(f"   - 血红蛋白基因: {sum(1 for g in filtered_genes if g.upper().startswith('HB'))}")
-    logging.info(f"   - 假基因: {sum(1 for g in filtered_genes if 'PSEUDO' in g.upper() or g.upper().endswith('-AS1') or g.upper().startswith('LOC'))}")
-
     # ========== 筛选每个细胞中的活跃基因（表达值过滤）==========
-    logging.info("筛选每个细胞中的活跃基因（基于表达阈值）...")
     cell_active_genes_ligand = {}  # spot_cell_key -> set of active ligand gene indices
     cell_active_genes_receptor = {}  # spot_cell_key -> set of active receptor gene indices
 
@@ -184,8 +148,7 @@ def calculate_lr_scores(
         cell_active_genes_ligand[spot_cell_name] = active_gene_indices
         cell_active_genes_receptor[spot_cell_name] = active_gene_indices
 
-    logging.info(f"   - 处理了 {len(spot_cell_names)} 个细胞")
-    logging.info(f"   - 平均每个细胞活跃基因数: {np.mean([len(genes) for genes in cell_active_genes_ligand.values()]):.1f}")
+    # （静默）统计信息可按需添加
 
     # ========== 优化2：预处理LR对，构建索引映射 ==========
     # 将LR对转换为索引对，并过滤掉不存在的基因
@@ -213,19 +176,18 @@ def calculate_lr_scores(
         if found_all:
             valid_lr_pairs.append((lig_idx, rec_indices, ligand, receptor))
 
-    logging.info(f"   - 有效LR对: {len(valid_lr_pairs)}/{len(lr_pairs)}")
+    print(f"LR scores:          valid LR pairs = {len(valid_lr_pairs)}/{len(lr_pairs)}")
 
     # 初始化通讯事件记录
     comm_event_records = []
 
-    # ========== 优化3：使用进度条和批量处理 ==========
-    logging.info("   - 开始遍历LR通信邻居对（基于KNN空间邻居）...")
+    # ========== 计算通讯事件 ==========
     total_pairs = 0
     spots_with_cells = 0
     spots_without_cells = 0
     same_celltype_skipped = 0  # 统计跳过的同类型细胞对
 
-    # 遍历所有潜在的LR通信邻居对（使用knn_mask限制为空间邻居）
+    # 遍历所有潜在的LR通信邻居对（KNN邻居，并过滤掉距离过远的邻居）
     for i in range(n_spots):
         spot_i_barcode = spot_names[i]
 
@@ -239,9 +201,18 @@ def calculate_lr_scores(
 
         spots_with_cells += 1
 
-        for j in range(n_spots):
-            if knn_mask[i, j] == 0:  # 只在KNN邻居之间计算LR通讯
-                continue
+        neighbor_js = np.where(knn_mask[i] == 1)[0]
+        if neighbor_js.size == 0:
+            continue
+
+        # 距离阈值过滤（只在 KNN 邻居内部过滤）
+        diffs = spot_coords[neighbor_js] - spot_coords[i]
+        dists = np.sqrt((diffs ** 2).sum(axis=1))
+        keep_mask = dists <= lr_comm_distance_threshold
+        neighbor_js = neighbor_js[keep_mask]
+        dists = dists[keep_mask]
+
+        for j, dist_ij in zip(neighbor_js, dists):
 
             total_pairs += 1
             spot_j_barcode = spot_names[j]
@@ -317,12 +288,11 @@ def calculate_lr_scores(
 
                         # ✅ 过滤低于阈值的通讯事件（使用 lr_score_threshold，log1p 空间）
                         if score >= lr_score_threshold:
-                            # ✅ 计算距离，用于后续伪标签生成
-                            distance = np.sqrt((spot_coords[i, 0] - spot_coords[j, 0])**2 +
-                                              (spot_coords[i, 1] - spot_coords[j, 1])**2)
+                            # ✅ 计算距离，用于后续伪标签生成（复用筛选时计算的距离）
+                            distance = float(dist_ij)
                             
-                            # ✅ 先记录是否在 KNN mask 内
-                            in_knn = 1 if knn_mask[i, j] == 1 else 0
+                            # ✅ 记录是否在 KNN mask 内（此处恒为 1，保留列以兼容下游分析）
+                            in_knn = 1
                             
                             comm_event_records.append([
                                 spot_i_barcode, spot_j_barcode, 
@@ -330,19 +300,11 @@ def calculate_lr_scores(
                                 ligand, receptor, score, in_knn, distance
                             ])
 
-        # 每处理100个spot打印一次进度
-        if (i + 1) % 100 == 0:
-            logging.info(f"   - 已处理 {i+1}/{n_spots} spots, 发现 {len(comm_event_records)} 个通讯事件")
-
-    logging.info(f"计算完成: {len(comm_event_records)} 个LR通讯事件")
-    logging.info(f"   - Spots with cells: {spots_with_cells}/{n_spots}")
-    logging.info(f"   - Spots without cells: {spots_without_cells}/{n_spots}")
-    logging.info(f"   - 处理的邻居对: {total_pairs}")
-    logging.info(f"   - 跳过同类型细胞对: {same_celltype_skipped}")
-
-    # ✅ 如果设置了阈值，输出过滤统计（显示 LR 阈值，log1p 空间）
-    if lr_score_threshold > 0:
-        logging.info(f"   - 通讯得分阈值过滤: score >= {lr_score_threshold} (log1p space)")
+    print(
+        "LR scores:          "
+        f"events={len(comm_event_records)}, neighbor_pairs={total_pairs}, "
+        f"spots_with_cells={spots_with_cells}/{n_spots}"
+    )
 
     # ✅ 使用 output_dir 保存 LR 通讯得分
     csv_path = os.path.join(output_dir, "lr_scores.csv")
@@ -353,10 +315,12 @@ def calculate_lr_scores(
     )
     
     df.to_csv(csv_path, index=False)
-    logging.info(f"\nLR通讯得分已保存到: {csv_path}")
-    logging.info(f"   - 总事件数: {len(df)}")
-    logging.info(f"   - Spot对数: {df.groupby(['spot_i', 'spot_j']).ngroups}")
-    logging.info(f"   - Cell对数: {df.groupby(['cell_i', 'cell_j']).ngroups}")
+    print(
+        "LR scores saved:    "
+        f"{csv_path} (events={len(df)}, "
+        f"spot_pairs={df.groupby(['spot_i', 'spot_j']).ngroups}, "
+        f"cell_pairs={df.groupby(['cell_i', 'cell_j']).ngroups})"
+    )
 
     # 准备graph_data字典（只包含坐标和composition）
     graph_data = {

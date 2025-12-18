@@ -5,7 +5,6 @@ import pandas as pd
 from typing import Dict, List, Tuple, Optional
 from sklearn.neighbors import NearestNeighbors
 from scipy.spatial.distance import pdist, squareform
-import logging
 import scanpy as sc
 from pathlib import Path
 import random
@@ -427,33 +426,6 @@ def set_seed(seed: int = 42):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-def setup_logging(log_file):
-    logger = logging.getLogger()
-    logger.setLevel(logging.INFO)
-
-    # 移除所有已有的 handler（避免重复打印）
-    for handler in logger.handlers[:]:
-        logger.removeHandler(handler)
-
-    # 创建文件handler，写日志到文件
-    file_handler = logging.FileHandler(log_file)
-    file_handler.setLevel(logging.INFO)
-    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-    file_handler.setFormatter(formatter)
-    logger.addHandler(file_handler)
-
-    # 创建控制台handler，兼容tqdm
-    console_handler = logging.StreamHandler()
-    console_handler.setLevel(logging.INFO)
-    console_handler.setFormatter(formatter)
-    logger.addHandler(console_handler)
-
-    # 配置tqdm logger避免冲突
-    tqdm_logger = logging.getLogger('tqdm')
-    tqdm_logger.setLevel(logging.WARNING)  # 只显示警告和错误
-    tqdm_logger.addHandler(console_handler)
-    tqdm_logger.propagate = False  # 防止向上传播
-
 class STHeteroSubgraphDataset:
     """空间转录组异构图子图数据集 - 以每个spot为中心构建k邻域子图"""
     
@@ -465,7 +437,8 @@ class STHeteroSubgraphDataset:
                  load_lr_scores_csv: Optional[str] = None,
                  min_comm_edges: int = 1,
                  valid_cell_types: Optional[List[str]] = None,
-                 device: str = 'cpu'):
+                 device: str = 'cpu',
+                 spot_cell_expr: Optional[pd.DataFrame] = None):
         """
         初始化数据集
         Args:
@@ -473,6 +446,7 @@ class STHeteroSubgraphDataset:
             cluster_expr: Cluster marker基因表达量DataFrame [n_clusters, n_marker_genes]
             cell_expr: Cell marker基因表达量DataFrame [n_cells, n_marker_genes]
             cell_full_expr: Cell全基因表达量DataFrame [n_cells, n_all_genes]
+            spot_cell_expr: Spot-cell动态表达DataFrame [n_spot_cells, n_genes]
             graph_data: 图数据（包含coords, composition, knn_mask等）
             lr_pairs: [(ligand, receptor), ...] 配体受体对列表
             k_neighbors: 邻域spot数量
@@ -488,21 +462,22 @@ class STHeteroSubgraphDataset:
         self.cluster_expr = cluster_expr
         self.cell_expr = cell_expr
         self.cell_full_expr = cell_full_expr
+        self.spot_cell_expr_df = spot_cell_expr
         self.graph_data = graph_data
         self.device = device
         self.k_neighbors = k_neighbors
         self.lr_pairs = lr_pairs
         self.expr_threshold = expr_threshold
         
-        # LR通讯结果字典 - 用于快速查询（从CSV加载）
-        self.lr_scores_dict = {}  # {(spot_i, spot_j, ct_i, ct_j, ligand, receptor): score, ...}
-        
         # LR对编码映射
         self.lr_pair_to_id = {}  # {(ligand, receptor): lr_id}
         self.lr_id_to_pair = {}  # {lr_id: (ligand, receptor)}
         
-        # 用于过滤的辅助字典
-        self.lr_keys_by_spot_pair = {}  # {(spot_i, spot_j, ct_i, ct_j): [keys]}
+        # 聚合后的通讯得分（按 spot+cell 对聚合所有 LR 事件）
+        # {(spot_i, spot_j, ct_i, ct_j): [total_score, lr_id]}
+        self.lr_scores_by_spot_pair = {}
+        # 按 spot 对索引的通讯列表：{(spot_i, spot_j): [(ct_i, ct_j, total_score, lr_id), ...]}
+        self.comm_by_spot_pair = {}
         
         # 加载ST数据
         self.adata = sc.read_h5ad(st_h5ad_path)
@@ -532,6 +507,8 @@ class STHeteroSubgraphDataset:
             
         if hasattr(self.st_X, 'toarray'):
             self.st_X = self.st_X.toarray()
+        if self.st_X.dtype != np.float32:
+            self.st_X = self.st_X.astype(np.float32)
         
         # 从knn_mask构建knn_indices（允许变长邻居）
  
@@ -557,21 +534,8 @@ class STHeteroSubgraphDataset:
         
         # marker基因表达用于embedding计算
         self.cell_marker_expr = cell_expr
-        
-        # 使用cell_expr作为细胞表达数据
-        # 假设所有spot的相同细胞类型有相同的表达
-        self.spot_cell_expr = cell_expr.values  # [n_cells, n_marker_genes]
         self.cell_names = cell_expr.index.tolist()
         self.gene_names = cell_expr.columns.tolist()
-        self.spot_cell_expr_index = {}
-
-        # 每个细胞类型在所有spot中共享表达
-        spot_names = self.adata.obs_names.tolist()
-        cell_names_list = self.cell_expr.index.tolist()
-        for spot_idx in range(self.n_spots):
-            for cell_idx in range(len(cell_names_list)):
-                if self.composition.iloc[spot_idx, cell_idx] > 1e-6:
-                    self.spot_cell_expr_index[(spot_idx, cell_idx)] = cell_idx
         
         if load_lr_scores_csv is not None:
             self._load_lr_scores_from_csv(load_lr_scores_csv)
@@ -579,13 +543,7 @@ class STHeteroSubgraphDataset:
             raise ValueError("必须提供load_lr_scores_csv")
         
         # DGI训练不需要过滤spot，直接使用所有spot
-        
-        # ========== 预计算基因索引映射，避免每次都查找 ==========
-        self.marker_gene_to_idx = {}
-        for gene_name in self.cell_marker_expr.columns:
-            if gene_name in self.gene_names:
-                self.marker_gene_to_idx[gene_name] = self.gene_names.index(gene_name)
-        
+
         # ========== 确保spot和cell基因顺序一致 ==========
         # 创建从cluster_expr基因顺序到cell_marker_expr基因顺序的映射
         self.spot_gene_order_to_cell = []
@@ -595,8 +553,57 @@ class STHeteroSubgraphDataset:
             else:
                 # 如果cell marker基因不在cluster基因中，用-1表示缺失
                 self.spot_gene_order_to_cell.append(-1)
-        print(f"[Optimized] Pre-computed gene index mapping for {len(self.marker_gene_to_idx)} activated genes")
-        print(f"[Aligned] Spot and cell gene orders aligned to {len(self.spot_gene_order_to_cell)} activated genes")
+        print(f"[Aligned] Spot/cell gene order: {len(self.spot_gene_order_to_cell)} genes")
+
+        # ========== 预计算加速用的数组 ==========
+        self.marker_genes = list(self.cell_marker_expr.columns)
+        self.n_marker_genes = len(self.marker_genes)
+        self.zero_cell_marker_expr = np.zeros(self.n_marker_genes, dtype=np.float32)
+
+        self.spot_names = self.adata.obs_names.tolist()
+        self.composition_values = self.composition.values.astype(np.float32)
+        self.cell_name_to_idx = {name: idx for idx, name in enumerate(self.cell_names)}
+        self.cells_in_spot = [
+            np.where(self.composition_values[i] > 1e-6)[0]
+            for i in range(self.n_spots)
+        ]
+
+        # 预先对齐 spot 表达矩阵到 marker 基因顺序
+        self.st_X_marker = np.zeros(
+            (self.n_spots, len(self.spot_gene_order_to_cell)),
+            dtype=np.float32
+        )
+        valid_positions = [
+            (dst_idx, src_idx)
+            for dst_idx, src_idx in enumerate(self.spot_gene_order_to_cell)
+            if src_idx >= 0
+        ]
+        if valid_positions:
+            dst_idx, src_idx = zip(*valid_positions)
+            self.st_X_marker[:, np.array(dst_idx)] = self.st_X[:, np.array(src_idx)]
+
+        # 预先对齐 spot-cell 动态表达到 marker 基因顺序
+        if self.spot_cell_expr_df is None:
+            raise ValueError("spot_cell_expr (动态 spot-cell 表达) 不能为空：cell 节点特征必须来自动态表达谱")
+
+        self.spot_cell_row_idx = None
+        self.spot_cell_marker_expr_values = None
+        marker_expr_df = self.spot_cell_expr_df.reindex(columns=self.marker_genes, fill_value=0.0)
+        self.spot_cell_marker_expr_values = marker_expr_df.values.astype(np.float32, copy=False)
+
+        spot_name_to_idx = {name: idx for idx, name in enumerate(self.spot_names)}
+        row_idx_matrix = np.full((self.n_spots, len(self.cell_names)), -1, dtype=np.int32)
+        for row_idx, spot_cell_name in enumerate(marker_expr_df.index):
+            parts = spot_cell_name.rsplit('_', 1)
+            if len(parts) != 2:
+                continue
+            spot_barcode, celltype = parts
+            spot_idx = spot_name_to_idx.get(spot_barcode)
+            cell_idx = self.cell_name_to_idx.get(celltype)
+            if spot_idx is None or cell_idx is None:
+                continue
+            row_idx_matrix[spot_idx, cell_idx] = row_idx
+        self.spot_cell_row_idx = row_idx_matrix
     
 
     def _load_lr_scores_from_csv(self, csv_path: str):
@@ -644,22 +651,33 @@ class STHeteroSubgraphDataset:
                     self.lr_id_to_pair[lr_id_counter] = lr_pair
                     lr_id_counter += 1
                 
-                key = (spot_i_idx, spot_j_idx, cell_i_idx, cell_j_idx, ligand, receptor)
-                # ✅ 存储 comm_score
+                lr_id = self.lr_pair_to_id[lr_pair]
+
+                # ✅ 聚合 comm_score（同一 spot/cell 对可能对应多个 LR 事件）
                 comm_score = float(row['comm_score'])
-                self.lr_scores_dict[key] = comm_score
-                
-                # 同时更新lr_keys_by_spot_pair
                 spot_pair_key = (spot_i_idx, spot_j_idx, cell_i_idx, cell_j_idx)
-                if spot_pair_key not in self.lr_keys_by_spot_pair:
-                    self.lr_keys_by_spot_pair[spot_pair_key] = []
-                self.lr_keys_by_spot_pair[spot_pair_key].append(key)
+                pair_data = self.lr_scores_by_spot_pair.get(spot_pair_key)
+                if pair_data is None:
+                    self.lr_scores_by_spot_pair[spot_pair_key] = [comm_score, lr_id]
+                else:
+                    pair_data[0] += comm_score
             except ValueError:
                 # 如果barcode或cell名称找不到，跳过这条记录
                 continue
         
-        print(f"[Loaded] Total LR score entries: {len(self.lr_scores_dict)}")
+        # 二级索引：按 spot 对分组，生成 edge 时只遍历存在通讯的 cell 对，避免 O(C^2) 穷举
+        comm_by_spot_pair = {}
+        for (spot_i, spot_j, ct_i, ct_j), (total_score, lr_id) in self.lr_scores_by_spot_pair.items():
+            comm_by_spot_pair.setdefault((spot_i, spot_j), []).append((ct_i, ct_j, total_score, lr_id))
+        self.comm_by_spot_pair = comm_by_spot_pair
+
+        total_cell_pairs = sum(len(v) for v in self.comm_by_spot_pair.values())
+        print(f"[Loaded] Spot pairs with communication: {len(self.comm_by_spot_pair)}")
+        print(f"[Loaded] Spot-cell pairs with communication: {total_cell_pairs}")
         print(f"[Loaded] Unique LR pairs: {len(self.lr_pair_to_id)}")
+
+        # 释放中间聚合字典，节省内存（生成边时使用 self.comm_by_spot_pair）
+        self.lr_scores_by_spot_pair = None
     
     def __len__(self):
         # 返回所有spot数量（DGI训练不需要过滤）
@@ -674,26 +692,12 @@ class STHeteroSubgraphDataset:
         n_spots_sub = len(subgraph_spot_indices)
         
         # ========== Step 2: 获取spot表达量（原始表达谱，只保留marker基因，顺序与cell一致） ==========
-        expr_vecs = self.st_X[subgraph_spot_indices].astype(np.float32)  # [k+1, n_marker_genes_cluster]
-        
-        # 重新排列基因顺序，使其与cell marker基因顺序一致
-        expr_marker = np.zeros((expr_vecs.shape[0], len(self.spot_gene_order_to_cell)), dtype=np.float32)
-        for i, gene_idx in enumerate(self.spot_gene_order_to_cell):
-            if gene_idx >= 0:
-                expr_marker[:, i] = expr_vecs[:, gene_idx]
-            # 如果基因缺失，保持为0
-        
-        expr_raw = torch.tensor(expr_marker, dtype=torch.float32)  # [k+1, n_marker_genes] 直接返回原始表达谱
+        expr_marker = self.st_X_marker[subgraph_spot_indices]  # [k+1, n_marker_genes]
+        expr_raw = torch.from_numpy(expr_marker)  # [k+1, n_marker_genes]
         
         # ========== Step 3: 只为实际存在的cell创建节点和获取表达量 ==========
         cell_expr_raw_list = []
-        n_cell_types = len(self.cell_marker_expr)  # 所有cell类型数
-        
-        # 预先获取所有需要的基因位置
-        marker_gene_positions = []
-        for gene_name in self.cell_marker_expr.columns:
-            pos = self.marker_gene_to_idx.get(gene_name, -1)
-            marker_gene_positions.append(pos)
+        n_cell_types = len(self.cell_names)  # 所有cell类型数
         
         # ✅ 新增：记录每个spot实际存在的cell及其节点映射
         # spot_cell_mapping: {(spot_local_idx, cell_type_id): cell_node_local_idx}
@@ -701,39 +705,30 @@ class STHeteroSubgraphDataset:
         cell_node_counter = 0  # 动态分配 cell 节点编号
         
         # 遍历子图中的每个 spot
-        composition_subgraph_full = self.composition.iloc[subgraph_spot_indices].values.astype(np.float32)
+        composition_subgraph_full = self.composition_values[subgraph_spot_indices]
         
         for spot_local_idx, spot_global_idx in enumerate(subgraph_spot_indices):
             # 找出该 spot 实际存在的 cell 类型 (composition > 1e-6)
-            composition_spot = composition_subgraph_full[spot_local_idx]
-            cells_in_spot = np.where(composition_spot > 1e-6)[0]
+            cells_in_spot = self.cells_in_spot[spot_global_idx]
             
             for cell_type_id in cells_in_spot:
                 # 记录这个 cell 节点的映射
                 spot_cell_mapping[(spot_local_idx, cell_type_id)] = cell_node_counter
                 cell_node_counter += 1
                 
-                # 获取该 spot-cell 的表达向量
-                idx_in_array = self.spot_cell_expr_index.get((spot_global_idx, cell_type_id))
-                
-                if idx_in_array is not None:
-                    # 从 spot-cell 表达矩阵中提取完整表达
-                    spot_cell_full_expr = self.spot_cell_expr[idx_in_array, :]
-                    
-                    # 只取 marker 基因
-                    cell_marker_expr = np.zeros(len(marker_gene_positions), dtype=np.float32)
-                    for gene_idx, gene_pos in enumerate(marker_gene_positions):
-                        if gene_pos >= 0:
-                            cell_marker_expr[gene_idx] = spot_cell_full_expr[gene_pos]
-                else:
-                    # 如果找不到，用全局 cell marker 表达作为备选
-                    cell_marker_expr = self.cell_marker_expr.iloc[cell_type_id].values.astype(np.float32)
-                
+                row_idx = self.spot_cell_row_idx[spot_global_idx, cell_type_id]
+                cell_marker_expr = (
+                    self.spot_cell_marker_expr_values[row_idx]
+                    if row_idx >= 0
+                    else self.zero_cell_marker_expr
+                )
                 cell_expr_raw_list.append(cell_marker_expr)
         
-        cell_expr_raw = torch.tensor(
-            np.array(cell_expr_raw_list), dtype=torch.float32
-        ) if cell_expr_raw_list else torch.empty((0, len(marker_gene_positions)), dtype=torch.float32)
+        cell_expr_raw = (
+            torch.from_numpy(np.array(cell_expr_raw_list, dtype=np.float32))
+            if cell_expr_raw_list
+            else torch.empty((0, self.n_marker_genes), dtype=torch.float32)
+        )
         # [actual_n_cells, n_marker_genes] - 只包含实际存在的 cell 节点
         
         n_actual_cells = len(cell_expr_raw_list)  # 实际创建的 cell 节点数
@@ -798,56 +793,25 @@ class STHeteroSubgraphDataset:
         edge_attr_cc_list = []  # 现在包含两个特征：[lr_score, lr_id]
 
         # ✅ 计算子图内所有spot的cell之间的通讯（有向边：配体细胞 -> 受体细胞）
-        # 包括同一个spot内的不同cell类型之间的通讯
-        for i_local in range(n_spots_sub):
-            spot_i_global = subgraph_spot_indices[i_local]
-            composition_i = composition_subgraph_full[i_local]
-            cells_in_i = np.where(composition_i > 1e-6)[0]
+        # 仅遍历“预计算里存在通讯”的 cell 对，避免对 cells_in_i × cells_in_j 做穷举
+        for i_local, spot_i_global in enumerate(subgraph_spot_indices):
+            for j_local, spot_j_global in enumerate(subgraph_spot_indices):
+                comm_list = self.comm_by_spot_pair.get((spot_i_global, spot_j_global))
+                if not comm_list:
+                    continue
 
-            for j_local in range(n_spots_sub):
-                spot_j_global = subgraph_spot_indices[j_local]
-                composition_j = composition_subgraph_full[j_local]
-                cells_in_j = np.where(composition_j > 1e-6)[0]
-
-                # ✅ 计算spot i的cell到spot j的cell的有向通讯边
-                for cell_type_i in cells_in_i:
-                    # 查找spot i的这个cell类型对应的节点编号
-                    cell_i_key = (i_local, cell_type_i)
-                    if cell_i_key not in spot_cell_mapping:
+                for cell_type_i, cell_type_j, total_lr_score, lr_id in comm_list:
+                    cell_i_node_local_idx = spot_cell_mapping.get((i_local, cell_type_i))
+                    if cell_i_node_local_idx is None:
                         continue
-                    cell_i_node_local_idx = spot_cell_mapping[cell_i_key]
+                    cell_j_node_local_idx = spot_cell_mapping.get((j_local, cell_type_j))
+                    if cell_j_node_local_idx is None:
+                        continue
 
-                    for cell_type_j in cells_in_j:
-                        # 查找spot j的这个cell类型对应的节点编号
-                        cell_j_key = (j_local, cell_type_j)
-                        if cell_j_key not in spot_cell_mapping:
-                            continue
-                        cell_j_node_local_idx = spot_cell_mapping[cell_j_key]
-
-                        # 优化：直接查询预计算的LR得分，避免遍历所有LR对
-                        pair_key = (spot_i_global, spot_j_global, cell_type_i, cell_type_j)
-                        lr_keys = self.lr_keys_by_spot_pair.get(pair_key, [])
-
-                        total_lr_score = 0.0
-                        lr_ids = []
-                        for key in lr_keys:
-                            spot_i, spot_j, ct_i, ct_j, ligand, receptor = key
-                            # ✅ lr_scores_dict 现在存储 score
-                            comm_score = self.lr_scores_dict[key]
-                            total_lr_score += comm_score
-                            lr_id = self.lr_pair_to_id[(ligand, receptor)]
-                            lr_ids.append(lr_id)
-
-                        if total_lr_score > 1e-6 and lr_ids:
-                            # 使用第一个LR ID作为代表（如果有多个LR对，取平均得分但用第一个ID）
-                            lr_id = lr_ids[0]
-
-                            # ✅ 使用动态分配的节点编号
-                            cell_i_node_global_id = n_spots_sub + cell_i_node_local_idx
-                            cell_j_node_global_id = n_spots_sub + cell_j_node_local_idx
-                            edge_index_cc_list.append([cell_i_node_global_id, cell_j_node_global_id])
-                            # ✅ 边特征：[lr_score, lr_id]
-                            edge_attr_cc_list.append([total_lr_score, lr_id])
+                    cell_i_node_global_id = n_spots_sub + cell_i_node_local_idx
+                    cell_j_node_global_id = n_spots_sub + cell_j_node_local_idx
+                    edge_index_cc_list.append([cell_i_node_global_id, cell_j_node_global_id])
+                    edge_attr_cc_list.append([total_lr_score, lr_id])
                         
         edge_index_cc = torch.tensor(
             np.array(edge_index_cc_list).T if edge_index_cc_list else np.array([[], []]).astype(int),
@@ -866,14 +830,9 @@ class STHeteroSubgraphDataset:
         coords_subgraph = torch.tensor(coords_sub, dtype=torch.float32)
         composition_subgraph = torch.tensor(composition_subgraph_full, dtype=torch.float32)
         
-        # 获取子图中所有spot的barcode
-        spot_names = self.adata.obs_names.tolist()
-        subgraph_spot_barcodes = [spot_names[idx] for idx in subgraph_spot_indices]
-        
         return {
             'center_spot_idx': center_idx,
             'subgraph_spot_indices': subgraph_spot_indices,  # 保留索引用于内部计算
-            'subgraph_spot_barcodes': subgraph_spot_barcodes,  # 新增：子图spot的barcode列表
             'n_spots_sub': n_spots_sub,
             'n_cells': n_actual_cells,  # ✅ 实际创建的 cell 节点数（动态）
             'n_cell_types': n_cell_types,  # 所有 cell 类型数（用于 composition 矩阵维度）
@@ -920,7 +879,6 @@ def hetero_subgraph_collate_fn(batch):
         'n_cells': n_cells_list,  # ✅ 改为列表，每个样本可能不同
         'center_spot_idx': [sample['center_spot_idx'] for sample in batch],
         'spot_indices': [sample['subgraph_spot_indices'] for sample in batch],  # 保留索引用于内部计算
-        'spot_barcodes': [sample['subgraph_spot_barcodes'] for sample in batch],  # 新增：子图spot的barcode列表
         'spot_cell_mapping': [sample['spot_cell_mapping'] for sample in batch],  # ✅ 添加spot_cell_mapping
         'expr_raw': expr_raw_list,  # ✅ list of [n_spots_i, n_marker_genes]
         'cell_expr_raw': cell_expr_raw_list,  # ✅ list of [n_cells_i, n_marker_genes]
@@ -931,3 +889,95 @@ def hetero_subgraph_collate_fn(batch):
     }
     
     return batch_dict
+
+
+def hetero_subgraph_collate_fn_batched(batch):
+    """将多个子图做 disjoint-union，真正 batch 化为一个大图（减少 Python 循环开销）"""
+    batch = [sample for sample in batch if sample is not None]
+    batch_size = len(batch)
+    if batch_size == 0:
+        return None
+
+    n_spots_sub_list = [sample['n_spots_sub'] for sample in batch]
+    n_cells_list = [sample['n_cells'] for sample in batch]
+    spot_offsets = np.cumsum([0] + n_spots_sub_list[:-1]).astype(int).tolist()
+    cell_offsets = np.cumsum([0] + n_cells_list[:-1]).astype(int).tolist()
+    total_spots = int(sum(n_spots_sub_list))
+    total_cells = int(sum(n_cells_list))
+
+    expr_raw = torch.cat([sample['expr_raw'] for sample in batch], dim=0)
+    if total_cells > 0:
+        cell_expr_raw = torch.cat([sample['cell_expr_raw'] for sample in batch], dim=0)
+    else:
+        cell_expr_raw = torch.empty((0, expr_raw.size(1)), dtype=expr_raw.dtype)
+
+    edge_index_like_parts = []
+    edge_attr_like_parts = []
+    edge_index_cc_parts = []
+    edge_attr_cc_parts = []
+
+    for sample, n_spots_sub, n_cells, spot_off, cell_off in zip(
+        batch, n_spots_sub_list, n_cells_list, spot_offsets, cell_offsets
+    ):
+        # ---- like edges (spot-spot + spot-cell) ----
+        ei_like = sample['edge_index_like']
+        if ei_like.numel() > 0:
+            src = ei_like[0] + spot_off
+            dst = ei_like[1]
+            dst_is_spot = dst < n_spots_sub
+            dst = torch.where(
+                dst_is_spot,
+                dst + spot_off,
+                (dst - n_spots_sub) + total_spots + cell_off
+            )
+            edge_index_like_parts.append(torch.stack([src, dst], dim=0))
+
+            ea_like = sample['edge_attr_like']
+            if ea_like.numel() > 0:
+                edge_attr_like_parts.append(torch.stack([ea_like, torch.zeros_like(ea_like)], dim=1))
+
+        # ---- cc edges (cell-cell) ----
+        ei_cc = sample['edge_index_cc']
+        if ei_cc.numel() > 0:
+            src = (ei_cc[0] - n_spots_sub) + total_spots + cell_off
+            dst = (ei_cc[1] - n_spots_sub) + total_spots + cell_off
+            edge_index_cc_parts.append(torch.stack([src, dst], dim=0))
+
+            ea_cc = sample['edge_attr_cc']
+            if ea_cc.dim() == 1:
+                ea_cc = ea_cc.view(-1, 2) if ea_cc.numel() > 0 else ea_cc.new_zeros((0, 2))
+            if ea_cc.numel() > 0:
+                edge_attr_cc_parts.append(ea_cc)
+
+    edge_index_like = (
+        torch.cat(edge_index_like_parts, dim=1)
+        if edge_index_like_parts
+        else torch.empty((2, 0), dtype=torch.long)
+    )
+    edge_attr_like = (
+        torch.cat(edge_attr_like_parts, dim=0)
+        if edge_attr_like_parts
+        else torch.empty((0, 2), dtype=torch.float32)
+    )
+    edge_index_cc = (
+        torch.cat(edge_index_cc_parts, dim=1)
+        if edge_index_cc_parts
+        else torch.empty((2, 0), dtype=torch.long)
+    )
+    edge_attr_cc = (
+        torch.cat(edge_attr_cc_parts, dim=0)
+        if edge_attr_cc_parts
+        else torch.empty((0, 2), dtype=torch.float32)
+    )
+
+    return {
+        'batch_size': batch_size,
+        'n_spots_sub': n_spots_sub_list,
+        'n_cells': n_cells_list,
+        'expr_raw': expr_raw,
+        'cell_expr_raw': cell_expr_raw,
+        'edge_index_like': edge_index_like,
+        'edge_attr_like': edge_attr_like,
+        'edge_index_cc': edge_index_cc,
+        'edge_attr_cc': edge_attr_cc,
+    }

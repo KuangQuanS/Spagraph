@@ -43,6 +43,7 @@ def run_cellcom(
     lr_id_emb_dim: int = 8,
     # Training parameters
     batch_size: int = 4,
+    num_workers: int = 0,
     epochs: int = 100,
     learning_rate: float = 1e-4,
     weight_decay: float = 1e-5,
@@ -159,6 +160,7 @@ def run_cellcom(
         mask_seed=mask_seed,
         lr_id_emb_dim=lr_id_emb_dim,
         batch_size=batch_size,
+        num_workers=num_workers,
         epochs=epochs,
         learning_rate=learning_rate,
         weight_decay=weight_decay,

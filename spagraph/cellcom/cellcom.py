@@ -49,6 +49,7 @@ def _print_stage3_header(args, device: torch.device):
     print(f"Use HVG for Comm:   {args.use_hvg_for_communication}")
     print(f"Active Expr Thr:    {args.active_expr_threshold}")
     print(f"LR Score Thr:       {args.lr_score_threshold}")
+    print(f"Same-Type Comm:     {getattr(args, 'allow_same_celltype_comm', False)}")
     print(f"Min Comm Edges:     {args.min_comm_edges}")
     print(f"Attention Thr:      {args.attention_threshold}")
     print(f"MLP:               {args.mlp_hidden_dims} -> {args.mlp_latent_dim}")
@@ -94,6 +95,12 @@ def parse_args():
                        help='预计算的spot-cell全基因表达CSV文件路径，如果提供则跳过构建步骤')
     parser.add_argument('--use_hvg_for_communication', type=lambda x: str(x).lower() == 'true', default=True,
                        help='只使用高变基因计算LR通讯（而非全部基因），减少计算量并保持特征一致性 (default: True)')
+    parser.add_argument(
+        '--allow_same_celltype_comm',
+        type=lambda x: str(x).lower() == 'true',
+        default=False,
+        help='是否允许相同细胞类型之间的通讯（同-type across spots）；默认关闭以保持与旧版本一致 (default: False)',
+    )
 
     # GAT参数
     parser.add_argument('--gat_hidden_dims', type=str, default='512,256,128', help='GAT隐层维度')

@@ -185,7 +185,8 @@ def calculate_lr_scores(
     total_pairs = 0
     spots_with_cells = 0
     spots_without_cells = 0
-    same_celltype_skipped = 0  # 统计跳过的同类型细胞对
+    allow_same_celltype_comm = bool(getattr(args, "allow_same_celltype_comm", False))
+    same_celltype_skipped = 0  # 统计跳过的同类型细胞对（仅在关闭同-type通讯时）
 
     # 遍历所有潜在的LR通信邻居对（KNN邻居，并过滤掉距离过远的邻居）
     for i in range(n_spots):
@@ -249,8 +250,8 @@ def calculate_lr_scores(
                     idx_j = spot_cell_name_to_idx[spot_cell_j_key]
                     cell_j_expr = spot_cell_expr_array[idx_j, :]
 
-                    # ✅ 跳过相同细胞类型之间的通讯
-                    if celltype_i == celltype_j:
+                    # ✅ 可选：跳过相同细胞类型之间的通讯（同-type）
+                    if (not allow_same_celltype_comm) and (celltype_i == celltype_j):
                         same_celltype_skipped += 1
                         continue
 
@@ -303,8 +304,11 @@ def calculate_lr_scores(
     print(
         "LR scores:          "
         f"events={len(comm_event_records)}, neighbor_pairs={total_pairs}, "
-        f"spots_with_cells={spots_with_cells}/{n_spots}"
+        f"spots_with_cells={spots_with_cells}/{n_spots}, "
+        f"same_type={'ON' if allow_same_celltype_comm else 'OFF'}"
     )
+    if (not allow_same_celltype_comm) and same_celltype_skipped:
+        print(f"LR scores:          same-type skipped={same_celltype_skipped}")
 
     # ✅ 使用 output_dir 保存 LR 通讯得分
     csv_path = os.path.join(output_dir, "lr_scores.csv")

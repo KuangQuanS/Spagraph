@@ -3,8 +3,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn import GATConv
 import numpy as np
-from sklearn.neighbors import NearestNeighbors
-from sklearn.metrics.pairwise import cosine_similarity
 from typing import List, Tuple, Dict, Optional
 
 # ================================
@@ -536,78 +534,69 @@ class HeterogeneousGATDeconvolution(nn.Module):
         # 合并节点特征 [spots; celltypes]
         node_features = torch.cat([spot_features, celltype_features], dim=0)
         
-        # 2. 构建边
-        edge_indices = []
-        edge_attrs = []
+        # 2. 构建边（torch 向量化，避免 sklearn + Python 双重循环）
+        edge_indices: List[torch.Tensor] = []
+        edge_attrs: List[torch.Tensor] = []
         
         # 2.1 Spot-Spot边（空间KNN或嵌入KNN）
-        if n_spots > 1:
-            if not use_embedding_knn and spatial_coords is not None and len(spatial_coords) > 1:
-                coords_np = spatial_coords.detach().cpu().numpy()
-                nbrs = NearestNeighbors(n_neighbors=min(self.k_spatial+1, len(coords_np))).fit(coords_np)
-                distances, indices = nbrs.kneighbors(coords_np)
-                
-                for i in range(len(indices)):
-                    for j in range(1, len(indices[i])):  # 跳过自己（第0个）
-                        neighbor_idx = indices[i][j]
-                        distance = distances[i][j]
-                        
-                        # 转换为相似度权重
-                        weight = np.exp(-distance / (np.std(distances) + 1e-8))
-                        
-                        # 双向边
-                        edge_indices.append([i, neighbor_idx])
-                        edge_attrs.append([weight])
-                        edge_indices.append([neighbor_idx, i])
-                        edge_attrs.append([weight])
-            else:
-                # 基于spot embedding的KNN（使用余弦相似度）
-                spot_np = spot_embeddings.detach().cpu().numpy()
-                nbrs = NearestNeighbors(n_neighbors=min(self.k_spatial+1, len(spot_np)), metric='cosine').fit(spot_np)
-                distances, indices = nbrs.kneighbors(spot_np)
-                # cosine metric gives distance = 1 - cosine_sim
-                for i in range(len(indices)):
-                    for j in range(1, len(indices[i])):
-                        neighbor_idx = indices[i][j]
-                        distance = distances[i][j]
-                        weight = np.exp(-(distance) / (np.std(distances) + 1e-8))
-                        edge_indices.append([i, neighbor_idx])
-                        edge_attrs.append([weight])
-                        edge_indices.append([neighbor_idx, i])
-                        edge_attrs.append([weight])
+        if n_spots > 1 and self.k_spatial > 0:
+            k_spatial = min(int(self.k_spatial), n_spots - 1)
+            with torch.no_grad():
+                if (
+                    not use_embedding_knn
+                    and spatial_coords is not None
+                    and spatial_coords.shape[0] > 1
+                ):
+                    # Euclidean KNN in spatial space
+                    dists = torch.cdist(spatial_coords, spatial_coords)  # [n_spots, n_spots]
+                else:
+                    # Cosine distance KNN in embedding space: dist = 1 - cos_sim
+                    spot_norm = F.normalize(spot_embeddings, p=2, dim=1)
+                    sim = spot_norm @ spot_norm.t()
+                    dists = 1.0 - sim
+
+                # Exclude self
+                diag_idx = torch.arange(n_spots, device=device)
+                dists[diag_idx, diag_idx] = float('inf')
+
+                knn_dists, knn_idx = torch.topk(dists, k=k_spatial, largest=False)
+                dist_std = knn_dists.std()
+                weights = torch.exp(-knn_dists / (dist_std + 1e-8)).reshape(-1, 1)
+
+                src = torch.arange(n_spots, device=device).unsqueeze(1).expand(-1, k_spatial)
+                src_flat = src.reshape(-1)
+                dst_flat = knn_idx.reshape(-1)
+
+                edge_indices.append(torch.stack([src_flat, dst_flat], dim=0))
+                edge_indices.append(torch.stack([dst_flat, src_flat], dim=0))
+                edge_attrs.append(weights)
+                edge_attrs.append(weights)
         
-        # 2.2 Spot-CellType边（基于KNN，每个spot连接k个最近的celltype）
-        # 在原始VAE embedding空间计算相似度（更准确地反映语义相似性）
-        spot_emb_np = spot_embeddings.detach().cpu().numpy()
-        celltype_emb_np = celltype_prototypes.detach().cpu().numpy()
+        # 2.2 Spot-CellType边（每个spot连接k个最相似的celltype）
+        if n_spots > 0 and n_cell_types > 0 and self.k_celltype > 0:
+            k_neighbors = min(int(self.k_celltype), n_cell_types)
+            with torch.no_grad():
+                # Cosine similarity in original VAE embedding space
+                spot_norm = F.normalize(spot_embeddings, p=2, dim=1)
+                cell_norm = F.normalize(celltype_prototypes, p=2, dim=1)
+                sim_matrix = spot_norm @ cell_norm.t()  # [n_spots, n_cell_types]
+
+                top_sim, top_idx = torch.topk(sim_matrix, k=k_neighbors, dim=1, largest=True)
+
+                src = torch.arange(n_spots, device=device).unsqueeze(1).expand(-1, k_neighbors).reshape(-1)
+                dst_cell = top_idx.reshape(-1)
+                dst_node = dst_cell + n_spots
+
+                sim_vals = top_sim.reshape(-1, 1)
+                edge_indices.append(torch.stack([src, dst_node], dim=0))
+                edge_indices.append(torch.stack([dst_node, src], dim=0))
+                edge_attrs.append(sim_vals)
+                edge_attrs.append(sim_vals)
         
-        similarity_matrix = cosine_similarity(spot_emb_np, celltype_emb_np)  # [n_spots, n_cell_types]
-        
-        # 对于每个spot，找到最相似的k个celltype
-        k_neighbors = min(self.k_celltype, n_cell_types)  # 防止k超过celltype数量
-        
-        for spot_idx in range(n_spots):
-            # 获取该spot与所有celltype的相似度
-            similarities = similarity_matrix[spot_idx]
-            
-            # 找到最大的k个相似度的索引
-            top_k_indices = np.argsort(-similarities)[:k_neighbors]
-            
-            for celltype_idx in top_k_indices:
-                similarity = similarities[celltype_idx]
-                
-                # Spot -> CellType
-                edge_indices.append([spot_idx, n_spots + celltype_idx])
-                edge_attrs.append([similarity])
-                
-                # CellType -> Spot
-                edge_indices.append([n_spots + celltype_idx, spot_idx])
-                edge_attrs.append([similarity])
-        
-        # 转换为tensor
-        if len(edge_indices) > 0:
-            edge_index = torch.LongTensor(edge_indices).t().contiguous().to(device)
-            edge_attr = torch.FloatTensor(edge_attrs).to(device)
+        # 拼接为 tensor
+        if edge_indices:
+            edge_index = torch.cat(edge_indices, dim=1).to(torch.long)
+            edge_attr = torch.cat(edge_attrs, dim=0).to(torch.float)
         else:
             edge_index = torch.zeros((2, 0), dtype=torch.long, device=device)
             edge_attr = torch.zeros((0, 1), dtype=torch.float, device=device)
@@ -638,14 +627,14 @@ class HeterogeneousGATDeconvolution(nn.Module):
         # This is used to enforce k_celltype sparsity
         sparse_mask = torch.zeros(n_spots, n_cell_types, dtype=torch.bool, device=device)
         
-        # Extract spot-celltype edges from edge_index
-        n_nodes = n_spots + n_cell_types
-        for i in range(edge_index.shape[1]):
-            src, dst = edge_index[0, i].item(), edge_index[1, i].item()
-            # Spot -> CellType edge
-            if src < n_spots and dst >= n_spots:
-                celltype_idx = dst - n_spots
-                sparse_mask[src, celltype_idx] = True
+        # Extract spot-celltype edges from edge_index (vectorized)
+        src = edge_index[0]
+        dst = edge_index[1]
+        sc_mask = (src < n_spots) & (dst >= n_spots)
+        if sc_mask.any():
+            src_spots = src[sc_mask]
+            dst_cells = dst[sc_mask] - n_spots
+            sparse_mask[src_spots, dst_cells] = True
         
         # 3. GAT processing with residual connections
         # 保存原始节点特征用于残差连接

@@ -47,7 +47,8 @@ def _print_stage3_header(args, device: torch.device):
     print(f"Num Workers:        {getattr(args, 'num_workers', 0)}")
     print(f"K Spot Neighbors:   {args.n_spot_neighbors}")
     print(f"Use HVG for Comm:   {args.use_hvg_for_communication}")
-    print(f"Active Expr Thr:    {args.active_expr_threshold}")
+    print(f"Ligand Expr Thr:    {getattr(args, 'ligand_expr_threshold', 3.0)} (CP10k)")
+    print(f"Receptor Expr Thr:  {getattr(args, 'receptor_expr_threshold', 1.0)} (CP10k)")
     print(f"LR Score Thr:       {args.lr_score_threshold}")
     print(f"Same-Type Comm:     {getattr(args, 'allow_same_celltype_comm', False)}")
     print(f"Min Comm Edges:     {args.min_comm_edges}")
@@ -85,8 +86,12 @@ def parse_args():
     parser.add_argument('--mean_expr_threshold', type=float, default=3.0, 
                        help='（已弃用）通用阈值：保留以兼容旧脚本，不再作为默认回退使用')
 
+    parser.add_argument('--ligand_expr_threshold', type=float, default=3.0,
+                       help='配体活跃基因阈值（CP10k）。默认=3.0')
+    parser.add_argument('--receptor_expr_threshold', type=float, default=1.0,
+                       help='受体活跃基因阈值（CP10k，通常低于配体）。默认=1.0')
     parser.add_argument('--active_expr_threshold', type=float, default=3.0,
-                       help='活跃基因阈值（CP10k，线性空间）。默认=3.0')
+                       help='（已弃用）活跃基因阈值。请使用ligand_expr_threshold和receptor_expr_threshold')
     parser.add_argument('--lr_score_threshold', type=float, default=3.0,
                        help='LR 通讯得分阈值（log1p 空间）。默认=3.0')
     parser.add_argument('--min_comm_edges', type=int, default=1, 
@@ -302,7 +307,9 @@ def main(args=None):
         cell_full_expr=spot_cell_expr_df,  
         output_dir=args.output_dir,
         n_neighbors=args.n_spot_neighbors,
-        hvg_genes=available_activated_genes if args.use_hvg_for_communication else None
+        hvg_genes=available_activated_genes if args.use_hvg_for_communication else None,
+        ligand_expr_threshold=getattr(args, 'ligand_expr_threshold', 3.0),
+        receptor_expr_threshold=getattr(args, 'receptor_expr_threshold', 1.0)
     )
     
     dataset = STHeteroSubgraphDataset(

@@ -22,7 +22,9 @@ def calculate_lr_scores(
     lr_pairs: List[Tuple[str, str]],
     output_dir: str,
     n_neighbors: int = 20,
-    hvg_genes: Optional[List[str]] = None
+    hvg_genes: Optional[List[str]] = None,
+    ligand_expr_threshold: float = 3.0,
+    receptor_expr_threshold: float = 1.0
 ) -> Tuple[np.ndarray, str, Dict[str, Any]]:
     """
     Calculate KNN neighborhoods and LR communication scores.
@@ -49,16 +51,17 @@ def calculate_lr_scores(
     
     # ✅ 在 KNN 邻居内用距离阈值过滤“过远”的邻居
     # 说明：KNN 总会保留固定数量邻居，在点稀疏区域可能出现非常远的邻居；这里用距离阈值剪枝。
-    lr_comm_distance_threshold = 500.0  # 单位与 spot_coords 一致（例如 μm）
+    lr_comm_distance_threshold = 2500.0  # 单位与 spot_coords 一致（例如 μm）
 
     # 阈值选择：使用独立参数（不再回退到 mean_expr_threshold）
-    active_expr_threshold = getattr(args, 'active_expr_threshold', 3.0)
+    ligand_expr_threshold = getattr(args, 'ligand_expr_threshold', ligand_expr_threshold)
+    receptor_expr_threshold = getattr(args, 'receptor_expr_threshold', receptor_expr_threshold)
     lr_score_threshold = getattr(args, 'lr_score_threshold', 3.0)
 
     print(
         "LR scores:          "
         f"spots={n_spots}, knn={n_neighbors}, dist_thr={lr_comm_distance_threshold}, "
-        f"active_thr={active_expr_threshold}, lr_thr={lr_score_threshold}"
+        f"lig_thr={ligand_expr_threshold}, rec_thr={receptor_expr_threshold}, lr_thr={lr_score_threshold}"
     )
 
     # ✅ 准备数据结构
@@ -115,7 +118,9 @@ def calculate_lr_scores(
     cell_active_genes_ligand = {}  # spot_cell_key -> set of active ligand gene indices
     cell_active_genes_receptor = {}  # spot_cell_key -> set of active receptor gene indices
 
-    # 使用之前计算的 active_expr_threshold 作为活跃基因筛选阈值（CP10k 空间）
+    # ✅ 使用CP10k归一化进行活跃基因筛选，配体和受体使用各自的阈值
+    # ligand_expr_threshold: 配体表达阈值（CP10k）
+    # receptor_expr_threshold: 受体表达阈值（CP10k，通常较低）
     
     # 过滤掉不参与通讯的基因索引（提前计算）
     filtered_gene_indices = set()
@@ -129,24 +134,29 @@ def calculate_lr_scores(
         idx = spot_cell_name_to_idx[spot_cell_name]
         cell_expr = spot_cell_expr_array[idx, :]  # [n_genes]
         
-        # 对单个细胞进行normalize
+        # 对单个细胞进行CP10k归一化
         total_count = cell_expr.sum()
         if total_count > 0:
             cell_expr_normalized = cell_expr / total_count * 1e4  # [n_genes]
         else:
             cell_expr_normalized = cell_expr  # 表达全为0的情况
         
-        # 筛选活跃基因：归一化后的表达值 > active_expr_threshold（CP10k）
-        active_mask = cell_expr_normalized > active_expr_threshold
-        active_gene_indices = set(np.where(active_mask)[0]) - filtered_gene_indices
+        # 筛选活跃配体基因：归一化后的表达值 > ligand_expr_threshold（CP10k）
+        ligand_active_mask = cell_expr_normalized > ligand_expr_threshold
+        ligand_active_indices = set(np.where(ligand_active_mask)[0]) - filtered_gene_indices
+        
+        # 筛选活跃受体基因：归一化后的表达值 > receptor_expr_threshold（CP10k）
+        receptor_active_mask = cell_expr_normalized > receptor_expr_threshold
+        receptor_active_indices = set(np.where(receptor_active_mask)[0]) - filtered_gene_indices
         
         # ✅ 如果启用HVG限制，进一步过滤只保留HVG
         if allowed_gene_indices is not None:
-            active_gene_indices = active_gene_indices & allowed_gene_indices
+            ligand_active_indices = ligand_active_indices & allowed_gene_indices
+            receptor_active_indices = receptor_active_indices & allowed_gene_indices
         
-        # 配体和受体使用相同的活跃基因集合
-        cell_active_genes_ligand[spot_cell_name] = active_gene_indices
-        cell_active_genes_receptor[spot_cell_name] = active_gene_indices
+        # 配体和受体使用各自的活跃基因集合
+        cell_active_genes_ligand[spot_cell_name] = ligand_active_indices
+        cell_active_genes_receptor[spot_cell_name] = receptor_active_indices
 
     # （静默）统计信息可按需添加
 

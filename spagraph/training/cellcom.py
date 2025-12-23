@@ -22,8 +22,8 @@ def run_cellcom(
     # Graph parameters
     n_spot_neighbors: int = 10,
     # LR communication parameters
-    mean_expr_threshold: float = 1.0,  # deprecated, not used as fallback
-    active_expr_threshold: float = 3.0,  # 活跃基因阈值（CP10k）
+    ligand_expr_threshold: float = 3.0,  # 配体表达阈值（CP10k）
+    receptor_expr_threshold: float = 1.0,  # 受体表达阈值（CP10k，通常较低）
     lr_score_threshold: float = 0,  # LR得分阈值（log1p 空间）
     min_comm_edges: int = 1,
     spot_cell_expr_csv: Optional[str] = None,  # 可选，优先使用deconv_dir中的动态表达
@@ -143,8 +143,8 @@ def run_cellcom(
         mlp_latent_dim=mlp_latent_dim,
         mlp_hidden_dims=mlp_hidden_dims,
         n_spot_neighbors=n_spot_neighbors,
-        mean_expr_threshold=mean_expr_threshold,
-        active_expr_threshold=active_expr_threshold,
+        ligand_expr_threshold=ligand_expr_threshold,
+        receptor_expr_threshold=receptor_expr_threshold,
         lr_score_threshold=lr_score_threshold,
         min_comm_edges=min_comm_edges,
         spot_cell_expr_csv=spot_cell_expr_csv,

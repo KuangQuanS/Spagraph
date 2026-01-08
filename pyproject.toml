@@ -66,6 +66,7 @@ packages = [
     "spagraph.preprocessing",
     "spagraph.utils",
     "spagraph.cellcom",
+    "SC_MAP_ST",
 ]
 
 [tool.setuptools.dynamic]

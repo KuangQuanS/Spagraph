@@ -51,7 +51,7 @@ def calculate_lr_scores(
     
     # ✅ 在 KNN 邻居内用距离阈值过滤“过远”的邻居
     # 说明：KNN 总会保留固定数量邻居，在点稀疏区域可能出现非常远的邻居；这里用距离阈值剪枝。
-    lr_comm_distance_threshold = 2500.0  # 单位与 spot_coords 一致（例如 μm）
+    lr_comm_distance_threshold = 500.0  # 单位与 spot_coords 一致（例如 μm）
 
     # 阈值选择：使用独立参数（不再回退到 mean_expr_threshold）
     ligand_expr_threshold = getattr(args, 'ligand_expr_threshold', ligand_expr_threshold)

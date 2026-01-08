@@ -846,11 +846,10 @@ class SpatialDeconvolutionLoss(nn.Module):
         n_genes = sc_cell_expressions.shape[1]
         device = attention_weights.device
         
-        # ✅ 内存优化：逐cluster处理，避免一次性分配巨大tensor
-        # 原来：[n_spots, n_cell_types, k, n_genes] 太大！
-        # 现在：逐个cluster处理，内存占用 = [n_spots, k, n_genes]
+        # ✅ 内存优化：避免一次性分配巨大tensor
+        # 改为逐cluster累积到最终结果，减少内存占用
         
-        cluster_dynamic_expr = torch.zeros(n_spots, n_cell_types, n_genes, device=device)
+        mixed_expr_full = torch.zeros(n_spots, n_genes, device=device)
         
         for cluster_id in range(n_cell_types):
             # 当前cluster的索引和权重
@@ -864,17 +863,10 @@ class SpatialDeconvolutionLoss(nn.Module):
             cell_expr = sc_cell_expressions[safe_indices.reshape(-1)].reshape(n_spots, k, n_genes)
             
             # 计算加权和: [n_spots, k] × [n_spots, k, n_genes] → [n_spots, n_genes]
-            cluster_dynamic_expr[:, cluster_id, :] = torch.einsum('sk,skg->sg', 
-                                                                   cluster_weights, 
-                                                                   cell_expr)
-        
-        # ✅ 最终混合：用attention_weights加权
-        # attention_weights: [n_spots, n_cell_types]
-        # cluster_dynamic_expr: [n_spots, n_cell_types, n_genes]
-        # → mixed_expr_full: [n_spots, n_genes]
-        mixed_expr_full = torch.einsum('sc,scg->sg', 
-                                       attention_weights, 
-                                       cluster_dynamic_expr)
+            cluster_expr = torch.einsum('sk,skg->sg', cluster_weights, cell_expr)
+            
+            # 累积到最终结果
+            mixed_expr_full += attention_weights[:, cluster_id].unsqueeze(-1) * cluster_expr
         
         return mixed_expr_full
         
@@ -1427,7 +1419,7 @@ def plot_vae_training_curves(train_losses, test_losses, recon_losses, kl_losses,
         ax6.grid(True)
     
     plt.tight_layout()
-    plt.savefig(f"{output_dir}/vae_training_curves.png", dpi=300, bbox_inches='tight')
+    plt.savefig(f"{output_dir}/vae_training_curves.pdf", bbox_inches='tight')
     plt.close()
 
 
@@ -1586,27 +1578,29 @@ def plot_modality_alignment_umap(vae, train_X, train_modality, device, y_train=N
     reducer = umap.UMAP(n_neighbors=30, min_dist=0.3, metric='euclidean', random_state=42)
     umap_coords = reducer.fit_transform(embeddings)
     
-    # Create figure with subplots
-    fig, axes = plt.subplots(1, 2, figsize=(20, 8))
-    
-    # Plot 1: Color by modality (SC vs ST)
-    ax1 = axes[0]
+    # Masks for modalities
     sc_mask = train_modality == 0
     st_mask = train_modality == 1
     
+    # Plot 1: Color by modality (SC vs ST)
+    fig1, ax1 = plt.subplots(1, 1, figsize=(8, 6))
+    
     ax1.scatter(umap_coords[sc_mask, 0], umap_coords[sc_mask, 1], 
-               c='#1f77b4', s=20, alpha=0.6, label=f'SC (n={sum(sc_mask)})', edgecolors='none')
+               c='#1f77b4', s=20, alpha=0.6, label=f'SC', edgecolors='none')
     ax1.scatter(umap_coords[st_mask, 0], umap_coords[st_mask, 1], 
-               c='#ff7f0e', s=20, alpha=0.6, label=f'ST (n={sum(st_mask)})', edgecolors='none')
+               c='#ff7f0e', s=20, alpha=0.6, label=f'ST', edgecolors='none')
     
     ax1.set_title('UMAP: SC vs ST Modality Alignment', fontsize=14, fontweight='bold')
     ax1.set_xlabel('UMAP 1', fontsize=12)
     ax1.set_ylabel('UMAP 2', fontsize=12)
     ax1.legend(fontsize=11, markerscale=2)
-    ax1.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig(f"{output_dir}/modality_alignment_umap_1.pdf", bbox_inches='tight')
+    plt.close(fig1)
     
     # Plot 2: Color by cluster (SC only) + ST
-    ax2 = axes[1]
+    fig2, ax2 = plt.subplots(1, 1, figsize=(8, 6))
     
     if y_train is not None:
         # Get SC data with cluster labels
@@ -1645,8 +1639,7 @@ def plot_modality_alignment_umap(vae, train_X, train_modality, device, y_train=N
     ax2.set_xlabel('UMAP 1', fontsize=12)
     ax2.set_ylabel('UMAP 2', fontsize=12)
     ax2.legend(fontsize=9, markerscale=2, ncol=2, loc='upper right')
-    ax2.grid(True, alpha=0.3)
     
     plt.tight_layout()
-    plt.savefig(f"{output_dir}/modality_alignment_umap.png", dpi=300, bbox_inches='tight')
-    plt.close()
+    plt.savefig(f"{output_dir}/modality_alignment_umap_2.pdf", bbox_inches='tight')
+    plt.close(fig2)

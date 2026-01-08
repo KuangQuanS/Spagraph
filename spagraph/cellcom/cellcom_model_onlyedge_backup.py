@@ -18,11 +18,11 @@ class EdgeAttentionLayer(nn.Module):
 
         assert hidden_dim % num_heads == 0, "hidden_dim must be divisible by num_heads"
 
-        # 注意力和消息计算需要结合边特征和节点特征
-        attention_input_dim = edge_dim + 2 * node_dim  # 边特征 + 源节点 + 目标节点
-        message_input_dim = edge_dim + node_dim  # 边特征 + 源节点
+        # 纯边驱动：注意力和消息计算只使用边特征
+        attention_input_dim = edge_dim  # 只用边特征
+        message_input_dim = edge_dim    # 只用边特征
 
-        # 边特征编码器 - 结合边特征和源节点特征生成消息
+        # 边特征编码器 - 只使用边特征生成消息
         self.edge_encoder = nn.Sequential(
             nn.Linear(message_input_dim, hidden_dim),
             nn.ReLU(),
@@ -34,14 +34,6 @@ class EdgeAttentionLayer(nn.Module):
             nn.Linear(attention_input_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, num_heads)
-        )
-        
-        # ✅ 边强度预测器 - 结合边特征和节点特征评估边的重要性（输出raw logits）
-        self.edge_strength_predictor = nn.Sequential(
-            nn.Linear(attention_input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, 1)  # 单头输出，预测边强度
         )
 
         self.output_projection = nn.Linear(hidden_dim, hidden_dim)
@@ -61,7 +53,7 @@ class EdgeAttentionLayer(nn.Module):
 
         Returns:
             out: [n_nodes, hidden_dim] 节点表示
-            attention_scores: [n_edges, num_heads] 边注意力得分
+            attention_scores: [n_edges] 边注意力得分（跨头平均）
         """
         n_edges = edge_attr.size(0)
         n_nodes = node_feat.size(0)
@@ -73,27 +65,17 @@ class EdgeAttentionLayer(nn.Module):
             out = self.output_projection(out)
             out = self.output_dropout(out)
             if return_attention:
-                return out, (torch.empty(0, self.num_heads, device=edge_attr.device), torch.empty(0, device=edge_attr.device))
+                return out, torch.empty(0, device=edge_attr.device)
             else:
                 return out, None
 
-        # 获取源节点和目标节点特征
-        src_feat = node_feat[edge_index[0]]  # [n_edges, node_dim]
-        dst_feat = node_feat[edge_index[1]]  # [n_edges, node_dim]
-
-        # 1. 预测边强度（结合边特征和节点特征）
-        strength_input = torch.cat([edge_attr, src_feat, dst_feat], dim=-1)  # [n_edges, edge_dim + 2*node_dim]
-        edge_strength_logits = self.edge_strength_predictor(strength_input).squeeze(-1)  # [n_edges]
-
-        # 2. 计算注意力权重用于节点聚合（结合边特征和节点特征实现动态注意力）
-        attention_input = torch.cat([edge_attr, src_feat, dst_feat], dim=-1)  # [n_edges, edge_dim + 2*node_dim]
-        attention_logits = self.attention_predictor(attention_input)  # [n_edges, num_heads]
+        # 1. 计算注意力权重（纯边驱动：只使用边特征）
+        attention_logits = self.attention_predictor(edge_attr)  # [n_edges, num_heads]
         # 使用edge-wise softmax进行归一化（对每个目标节点的所有入边）
         attention_weights = self._edge_softmax(attention_logits, edge_index[1])  # [n_edges, num_heads]
 
-        # 3. 生成消息（结合边特征和源节点特征）
-        message_input = torch.cat([edge_attr, src_feat], dim=-1)  # [n_edges, edge_dim + node_dim]
-        edge_updates = self.edge_encoder(message_input)  # [n_edges, hidden_dim]
+        # 2. 生成消息（纯边驱动：只使用边特征）
+        edge_updates = self.edge_encoder(edge_attr)  # [n_edges, hidden_dim]
 
         # Reshape为多头
         edge_updates = edge_updates.view(n_edges, self.num_heads, self.head_dim)  # [n_edges, num_heads, head_dim]
@@ -127,10 +109,9 @@ class EdgeAttentionLayer(nn.Module):
         # 计算每条边跨头的平均注意力 (attn_avg)
         attn_avg = attention_weights.mean(dim=-1)  # [n_edges]
 
-        # 返回边强度logits（用于监督学习和评估）以及实际用于聚合的归一化注意力
+        # 返回归一化后的注意力权重
         if return_attention:
-            # 返回 (attn_avg, edge_strength_logits) 作为元组，便于上游使用真实attention用于报告和sigmoid/logits用于监督
-            return out, (attn_avg, edge_strength_logits)
+            return out, attn_avg
         else:
             return out, None
     
@@ -196,7 +177,7 @@ class EdgeAttentionNetwork(nn.Module):
 
         Returns:
             out: [n_nodes, hidden_dims[-1]]
-            attention_scores: [n_edges, num_heads] 如果return_attention=True，否则None
+            attention_scores: [n_edges] 如果return_attention=True，否则None
         """
         x = node_feat
         attn_scores = None
@@ -318,10 +299,10 @@ class HeteroSTModel(nn.Module):
             nn.Linear(output_dim, output_dim)
         )
         
-        # ✅ 通讯强度预测头（基于注意力机制）
-        # 输入：注意力得分 + 节点表示
+        # ✅ 通讯强度预测头（基于聚合后的节点表示重构被mask的边）
+        # 输入：源节点表示 + 目标节点表示
         self.comm_predictor = nn.Sequential(
-            nn.Linear(1 + gat_hidden_dims[-1] * 2, gat_hidden_dims[-1]),
+            nn.Linear(gat_hidden_dims[-1] * 2, gat_hidden_dims[-1]),
             nn.ReLU(),
             nn.Dropout(gat_dropout),
             nn.Linear(gat_hidden_dims[-1], 1)
@@ -453,14 +434,12 @@ class HeteroSTModel(nn.Module):
             lr_id_emb = self.lr_id_embedding(lr_ids)
             comm_edge_feat = torch.cat([lr_scores, lr_id_emb], dim=1)
 
-            comm_repr, cc_attention_tuple = self.edge_attn_comm(
+            comm_repr, cc_attention = self.edge_attn_comm(
                 comm_edge_feat, edge_index_cc, all_feat, return_attention=return_attention
             )
 
-            # cc_attention_tuple: (attn_avg, edge_strength_logits) or None
-            if cc_attention_tuple is not None:
-                attn_avg, edge_strength_logits = cc_attention_tuple
-                cc_attention = attn_avg
+            # cc_attention: 归一化的注意力权重 [n_edges]
+            if cc_attention is not None:
                 # 只对被mask的边进行重构预测
                 if edge_mask is not None and edge_mask.any():
                     src_idx, dst_idx = edge_index_cc
@@ -468,16 +447,12 @@ class HeteroSTModel(nn.Module):
                     masked_dst_idx = dst_idx[edge_mask]
                     masked_src_repr = comm_repr[masked_src_idx]
                     masked_dst_repr = comm_repr[masked_dst_idx]
-                    masked_attention = edge_strength_logits[edge_mask]
+                    # 使用聚合后的节点表示预测原始LR score，不依赖注意力值
                     masked_edge_features = torch.cat([
-                        masked_attention.unsqueeze(-1),
                         masked_src_repr,
                         masked_dst_repr
                     ], dim=-1)
                     predicted_masked_edges = self.comm_predictor(masked_edge_features).squeeze(-1)
-            else:
-                attn_avg, edge_strength_logits = None, None
-                cc_attention = None
         else:
             comm_repr = self.fallback_proj(all_feat)
             cc_attention = None

@@ -24,7 +24,7 @@ def run_cellcom(
     # LR communication parameters
     ligand_expr_threshold: float = 3.0,  # 配体表达阈值（CP10k）
     receptor_expr_threshold: float = 1.0,  # 受体表达阈值（CP10k，通常较低）
-    lr_score_threshold: float = 0,  # LR得分阈值（log1p 空间）
+    lr_score_threshold: float = 1,  # LR得分阈值（log1p 空间）
     min_comm_edges: int = 1,
     spot_cell_expr_csv: Optional[str] = None,  # 可选，优先使用deconv_dir中的动态表达
     use_hvg_for_communication: bool = False,  # 只使用高变基因计算通讯（默认启用）、

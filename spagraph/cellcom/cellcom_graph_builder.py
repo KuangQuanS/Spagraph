@@ -481,6 +481,7 @@ class STHeteroSubgraphDataset:
         
         # 加载ST数据
         self.adata = sc.read_h5ad(st_h5ad_path)
+        self.adata.var_names_make_unique()
         self.n_spots = self.adata.n_obs
         
         # 获取spot坐标（用于构建邻域）
@@ -497,7 +498,9 @@ class STHeteroSubgraphDataset:
         self.knn_mask = graph_data.get('knn_mask', None)
         
         # 获取ST中与cluster表达量匹配的基因
-        self.genes = cluster_expr.columns.tolist()
+        self.genes = list(set(cluster_expr.columns.tolist()))
+        # 过滤到 adata 中存在的基因
+        self.genes = [g for g in self.genes if g in self.adata.var_names]
         # 对于激活基因，我们需要从adata中提取对应的表达
         if len(self.genes) != self.adata.n_vars:
             # 如果基因数量不匹配，说明使用的是激活基因子集

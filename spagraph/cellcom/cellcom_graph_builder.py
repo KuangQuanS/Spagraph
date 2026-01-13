@@ -570,6 +570,13 @@ class STHeteroSubgraphDataset:
             np.where(self.composition_values[i] > 1e-6)[0]
             for i in range(self.n_spots)
         ]
+        
+        # ========== 预计算Spot-Spot高斯权重矩阵（避免__getitem__中重复计算）==========
+        coords = self.coords
+        diff = coords[:, np.newaxis, :] - coords[np.newaxis, :, :]  # [n_spots, n_spots, 2]
+        dist_matrix = np.sqrt((diff ** 2).sum(axis=2))  # [n_spots, n_spots]
+        sigma = 50.0
+        self.spot_weight_matrix = np.exp(-dist_matrix ** 2 / (2 * sigma ** 2)).astype(np.float32)  # [n_spots, n_spots]
 
         # 预先对齐 spot 表达矩阵到 marker 基因顺序
         self.st_X_marker = np.zeros(
@@ -750,23 +757,22 @@ class STHeteroSubgraphDataset:
         edge_index_like_list = []
         edge_attr_like_list = []
         
-        # 5a. Spot-Spot边（基于KNN关系 + 高斯权重）
-        # ✅ 只为KNN邻居创建边，避免对所有spot对计算距离
-        for i in range(n_spots_sub):
-            spot_i_global = subgraph_spot_indices[i]
-            for j in range(n_spots_sub):
-                if i != j:
-                    spot_j_global = subgraph_spot_indices[j]
-                    
-                    # 检查是否为KNN邻居（使用预计算的knn_mask）
-                    if self.knn_mask[spot_i_global, spot_j_global] == 1:
-                        # 计算高斯权重
-                        dist = np.linalg.norm(coords_sub[i] - coords_sub[j])
-                        sigma = 50.0
-                        weight = np.exp(-dist**2 / (2 * sigma**2))
-                        if weight > 1e-4:
-                            edge_index_like_list.append([i, j])
-                            edge_attr_like_list.append(weight)
+        # 5a. Spot-Spot边（基于KNN关系 + 高斯权重）- 使用预计算的权重矩阵
+        knn_sub = self.knn_mask[np.ix_(subgraph_spot_indices, subgraph_spot_indices)]  # [k+1, k+1]
+        weight_sub = self.spot_weight_matrix[np.ix_(subgraph_spot_indices, subgraph_spot_indices)]  # [k+1, k+1]
+        
+        # 找到有效边：KNN邻居 & 权重 > 阈值 & 非自环
+        valid_mask = (knn_sub == 1) & (weight_sub > 1e-4)
+        np.fill_diagonal(valid_mask, False)  # 排除自环
+        
+        # 提取边索引和权重
+        src_indices, dst_indices = np.where(valid_mask)
+        weights = weight_sub[valid_mask]
+        
+        # 直接构建numpy数组，避免Python list开销
+        if len(src_indices) > 0:
+            edge_index_like_list = list(np.stack([src_indices, dst_indices], axis=1))
+            edge_attr_like_list = list(weights)
         
         # 5b. Spot-Cell边（基于composition权重）
         # ✅ 只为实际存在的 cell 创建边

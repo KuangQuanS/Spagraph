@@ -122,7 +122,7 @@ def run_deconv(
     # Training parameters
     n_epochs: int = 300,
     lr: float = 5e-3,
-    batch_size: int = 512,
+    batch_size: int = 128,
     print_every: int = 25,
     # Graph parameters
     k_spatial: int = 5,

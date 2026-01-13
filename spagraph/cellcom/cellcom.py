@@ -126,7 +126,7 @@ def parse_args():
     
 
     # 训练参数
-    parser.add_argument('--batch_size', type=int, default=4, help='批次大小 (已支持真正的批处理)')
+    parser.add_argument('--batch_size', type=int, default=16, help='Batch size (default: 16, larger is more efficient on CPU)')
     parser.add_argument('--num_workers', type=int, default=0, help='DataLoader worker数量 (default: 0)')
     parser.add_argument('--epochs', type=int, default=100, help='训练轮数')
     parser.add_argument('--learning_rate', type=float, default=1e-4, help='学习率')
@@ -153,6 +153,20 @@ def main(args=None):
     
     # 设置设备
     device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
+    
+    # ========== CPU优化设置 ==========
+    if device.type == 'cpu':
+        # 设置PyTorch使用的CPU线程数（充分利用多核）
+        import multiprocessing
+        n_threads = min(multiprocessing.cpu_count(), 8)  # 最多8线程，避免过度竞争
+        torch.set_num_threads(n_threads)
+        torch.set_num_interop_threads(2)  # 操作间并行
+        
+        # 启用优化的矩阵运算
+        torch.backends.mkl.is_available() and None  # 确保MKL可用
+        
+        print(f"CPU Optimization:   threads={n_threads}, interop=2")
+    
     _print_stage3_header(args, device)
     
     # ========== 阶段1：加载数据和构建激活基因特征 ==========
@@ -161,8 +175,16 @@ def main(args=None):
     # ========== 加载必要的数据 ==========
     deconv_dir = args.deconv_dir
     
-    # 1. CellChat数据库（用于LR通讯计算）
-    cellchat_file = 'cellchat_human.csv'
+    # 1. CellChat database (for LR communication computation)
+    # Use absolute path based on the project root directory
+    project_root = Path(__file__).parent.parent.parent  # Go up to project root from cellcom/cellcom.py
+    cellchat_file = project_root / 'cellchat_human.csv'
+    if not cellchat_file.exists():
+        raise FileNotFoundError(
+            f"CellChat database file not found: {cellchat_file}\\n"
+            f"Expected location: {project_root}/cellchat_human.csv\\n"
+            f"Please ensure cellchat_human.csv is in the project root directory."
+        )
     lr_db = pd.read_csv(cellchat_file)
     lr_pairs = []
     for _, row in lr_db.iterrows():

@@ -59,9 +59,9 @@ class coEncoder:
         Args:
             sc_file: Path to single-cell h5ad file
             st_file: Path to spatial transcriptomics h5ad file
-            output_dir: Output directory path (如果 save_to_disk=False，仅用于临时文件)
+            output_dir: Output directory path (if save_to_disk=False, only used for temp files)
             device: Computing device (cuda/cpu, None for auto)
-            save_to_disk: 是否保存模型和数据到磁盘。False 时只返回内存对象，不写入任何文件
+            save_to_disk: Whether to save models and data to disk. If False, only returns in-memory objects
             seed: Random seed for reproducibility
         """
         # Set random seed first
@@ -138,7 +138,7 @@ class coEncoder:
             marker_selection_method: Method for marker gene selection ('l1', 'variance', 'correlation')
         """
 
-        # ✅ 0. 最开始就计算 auto_library_size（用原始count）
+        # Step 0: Compute auto_library_size first (using raw counts)
         try:
             # 复制原始数据用于HVG计算
             sc_hvg_adata = sc_adata.copy()
@@ -167,22 +167,22 @@ class coEncoder:
                     
                     if st_hvg_total_count > 0 and sc_hvg_total_count > 0:
                         self.auto_library_size =  sc_hvg_total_count / st_hvg_total_count
-                        print(f"✅ 自动计算 library_size factor: {self.auto_library_size:.4f}")
-                        print(f"   - SC HVG 总count: {sc_hvg_total_count:.0f}")
-                        print(f"   - ST HVG 总count: {st_hvg_total_count:.0f}")
-                        print(f"   - 使用HVG基因数: {len(sc_hvg_in_st)}")
+                        print(f"Auto-computed library_size factor: {self.auto_library_size:.4f}")
+                        print(f"   - SC HVG total count: {sc_hvg_total_count:.0f}")
+                        print(f"   - ST HVG total count: {st_hvg_total_count:.0f}")
+                        print(f"   - HVG genes used: {len(sc_hvg_in_st)}")
                     else:
                         self.auto_library_size = 1.0
-                        print("⚠️  无法计算 library_size (count=0)，使用默认值 1.0")
+                        print("Warning: Cannot compute library_size (count=0), using default value 1.0")
                 else:
                     self.auto_library_size = 1.0
-                    print("⚠️  SC HVG 在 ST 中无交集，library_size 使用默认值 1.0")
+                    print("Warning: No SC HVG intersection in ST, using default library_size 1.0")
             else:
                 self.auto_library_size = 1.0
-                print("⚠️  SC HVG 为空，library_size 使用默认值 1.0")
+                print("Warning: SC HVG is empty, using default library_size 1.0")
         except Exception as e:
             self.auto_library_size = 1.0
-            print(f"⚠️  计算 library_size 失败: {e}，使用默认值 1.0")
+            print(f"Warning: Failed to compute library_size: {e}, using default value 1.0")
 
         # 1. Compute clusters and marker genes  
         if precomputed_marker_file is not None:
@@ -227,7 +227,7 @@ class coEncoder:
         # ✅ First filter to match sc_clusters.index (some cells may be filtered during clustering)
         sc_adata_count = sc_adata[sc_clusters.index].copy()
         
-        # ✅ 提取所有基因的原始count（用于后续scaling和重建表达）
+        # Extract raw counts for all genes (for later scaling and expression reconstruction)
         sc_all_genes_raw = sc_adata_count.X.toarray() if hasattr(sc_adata_count.X, 'toarray') else sc_adata_count.X
 
         # Normalize and log1p transform for VAE training
@@ -258,7 +258,7 @@ class coEncoder:
         
         st_X = st_subset.X.toarray() if hasattr(st_subset.X, 'toarray') else st_subset.X
 
-        # ✅ 计算 SC/ST HVG 交集（保留用于Stage2的scale_basis='hvg'）
+        # Compute SC/ST HVG intersection (retained for Stage2 scale_basis='hvg')
         try:
             # SC HVG
             sc_hvg = sc_adata_count.copy()
@@ -283,7 +283,7 @@ class coEncoder:
             self.hvg_genes_union = hvg_intersection
         except Exception as e:
             self.hvg_genes_union = None
-            print(f"⚠️  计算 HVG 交集失败: {e}")
+            print(f"Warning: Failed to compute HVG intersection: {e}")
         
         # 4. Ensure SC and ST feature dimensions are consistent
         final_genes = [g for g in self.marker_genes 
@@ -318,9 +318,9 @@ class coEncoder:
             np.ones(len(st_test))
         ])
         
-        # ✅ Keep ALL SC data (train + test) for cluster embedding computation
-        # 注意：保存所有基因的原始count（用于后续scaling和重建表达）
-        # sc_all_genes_raw: [n_cells, n_all_genes] 所有基因的原始count
+        # Keep ALL SC data (train + test) for cluster embedding computation
+        # Note: Save raw counts for all genes (for later scaling and expression reconstruction)
+        # sc_all_genes_raw: [n_cells, n_all_genes] raw counts for all genes
         sc_all_indices = np.arange(len(sc_X_final))  # All indices
         sc_all_labels = sc_y  # All labels
         
@@ -328,7 +328,7 @@ class coEncoder:
         self.genes = final_genes
         self.all_genes = sc_all_genes  # Save all gene list
         
-        # 只有在 save_to_disk=True 时才保存文件
+        # Only save files when save_to_disk=True
         if self.save_to_disk and self.output_dir:
             genes_file = f"{self.output_dir}/final_genes.txt"
             with open(genes_file, 'w') as f:
@@ -527,7 +527,7 @@ class coEncoder:
             self.build_vae(input_dim, hidden_dims=hidden_dims, latent_dim=latent_dim, loss_type=loss_type, use_dual_decoder=use_dual_decoder)
         
         # 4. Train VAE with test set for early stopping
-        # 只有在 save_to_disk=True 时才传 output_dir（用于保存训练曲线图）
+        # Only pass output_dir when save_to_disk=True (for saving training curves)
         best_loss = train_vae(
             vae=self.vae,
             train_X=train_X,
@@ -551,12 +551,12 @@ class coEncoder:
         self.train_X = train_X
         self.train_modality = train_modality  
         self.y_train = y_train
-        # ✅ Save ALL SC data (train + test) for cluster embedding computation
+        # Save ALL SC data (train + test) for cluster embedding computation
         self.sc_X_final = sc_X_final  # ALL SC marker gene data (log1p normalized)
-        self.sc_all_genes_raw = sc_all_genes_raw  # ALL SC 所有基因 raw counts [n_cells, n_all_genes]
+        self.sc_all_genes_raw = sc_all_genes_raw  # ALL SC raw counts for all genes [n_cells, n_all_genes]
         self.sc_all_labels = sc_all_labels  # ALL SC cluster labels
         
-        # ✅ Use trained VAE to compute embeddings for ALL SC cells
+        # Use trained VAE to compute embeddings for ALL SC cells
         self.vae.eval()
         with torch.no_grad():
             # Process in batches to avoid memory issues
@@ -573,14 +573,14 @@ class coEncoder:
             
             embeddings = np.vstack(all_embeddings)
         
-        # ✅ Compute cluster centers and expressions using ALL SC data
-        # 注意：静态模式仍需要cluster聚合表达，所以这里传递全基因原始count
+        # Compute cluster centers and expressions using ALL SC data
+        # Note: Static mode still requires cluster aggregated expression, so pass raw counts for all genes
         cluster_prototypes, cluster_expressions, cluster_expressions_full_count, cluster_cell_weights = \
             compute_cluster_centers_and_expressions(
                 embeddings=embeddings,
                 sc_train_data=sc_X_final,  # Use ALL marker gene data (log1p)
                 sc_train_labels=sc_all_labels,  # Use ALL labels
-                sc_X_full_train_count=sc_all_genes_raw,  # 传递所有基因原始count（用于静态模式的cluster聚合）
+                sc_X_full_train_count=sc_all_genes_raw,  # Pass raw counts for all genes (for static mode cluster aggregation)
                 aggregation_method=aggregation_method
             )
         
@@ -591,10 +591,10 @@ class coEncoder:
         self.cluster_expressions_full_count = cluster_expressions_full_count
         self.cluster_cell_weights = cluster_cell_weights
         
-        # ✅ 5.5. 保存SC的embeddings和原始表达（供动态cluster使用）
-        # 这些数据会传递给Stage2，用于预计算k-nearest cells或在训练中使用
+        # Step 5.5: Save SC embeddings and raw expression (for dynamic cluster usage)
+        # This data will be passed to Stage2 for pre-computing k-nearest cells or in-training use
         self.sc_cell_embeddings = embeddings  # [n_sc_cells, latent_dim]
-        self.sc_cell_expressions_raw = sc_all_genes_raw  # [n_sc_cells, n_all_genes] 所有基因原始count
+        self.sc_cell_expressions_raw = sc_all_genes_raw  # [n_sc_cells, n_all_genes] raw counts for all genes
         self.sc_cell_labels = sc_all_labels  # [n_sc_cells] cluster labels
         
         # 6. Extract celltype-cluster mapping (if celltype available in sc_adata)
@@ -630,13 +630,13 @@ class coEncoder:
                 output_dir=self.output_dir
             )
         
-        # 8. 不保存模型文件（完全内存模式，通过 Stage1Artifacts 传递）
+        # Step 8: Don't save model files (pure memory mode, passed through Stage1Artifacts)
         model_path = None
         npz_path = None
         
-        # Stage 1 不再保存 .pth 和 .npz，所有数据通过内存传递
+        # Stage 1 no longer saves .pth and .npz, all data passed through memory
         
-        # 将 cluster_prototypes/expressions 转换为 numpy 数组（如果是 dict）
+        # Convert cluster_prototypes/expressions to numpy arrays (if dict)
         if isinstance(self.cluster_prototypes, dict):
             cluster_ids_sorted = sorted(self.cluster_prototypes.keys())
             prototypes_array = np.stack([self.cluster_prototypes[cid] for cid in cluster_ids_sorted], axis=0)
@@ -655,7 +655,7 @@ class coEncoder:
         else:
             expressions_full_list = self.cluster_expressions_full_count
         
-        # 返回结果：包含所有内存产物，供 Stage1Artifacts 使用
+        # Return results: contains all in-memory artifacts for Stage1Artifacts usage
         return {
             'best_loss': best_loss,
             'n_genes': len(self.genes),
@@ -663,9 +663,9 @@ class coEncoder:
             'model_path': model_path,
             'cluster_data_path': npz_path,
             'clusters': list(self.label_encoder.classes_),
-            # ===== 内存产物（供纯内存模式使用）=====
-            'vae_encoder': self.vae.encoder,  # 直接返回编码器模块
-            'vae_state_dict': self.vae.state_dict(),  # 同时返回 state_dict 作为备份
+            # ===== Memory artifacts (for pure memory mode) =====
+            'vae_encoder': self.vae.encoder,  # Directly return encoder module
+            'vae_state_dict': self.vae.state_dict(),  # Also return state_dict as backup
             'input_dim': len(self.genes),
             'latent_dim': self.vae.encoder.fc_mu.out_features,
             'output_type': getattr(self.vae, 'output_type', 'mse'),
@@ -680,10 +680,10 @@ class coEncoder:
             'celltype_expressions': expressions_array,
             'celltype_expressions_full': expressions_full_list,
             'hvg_genes_union': getattr(self, 'hvg_genes_union', None),
-            'auto_library_size': getattr(self, 'auto_library_size', 1.0),  # ✅ 自动计算的library_size
-            # ===== 动态cluster所需数据 =====
+            'auto_library_size': getattr(self, 'auto_library_size', 1.0),  # Auto-computed library_size
+            # ===== Data required for dynamic cluster =====
             'sc_cell_embeddings': self.sc_cell_embeddings,  # [n_sc_cells, latent_dim]
-            'sc_cell_expressions_raw': self.sc_cell_expressions_raw,  # [n_sc_cells, n_all_genes] 所有基因原始count
+            'sc_cell_expressions_raw': self.sc_cell_expressions_raw,  # [n_sc_cells, n_all_genes] raw counts for all genes
             'sc_cell_labels': self.sc_cell_labels,  # [n_sc_cells] cluster labels
         }
 

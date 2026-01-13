@@ -136,36 +136,30 @@ class EdgeAttentionLayer(nn.Module):
     
     def _edge_softmax(self, logits: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
         """
-        对每个目标节点的所有入边做softmax归一化
-        
-        Args:
-            logits: [n_edges, num_heads] 注意力logits
-            edge_index: [n_edges] 目标节点索引
-            
-        Returns:
-            attention_weights: [n_edges, num_heads] 归一化后的注意力权重
+        对每个目标节点的所有入边做softmax归一化 (优化版本)
         """
-        # 为每个目标节点计算softmax
-        # 1. 找到logits的最大值（用于数值稳定性）
-        max_logits = torch.zeros(edge_index.max() + 1, logits.size(1), 
-                                  device=logits.device, dtype=logits.dtype)
-        max_logits.scatter_reduce_(0, edge_index.unsqueeze(-1).expand_as(logits), 
+        n_edges = logits.size(0)
+        if n_edges == 0:
+            return logits
+        
+        num_heads = logits.size(1)
+        max_node = edge_index.max().item() + 1
+        
+        # 数值稳定性：减去每组最大值
+        max_logits = logits.new_full((max_node, num_heads), float('-inf'))
+        max_logits.scatter_reduce_(0, edge_index.unsqueeze(-1).expand(-1, num_heads), 
                                    logits, reduce='amax', include_self=False)
-        max_logits = max_logits[edge_index]  # [n_edges, num_heads]
+        max_per_edge = max_logits[edge_index]  # [n_edges, num_heads]
         
-        # 2. 计算exp(logits - max_logits)
-        exp_logits = torch.exp(logits - max_logits)
+        # exp(logits - max)
+        exp_logits = torch.exp(logits - max_per_edge)
         
-        # 3. 计算每个目标节点的exp_logits之和
-        sum_exp = torch.zeros(edge_index.max() + 1, logits.size(1),
-                              device=logits.device, dtype=logits.dtype)
-        sum_exp.scatter_add_(0, edge_index.unsqueeze(-1).expand_as(exp_logits), exp_logits)
-        sum_exp = sum_exp[edge_index]  # [n_edges, num_heads]
+        # 求和
+        sum_exp = logits.new_zeros((max_node, num_heads))
+        sum_exp.scatter_add_(0, edge_index.unsqueeze(-1).expand(-1, num_heads), exp_logits)
+        sum_per_edge = sum_exp[edge_index] + 1e-8  # [n_edges, num_heads]
         
-        # 4. 归一化
-        attention_weights = exp_logits / (sum_exp + 1e-8)
-        
-        return attention_weights
+        return exp_logits / sum_per_edge
 class EdgeAttentionNetwork(nn.Module):
     """多层边注意力网络"""
 

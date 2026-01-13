@@ -11,6 +11,7 @@ import numpy as np
 import pandas as pd
 from sklearn.neighbors import kneighbors_graph
 from typing import List, Tuple, Dict, Any, Optional
+from tqdm import tqdm
 
 
 def calculate_lr_scores(
@@ -199,7 +200,7 @@ def calculate_lr_scores(
     same_celltype_skipped = 0  # 统计跳过的同类型细胞对（仅在关闭同-type通讯时）
 
     # 遍历所有潜在的LR通信邻居对（KNN邻居，并过滤掉距离过远的邻居）
-    for i in range(n_spots):
+    for i in tqdm(range(n_spots), desc="Computing LR scores", leave=False):
         spot_i_barcode = spot_names[i]
 
         # 获取spot i的cell composition
@@ -266,49 +267,44 @@ def calculate_lr_scores(
                         continue
 
                     # ========== 优化4：向量化LR得分计算 ==========
-                    # 使用预处理的LR索引，避免重复查找
+                    # 预计算cell表达总量（避免在内层循环重复计算）
+                    total_i = cell_i_expr.sum()
+                    total_j = cell_j_expr.sum()
+                    
+                    if total_i <= 0 or total_j <= 0:
+                        continue
+                    
+                    # 预计算归一化因子
+                    normalization_factor = 1e4 / np.sqrt(total_i * total_j)
+                    
+                    # 缓存活跃基因集合到局部变量（避免重复字典查找）
+                    active_lig_set = cell_active_genes_ligand.get(spot_cell_i_key, set())
+                    active_rec_set = cell_active_genes_receptor.get(spot_cell_j_key, set())
+                    
+                    if not active_lig_set or not active_rec_set:
+                        continue
+                    
+                    # 遍历所有有效LR pairs
                     for lig_idx, rec_indices, ligand, receptor in valid_lr_pairs:
-                        # 检查配体基因是否在源细胞中活跃
-                        if lig_idx not in cell_active_genes_ligand[spot_cell_i_key]:
+                        # 快速检查：ligand是否活跃
+                        if lig_idx not in active_lig_set:
                             continue
-
-                        # 检查所有受体基因是否在目标细胞中活跃
-                        receptor_active = all(rec_idx in cell_active_genes_receptor[spot_cell_j_key] for rec_idx in rec_indices)
-                        if not receptor_active:
+                        
+                        # 快速检查：所有receptor是否都活跃
+                        if not all(rec_idx in active_rec_set for rec_idx in rec_indices):
                             continue
-
-                        # 获取配体和受体的表达值
+                        
+                        # 获取配体和受体的表达值并计算得分
                         lig_val = cell_i_expr[lig_idx]
-                        rec_vals = cell_j_expr[rec_indices]
-
-                        # 计算受体乘积（联合受体取乘积）
-                        rec_product = np.prod(rec_vals)
-
-                        # ✅ 计算归一化通讯得分（基于各细胞的总表达量标准化）
-                        total_i = cell_i_expr.sum()
-                        total_j = cell_j_expr.sum()
-                        if total_i > 0 and total_j > 0:
-                            # 归一化因子：1e4 / sqrt(total_i * total_j)
-                            normalization_factor = 1e4 / np.sqrt(total_i * total_j)
-                            score = np.sqrt(lig_val * rec_product) * normalization_factor
-                        else:
-                            score = 0
-
-                        # ✅ 对通讯得分应用log1p变换，处理长尾分布
-                        score = np.log1p(score)
-
-                        # ✅ 过滤低于阈值的通讯事件（使用 lr_score_threshold，log1p 空间）
+                        rec_product = np.prod(cell_j_expr[rec_indices])
+                        score = np.log1p(np.sqrt(lig_val * rec_product) * normalization_factor)
+                        
+                        # 过滤低于阈值的通讯事件
                         if score >= lr_score_threshold:
-                            # ✅ 计算距离，用于后续伪标签生成（复用筛选时计算的距离）
-                            distance = float(dist_ij)
-                            
-                            # ✅ 记录是否在 KNN mask 内（此处恒为 1，保留列以兼容下游分析）
-                            in_knn = 1
-                            
                             comm_event_records.append([
                                 spot_i_barcode, spot_j_barcode, 
-                                spot_cell_i_key, spot_cell_j_key,  # ✅ 使用完整的spot_cell名称
-                                ligand, receptor, score, in_knn, distance
+                                spot_cell_i_key, spot_cell_j_key,
+                                ligand, receptor, score, 1, float(dist_ij)
                             ])
 
     print(

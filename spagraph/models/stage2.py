@@ -42,15 +42,15 @@ class SpatialDataset(Dataset):
             'expression_raw': self.st_data_raw[idx],                # For loss
             'coords': self.spatial_coords[idx],
             'spot_id': self.spot_ids[idx],
-            'index': idx  # ✅ Add index for spot_total_counts lookup
+            'index': idx  # Add index for spot_total_counts lookup
         }
 
 class GATDeconvolution:
     """Stage 2: GAT deconvolution trainer
     
-    支持两种模式：
-    1. 文件模式：通过 stage1_model_path 加载
-    2. 内存模式：通过 stage1_artifacts 直接传入
+    Supports two modes:
+    1. File mode: Load via stage1_model_path
+    2. Memory mode: Pass directly via stage1_artifacts
     """
     def __init__(self, stage1_model_path: str = None, output_dir: str = "./stage2_results/", 
                  device: str = None, weight_threshold: float = 0.01, stage1_artifacts=None, seed: int = 42,
@@ -69,7 +69,7 @@ class GATDeconvolution:
         self.stage1_artifacts = stage1_artifacts
         self.output_dir = output_dir
         self.seed = seed
-        # 不在初始化时创建目录，留到实际保存文件时再创建
+        # Don't create directory on init; create only when saving files
         
         # Device
         if device is None:
@@ -81,9 +81,9 @@ class GATDeconvolution:
         self.weight_threshold = weight_threshold
         
         # Output options
-        self.save_reconstructed_genes = False  # 是否保存重构的全基因表达
-        self.use_ols_scaling = use_ols_scaling  # 是否使用 OLS 最小二乘缩放（默认 False 使用 sum-based）
-        self.library_size = library_size  # 手动文库因子，在 scale 基础上再乘此值（默认 1.0 不改变）
+        self.save_reconstructed_genes = False  # Whether to save reconstructed full gene expression
+        self.use_ols_scaling = use_ols_scaling  # Whether to use OLS (Ordinary Least Squares) scaling (default False uses sum-based)
+        self.library_size = library_size  # Manual library size factor, multiplied on top of scale (default 1.0, no change)
 
         # Model components
         self.vae_encoder = None
@@ -102,17 +102,17 @@ class GATDeconvolution:
         self.k_celltype = 10
     
     def load_from_artifacts(self, artifacts):
-        """从 Stage1Artifacts 对象加载所有必要的组件（纯内存模式）"""
-        # 加载 VAE 编码器
+        """Load all necessary components from Stage1Artifacts object (pure memory mode)"""
+        # Load VAE encoder
         if artifacts.vae_encoder is not None:
-            # 直接使用已经加载的编码器
+            # Directly use the loaded encoder
             self.vae_encoder = artifacts.vae_encoder
             if hasattr(self.vae_encoder, 'to'):
                 self.vae_encoder = self.vae_encoder.to(self.device)
             self.vae_encoder.eval()
             self.latent_dim = self.vae_encoder.fc_mu.out_features
         elif artifacts.vae_state_dict is not None:
-            # 从 state_dict 重建编码器
+            # Rebuild encoder from state_dict
             from .deconv_model import DualDecoderVAE
             input_dim = artifacts.input_dim
             latent_dim = artifacts.latent_dim
@@ -125,9 +125,9 @@ class GATDeconvolution:
             self.vae_encoder.eval()
             self.latent_dim = latent_dim
         else:
-            raise ValueError("Stage1Artifacts 必须包含 vae_encoder 或 vae_state_dict")
+            raise ValueError("Stage1Artifacts must contain vae_encoder or vae_state_dict")
         
-        # 加载其他组件
+        # Load other components
         self.label_encoder = artifacts.label_encoder
         self.marker_genes = artifacts.marker_genes
         self.genes = artifacts.genes
@@ -137,9 +137,9 @@ class GATDeconvolution:
         self.cluster_to_celltype = artifacts.cluster_to_celltype
         self.all_genes = artifacts.all_genes
         self.hvg_genes_union = artifacts.hvg_genes_union
-        self.auto_library_size = getattr(artifacts, 'auto_library_size', 1.0)  # ✅ 加载自动计算的library_size
+        self.auto_library_size = getattr(artifacts, 'auto_library_size', 1.0)  # Load auto-computed library_size
         
-        # 加载聚类中心和表达
+        # Load cluster centers and expressions
         if artifacts.celltype_prototypes is not None:
             if isinstance(artifacts.celltype_prototypes, torch.Tensor):
                 self.celltype_prototypes = artifacts.celltype_prototypes.to(self.device)
@@ -155,23 +155,23 @@ class GATDeconvolution:
         if artifacts.celltype_expressions_full is not None:
             self.celltype_expressions_full = artifacts.celltype_expressions_full
         
-        # 冻结编码器参数
+        # Freeze encoder parameters
         for param in self.vae_encoder.parameters():
             param.requires_grad = False
         
     def load_vae_encoder(self):
         """Load Stage 1 VAE components
         
-        优先从 stage1_artifacts 加载（内存模式），否则从文件加载
+        Prioritize loading from stage1_artifacts (memory mode), otherwise load from file
         """
-        # 如果有 artifacts 且是内存模式，直接使用
+        # If artifacts exist and in memory mode, use directly
         if self.stage1_artifacts is not None and self.stage1_artifacts.is_memory_mode():
             self.load_from_artifacts(self.stage1_artifacts)
             return
         
-        # 否则从文件加载
+        # Otherwise load from file
         if self.stage1_model_path is None:
-            raise ValueError("必须提供 stage1_model_path 或包含内存数据的 stage1_artifacts")
+            raise ValueError("Must provide stage1_model_path or stage1_artifacts containing memory data")
         
         checkpoint = torch.load(self.stage1_model_path, map_location=self.device, weights_only=False)
         
@@ -180,7 +180,7 @@ class GATDeconvolution:
         latent_dim = checkpoint['latent_dim']
         output_type = checkpoint.get('output_type', 'mse')  # Get output_type from checkpoint
         
-        # 检测是否是双解码器架构
+        # Detect if it's a dual decoder architecture
         state_dict = checkpoint['vae_state_dict']
 
         from .deconv_model import DualDecoderVAE
@@ -294,9 +294,9 @@ class GATDeconvolution:
         Args:
             spot_total_counts: Array of total counts for each spot (shape: [n_spots])
                               Used for scaling: reconstructed = s_i × Σ(w_ic × R_c)
-            use_dynamic_cluster_repr: 是否启用动态cluster表示
-            k_cells_per_cluster: 每个cluster使用多少个最近细胞
-            sc_cell_expressions: [n_cells, n_all_genes] 单细胞全基因原始count（动态模式需要）
+            use_dynamic_cluster_repr: Whether to enable dynamic cluster representation
+            k_cells_per_cluster: Number of nearest cells to use per cluster
+            sc_cell_expressions: [n_cells, n_all_genes] Single-cell full gene raw counts (required for dynamic mode)
         """
         # Get embedding dimension from VAE encoder
         embedding_dim = self.latent_dim
@@ -313,28 +313,28 @@ class GATDeconvolution:
             dropout=dropout,
             k_spatial=self.k_spatial,
             k_celltype=self.k_celltype,
-            celltype_prototypes=self.celltype_prototypes,  # 使用第一阶段的celltype prototypes初始化
-            # 动态cluster参数
+            celltype_prototypes=self.celltype_prototypes,  # Initialize with Stage 1 celltype prototypes
+            # Dynamic cluster parameters
             use_dynamic_cluster_repr=use_dynamic_cluster_repr,
             k_cells_per_cluster=k_cells_per_cluster,
-            sc_cell_expressions=sc_cell_expressions  # [n_cells, n_all_genes] 全基因
+            sc_cell_expressions=sc_cell_expressions  # [n_cells, n_all_genes] full genes
         ).to(self.device)
         
-        # 计算单细胞数据中各cluster的比例
+        # Compute cluster proportions in single-cell data
         sc_celltype_proportions = None
         if hasattr(self, 'sc_clusters') and self.sc_clusters is not None:
-            # sc_clusters 是从 stage1 加载的单细胞cluster标签
+            # sc_clusters are single-cell cluster labels loaded from stage1
             cluster_counts = {}
             for cluster_id in self.sc_clusters:
                 cluster_counts[cluster_id] = cluster_counts.get(cluster_id, 0) + 1
             
             total_cells = len(self.sc_clusters)
-            # 按cluster ID顺序构建比例数组
+            # Build proportion array in cluster ID order
             proportions = []
             for i in range(n_cell_types):
-                count = cluster_counts.get(str(i), 0)  # cluster ID可能是字符串
+                count = cluster_counts.get(str(i), 0)  # cluster ID may be string
                 if count == 0:
-                    count = cluster_counts.get(i, 0)  # 尝试整数
+                    count = cluster_counts.get(i, 0)  # Try integer
                 proportion = count / total_cells if total_cells > 0 else 1.0 / n_cell_types
                 proportions.append(proportion)
             
@@ -343,9 +343,9 @@ class GATDeconvolution:
             pass
         
         celltype_expr_full = np.vstack([np.asarray(expr, dtype=np.float64) for expr in self.celltype_expressions_full])
-        # 计算 marker 基因在全部基因中的索引
+        # Compute marker gene indices in all genes
         marker_gene_indices = [self.all_genes.index(g) for g in self.genes]
-        # 计算 HVG 交集在全部基因中的索引（如果可用）
+        # Compute HVG intersection indices in all genes (if available)
         hvg_gene_indices = None
         if getattr(self, "hvg_genes_union", None) is not None:
             try:
@@ -368,8 +368,8 @@ class GATDeconvolution:
             marker_gene_indices=marker_gene_indices,
             hvg_gene_indices=hvg_gene_indices,
             scale_basis=getattr(self, "scale_basis", "hvg"),
-            library_size=self.library_size  # ✅ 传递 library_size 到 loss function
-        ).to(self.device)  # ✅ Move loss function to device
+            library_size=self.library_size  # Pass library_size to loss function
+        ).to(self.device)  # Move loss function to device
         
     def train_epoch_batched(self, 
                            dataloader: DataLoader,
@@ -396,9 +396,9 @@ class GATDeconvolution:
             batch_st_normalized = batch['expression_normalized'].to(self.device)  # For embedding
             batch_st_raw = batch['expression_raw'].to(self.device)                # For loss
             batch_spatial_coords = batch['coords'].to(self.device)
-            batch_indices = batch['index']  # ✅ Get batch indices
+            batch_indices = batch['index']  # Get batch indices
             
-            # ✅ Get spot_total_counts for this batch (convert to tensor)
+            # Get spot_total_counts for this batch (convert to tensor)
             if self.spot_total_counts is not None:
                 batch_spot_total_counts = torch.FloatTensor(
                     self.spot_total_counts[batch_indices]
@@ -406,10 +406,10 @@ class GATDeconvolution:
             else:
                 batch_spot_total_counts = None
             
-            # ✅ 获取动态cluster数据（如果启用）
+            # Get dynamic cluster data (if enabled)
             batch_knn_indices = None
             if self.knn_cell_indices is not None:
-                # 使用non_blocking加速数据传输
+                # Use non_blocking to accelerate data transfer
                 batch_knn_indices = torch.LongTensor(
                     self.knn_cell_indices[batch_indices]
                 ).to(self.device, non_blocking=True)
@@ -431,14 +431,14 @@ class GATDeconvolution:
             loss_outputs = self.loss_fn(
                 attention_weights=gat_outputs['deconv_weights'],
                 celltype_expression=self.celltype_expressions,
-                true_spot_expression=batch_st_raw,  # ✅ Use raw counts for loss
-                spot_embedding=spot_embeddings,  # ✅ Use original VAE embeddings for dynamic cluster MLP
+                true_spot_expression=batch_st_raw,  # Use raw counts for loss
+                spot_embedding=spot_embeddings,  # Use original VAE embeddings for dynamic cluster MLP
                 celltype_embedding=gat_outputs['celltype_features'],
                 edge_index=gat_outputs['edge_index'],
-                batch_spot_total_counts=batch_spot_total_counts,  # ✅ Pass batch-specific counts
-                # 动态cluster参数
+                batch_spot_total_counts=batch_spot_total_counts,  # Pass batch-specific counts
+                # Dynamic cluster parameters
                 knn_cell_indices=batch_knn_indices,
-                sc_cell_embeddings=self.sc_cell_embeddings_tensor,  # ✅ 使用预转换的tensor
+                sc_cell_embeddings=self.sc_cell_embeddings_tensor,  # Use pre-converted tensor
                 sc_cell_expressions=self.gat_model.sc_cell_expressions if hasattr(self.gat_model, 'sc_cell_expressions') else None,
                 gat_model=self.gat_model
             )
@@ -477,17 +477,17 @@ class GATDeconvolution:
             st_data_normalized: Normalized ST data (sum=1) for VAE embedding
             st_data_raw: Raw count ST data for loss calculation
             print_every: Print loss every N epochs (default: 50)
-            knn_cell_indices: [n_spots, n_cell_types, k] 预计算的k-nearest cell索引（动态模式）
-            sc_cell_embeddings: [n_cells, embedding_dim] 单细胞embeddings（动态模式）
+            knn_cell_indices: [n_spots, n_cell_types, k] Pre-computed k-nearest cell indices (dynamic mode)
+            sc_cell_embeddings: [n_cells, embedding_dim] Single-cell embeddings (dynamic mode)
         """
         # Save st_adata for later use
         self.st_adata = st_adata
         
-        # 保存动态cluster数据
+        # Save dynamic cluster data
         self.knn_cell_indices = knn_cell_indices
         self.sc_cell_embeddings = sc_cell_embeddings
         
-        # ✅ 预先转换为GPU tensor，避免每个batch重复转换
+        # Pre-convert to GPU tensor to avoid repeated conversion per batch
         if self.sc_cell_embeddings is not None:
             self.sc_cell_embeddings_tensor = torch.FloatTensor(self.sc_cell_embeddings).to(self.device)
         else:
@@ -499,15 +499,14 @@ class GATDeconvolution:
         spot_ids = list(range(len(st_data_normalized)))
         dataset = SpatialDataset(st_data_normalized, st_data_raw, spatial_coords, spot_ids)
         
-        # ✅ 优化DataLoader性能：多进程+pin_memory
+        # DataLoader configuration (num_workers=0 for Windows/Jupyter compatibility)
         dataloader = DataLoader(
             dataset, 
             batch_size=batch_size, 
             shuffle=True, 
             drop_last=False,
-            num_workers=4,  # 多进程加载数据
-            pin_memory=True,  # 加速CPU→GPU传输
-            persistent_workers=True  # 保持worker进程，避免重复创建开销
+            num_workers=0,  # Use 0 for Windows and Jupyter notebook compatibility (single-process)
+            pin_memory=True if torch.cuda.is_available() else False  # Only use pin_memory with CUDA
         )
         
         # Optimizer
@@ -529,15 +528,15 @@ class GATDeconvolution:
         hetero_losses = []
         proportion_losses = []
         
-        # ✅ 早停策略：监测 Pearson 和 Cosine 的绝对改进
+        # Early stopping strategy: Monitor absolute improvement of Pearson and Cosine
         best_pearson = float('inf')
         best_mse = float('inf')
         best_cosine = float('inf')
         best_gene_pearson = float('inf')
         best_gene_cosine = float('inf')
         patience_counter = 0
-        patience = 20  # 早停 patience
-        min_delta = 0.001  # 绝对改进阈值（Pearson/Cosine 需要下降至少这么多）
+        patience = 20  # Early stopping patience
+        min_delta = 0.001  # Absolute improvement threshold (Pearson/Cosine needs to decrease by at least this much)
         
         for epoch in range(n_epochs):
             # Train one epoch
@@ -567,11 +566,11 @@ class GATDeconvolution:
             current_gene_pearson = epoch_losses.get('gene_pearson_loss', 0.0)
             current_gene_cosine = epoch_losses.get('gene_cosine_loss', 0.0)
             
-            # 绝对改进：best - current > min_delta（损失下降超过阈值）
+            # Absolute improvement: best - current > min_delta (loss decreased beyond threshold)
             pearson_improvement = best_pearson - current_pearson
             cosine_improvement = best_cosine - current_cosine
             
-            # 只要 Pearson 或 Cosine 其中一个有显著改进，就重置计数器
+            # Reset counter if either Pearson or Cosine shows significant improvement
             if pearson_improvement > min_delta or cosine_improvement > min_delta:
                 if current_pearson < best_pearson:
                     best_pearson = current_pearson
@@ -584,17 +583,17 @@ class GATDeconvolution:
                 if current_gene_cosine < best_gene_cosine:
                     best_gene_cosine = current_gene_cosine
                 patience_counter = 0
-                # 不保存模型权重文件
+                # Don't save model weight files
             else:
                 patience_counter += 1
             
-            # Print every N epochs（网格搜索时 print_every=9999 不会触发）
+            # Print every N epochs (print_every=9999 in grid search won't trigger)
             if (epoch) % print_every == 0:
                 print(f"  Epoch {epoch}/{n_epochs}: Total={avg_total_loss:.4f}, MSE={current_mse:.4f}, Pearson={current_pearson:.4f}, Cosine={current_cosine:.4f}, Gene_Pearson={current_gene_pearson:.4f}, Gene_Cosine={current_gene_cosine:.4f}")
             
             # Early stopping
             if patience_counter >= patience:
-                if print_every != 9999:  # 网格搜索时不打印
+                if print_every != 9999:  # Don't print during grid search
                     print(f"Early stopping at epoch {epoch+1}/{n_epochs}")
                     # Only print best values if they are not inf
                     if best_pearson != float('inf') and best_mse != float('inf') and best_cosine != float('inf'):
@@ -608,8 +607,8 @@ class GATDeconvolution:
                                      weight_regs, sparsity_regs, diversity_losses, hetero_losses, 
                                      proportion_losses, sample_name)
         
-        # 注意：最佳模型已在训练循环中保存为 best_gat_model.pth
-        # 不需要再保存 final_gat_model.pth，避免重复
+        # Note: Best model already saved during training loop as best_gat_model.pth
+        # No need to save final_gat_model.pth again to avoid duplication
         
         # Evaluate and visualize results (use normalized data for embedding)
         eval_outputs = self.evaluate_and_visualize(
@@ -695,13 +694,13 @@ class GATDeconvolution:
 
             celltype_expr_full = np.array(self.celltype_expressions_full)  # [n_clusters, n_all_genes]
             
-            # ✅ 判断是否使用动态cluster表示进行重建
+            # Check if using dynamic cluster representation for reconstruction
             if (self.gat_model.use_dynamic_cluster_repr and 
                 knn_cell_indices is not None and 
                 hasattr(self.gat_model, 'sc_cell_expressions') and
                 self.gat_model.sc_cell_expressions is not None):
                 
-                # ========== 动态cluster重建 ==========
+                # ========== Dynamic cluster reconstruction ==========
                 # 1. 转换为tensor
                 deconv_weights_tensor = torch.FloatTensor(deconv_weights).to(self.device)  # [n_spots, n_clusters]
                 knn_indices_tensor = torch.LongTensor(knn_cell_indices).to(self.device)  # [n_spots, n_clusters, k]
@@ -731,10 +730,10 @@ class GATDeconvolution:
                     )  # [n_spots, n_all_genes]
                     mixed_expr_full = mixed_expr_full_tensor.detach().cpu().numpy()
                 else:
-                    # 如果loss_fn没有该方法，回退到静态方法
+                    # If loss_fn doesn't have this method, fall back to static method
                     mixed_expr_full = np.dot(deconv_weights, celltype_expr_full)  # [n_spots, n_all_genes]
             else:
-                # ========== 静态cluster重建（原始逻辑）==========
+                # ========== Static cluster reconstruction (original logic) ==========
                 mixed_expr_full = np.dot(deconv_weights, celltype_expr_full)  # [n_spots, n_all_genes]
             
             scale_basis = getattr(self, "scale_basis", "all")
@@ -742,109 +741,109 @@ class GATDeconvolution:
                 reconstructed_full_expr = mixed_expr_full
                 scale = np.ones((n_spots, 1))
             elif scale_basis == "fixed_10":
-                # 固定缩放因子10：比例×10 = 细胞数量
+                # Fixed scale factor 10: proportion × 10 = cell count
                 reconstructed_full_expr = mixed_expr_full * 10.0
                 scale = np.full((n_spots, 1), 10.0)
             else:
-                # 使用 spot_total_counts 进行缩放（与 deconv_model.py 保持一致）
+                # Use spot_total_counts for scaling (consistent with deconv_model.py)
                 if self.spot_total_counts is None:
                     raise ValueError("spot_total_counts not set; cannot compute scale factor.")
                 spot_counts = self.spot_total_counts[:len(spot_barcodes)]
                 
-                # 获取基因子集（用于计算 scale）
+                # Get gene subset (for computing scale)
                 if scale_basis == "all":
-                    # 使用全部基因
+                    # Use all genes
                     basis_indices = list(range(len(self.all_genes)))
                 elif scale_basis == "hvg" and self.hvg_genes_union is not None:
-                    # 使用 HVG 交集
+                    # Use HVG intersection
                     basis_indices = [i for i, g in enumerate(self.all_genes) if g in self.hvg_genes_union]
                 else:
-                    # 默认：使用 marker 子集
+                    # Default: use marker subset
                     basis_indices = [i for i, g in enumerate(self.all_genes) if g in self.genes]
                 
-                # 提取子集用于计算 scale
+                # Extract subset for computing scale
                 mixed_basis = mixed_expr_full[:, basis_indices]  # [n_spots, n_basis_genes]
                 
-                # 获取真实观测（用于 OLS）
+                # Get true observations (for OLS)
                 if scale_basis == "all":
-                    # 确保 obs_basis_raw 与 mixed_basis 的基因完全对齐
-                    # mixed_basis 是基于 self.all_genes 的
-                    # obs_basis_raw 必须也是基于 self.all_genes 的
+                    # Ensure obs_basis_raw aligns perfectly with mixed_basis genes
+                    # mixed_basis is based on self.all_genes
+                    # obs_basis_raw must also be based on self.all_genes
                     
-                    # 1. 找出 self.all_genes 中哪些在 st_adata 中存在
+                    # 1. Find which genes in self.all_genes exist in st_adata
                     valid_gene_indices = [i for i, g in enumerate(self.all_genes) if g in st_adata.var_names]
                     valid_genes = [self.all_genes[i] for i in valid_gene_indices]
                     
-                    # 2. 提取 ST 数据中存在的基因
+                    # 2. Extract genes that exist in ST data
                     st_subset = st_adata[:, valid_genes]
                     obs_basis_subset = st_subset.X.toarray() if hasattr(st_subset.X, 'toarray') else st_subset.X
                     
-                    # 3. 提取 mixed_basis 中对应的列
+                    # 3. Extract corresponding columns in mixed_basis
                     mixed_basis_subset = mixed_basis[:, valid_gene_indices]
                     
-                    # 4. 使用对齐后的子集进行计算
+                    # 4. Use aligned subset for computation
                     obs_basis_raw = obs_basis_subset
                     mixed_basis = mixed_basis_subset
                     
                 elif scale_basis == "hvg" and self.hvg_genes_union is not None:
-                    # 类似处理 HVG
+                    # Similar processing for HVG
                     valid_hvg_indices = [i for i, g in enumerate(self.hvg_genes_union) if g in st_adata.var_names]
                     valid_hvgs = [self.hvg_genes_union[i] for i in valid_hvg_indices]
                     
-                    # 提取 ST
+                    # Extract ST
                     st_subset = st_adata[:, valid_hvgs]
                     obs_basis_raw = st_subset.X.toarray() if hasattr(st_subset.X, 'toarray') else st_subset.X
                     
-                    # 提取 mixed (注意 mixed_basis 已经是 hvg 子集了，这里需要再次对齐)
-                    # mixed_basis 现在的列对应 self.hvg_genes_union
+                    # Extract mixed (note mixed_basis is already hvg subset, needs alignment again)
+                    # mixed_basis columns now correspond to self.hvg_genes_union
                     mixed_basis = mixed_basis[:, valid_hvg_indices]
                     
                 else:
-                    # Marker 模式通常基因都在，但为了保险也可以加检查
+                    # Marker mode usually has all genes, but add check for safety
                     valid_marker_indices = [i for i, g in enumerate(self.genes) if g in st_adata.var_names]
                     valid_markers = [self.genes[i] for i in valid_marker_indices]
                     
                     st_subset = st_adata[:, valid_markers]
                     obs_basis_raw = st_subset.X.toarray() if hasattr(st_subset.X, 'toarray') else st_subset.X
                     
-                    # mixed_basis 对应 self.genes
+                    # mixed_basis corresponds to self.genes
                     mixed_basis = mixed_basis[:, valid_marker_indices]
                 
-                # ========== 选择缩放方法 ==========
+                # ========== Choose scaling method ==========
                 if self.use_ols_scaling:
-                    # ✅ OLS（最小二乘）缩放：s = (m·y) / (m·m)
-                    print("🔧 使用 OLS 最小二乘缩放")
+                    # OLS (Ordinary Least Squares) scaling: s = (m·y) / (m·m)
+                    print("Using OLS (Ordinary Least Squares) scaling")
                     eps = 1e-8
                     numer = (mixed_basis * obs_basis_raw).sum(axis=1)  # [n_spots]
                     denom = (mixed_basis * mixed_basis).sum(axis=1) + eps  # [n_spots]
                     scale = numer / denom  # [n_spots]
                     
-                    # 数值稳健处理：裁剪到合理范围
+                    # Numerical robustness: clip to reasonable range
                     scale_min, scale_max = 0.01, 100.0
                     n_clipped_low = (scale < scale_min).sum()
                     n_clipped_high = (scale > scale_max).sum()
                     scale = np.clip(scale, scale_min, scale_max)
                     
                     if n_clipped_low > 0 or n_clipped_high > 0:
-                        print(f"⚠️  OLS scale 裁剪: {n_clipped_low} spots < {scale_min}, {n_clipped_high} spots > {scale_max}")
+                        print(f"Warning: OLS scale clipped: {n_clipped_low} spots < {scale_min}, {n_clipped_high} spots > {scale_max}")
                     
                     scale = scale[:, np.newaxis]  # [n_spots, 1]
                 else:
-                    # 原始 sum-based 缩放
-                    print("🔧 使用 sum-based 缩放")
+                    # Original sum-based scaling
+                    print("Using sum-based scaling")
                     mixed_basis_totals = mixed_basis.sum(axis=1, keepdims=True)  # [n_spots, 1]
                     scale = spot_counts[:, np.newaxis] / (mixed_basis_totals + 1e-8)
                 
-                # 输出 scale 统计（便于诊断）
+                # Output scale statistics (for diagnosis)
                 scale_vals = scale.ravel()
-                print(f"📊 Scale 统计: mean={scale_vals.mean():.4f}, median={np.median(scale_vals):.4f}, "
+                print(f"Scale statistics: mean={scale_vals.mean():.4f}, median={np.median(scale_vals):.4f}, "
                            f"min={scale_vals.min():.4f}, max={scale_vals.max():.4f}, "
                            f"Q25={np.percentile(scale_vals, 25):.4f}, Q75={np.percentile(scale_vals, 75):.4f}")
                 
-                # ✅ 应用 library_size 因子（在 scale 之后）
+                # Apply library_size factor (after scale)
                 reconstructed_full_expr = mixed_expr_full * scale * self.library_size
                 if self.library_size != 1.0:
-                    print(f"📚 Library size factor: {self.library_size}")
+                    print(f"Library size factor: {self.library_size}")
             
             # Get full gene names
             if self.all_genes is not None:
@@ -852,11 +851,11 @@ class GATDeconvolution:
             else:
                 all_gene_names = [f"Gene_{i}" for i in range(celltype_expr_full.shape[1])]
             
-            # 只在启用时保存重构的全基因表达
+            # Only save when enabled
             if self.save_reconstructed_genes and self.output_dir:
                 os.makedirs(self.output_dir, exist_ok=True)
                 
-                # 1. 保存spot级别的重构表达（原有功能）
+                # 1. Save spot-level reconstructed expression (original feature)
                 full_expr_df = pd.DataFrame(
                     reconstructed_full_expr,
                     columns=all_gene_names,
@@ -865,13 +864,13 @@ class GATDeconvolution:
                 full_expr_file = f"{self.output_dir}/{sample_name}_reconstructed.csv"
                 full_expr_df.to_csv(full_expr_file)
                 
-                # 2. ✅ 新增：保存spot-cell级别的动态表达（用于第三阶段cellcom）
+                # 2. New: Save spot-cell level dynamic expression (for Stage 3 cellcom)
                 if (self.gat_model.use_dynamic_cluster_repr and 
                     knn_cell_indices is not None and 
                     hasattr(self.gat_model, 'sc_cell_expressions') and
                     self.gat_model.sc_cell_expressions is not None):
                     
-                    print("正在计算spot-cell级别的动态表达...")
+                    print("Computing spot-cell level dynamic expression...")
                     spot_cell_expr_dict = {}
                     
                     # deconv_weights: [n_spots, n_clusters]
@@ -889,20 +888,20 @@ class GATDeconvolution:
                         spot_name = spot_barcodes[spot_idx]
                         
                         for cluster_idx, cluster_id in enumerate(cluster_list):
-                            # 获取celltype名称
+                            # Get celltype name
                             celltype_name = cluster_to_celltype_map.get(str(cluster_id), f"Cluster_{cluster_id}")
                             
-                            # 该cluster在该spot的deconv权重（比例）
+                            # This cluster's deconv weight (proportion) in this spot
                             cluster_proportion = deconv_weights[spot_idx, cluster_idx]
                             
                             if cluster_proportion < 1e-6:
                                 continue
                             
-                            # 获取该cluster的k个nearest cells的索引和权重
+                            # Get indices and weights of k nearest cells for this cluster
                             cell_indices = knn_indices_tensor[spot_idx, cluster_idx]  # [k]
                             cell_weights = dynamic_weights[spot_idx, cluster_idx]  # [k]
                             
-                            # 过滤掉padding（索引为-1）
+                            # Filter out padding (index -1)
                             valid_mask = (cell_indices != -1).cpu()
                             cell_indices = cell_indices[valid_mask]
                             cell_weights = cell_weights[valid_mask]
@@ -910,40 +909,40 @@ class GATDeconvolution:
                             if len(cell_indices) == 0:
                                 continue
                             
-                            # 重新归一化权重
+                            # Re-normalize weights
                             cell_weights = cell_weights / (cell_weights.sum() + 1e-8)
                             
-                            # 计算该spot-cell的表达：加权平均k个cells的表达
+                            # Compute spot-cell expression: weighted average of k cells' expression
                             # sc_cell_expressions: [n_cells, n_all_genes]
                             cell_exprs = self.gat_model.sc_cell_expressions[cell_indices]  # [k, n_genes]
                             weighted_expr = (cell_exprs * cell_weights.unsqueeze(1)).sum(dim=0)  # [n_genes]
                             
-                            # 缩放：使用全局计算的 scale 因子和 library_size 因子，确保与 reconstructed_full_expr 一致
+                            # Scaling: use globally computed scale factor and library_size factor, consistent with reconstructed_full_expr
                             # scale: [n_spots, 1]
                             spot_scale = scale[spot_idx, 0]
                             scaled_expr = weighted_expr.cpu().numpy() * cluster_proportion * spot_scale * self.library_size
                             
-                            # 累加到该spot-celltype
+                            # Accumulate to this spot-celltype
                             key = f"{spot_name}_{celltype_name}"
                             if key in spot_cell_expr_dict:
                                 spot_cell_expr_dict[key] += scaled_expr
                             else:
                                 spot_cell_expr_dict[key] = scaled_expr.copy()
                     
-                    # 转为DataFrame
+                    # Convert to DataFrame
                     spot_cell_expr_df = pd.DataFrame.from_dict(
                         spot_cell_expr_dict, orient='index', columns=all_gene_names
                     )
                     spot_cell_expr_df.index.name = 'spot_cell'
                     
-                    # 过滤全为0的行
+                    # Filter rows that are all zeros
                     row_sums = spot_cell_expr_df.sum(axis=1)
                     spot_cell_expr_df = spot_cell_expr_df[row_sums > 0]
                     
-                    # 保存
+                    # Save
                     spot_cell_file = f"{self.output_dir}/{sample_name}_spot_cell_expr.csv"
                     spot_cell_expr_df.to_csv(spot_cell_file)
-                    print(f"✅ 已保存spot-cell动态表达: {spot_cell_file}, 形状={spot_cell_expr_df.shape}")
+                    print(f"Saved spot-cell dynamic expression: {spot_cell_file}, shape={spot_cell_expr_df.shape}")
         else:
             pass
 
@@ -972,7 +971,7 @@ class GATDeconvolution:
             index=spot_barcodes
         )
 
-        # 如果存在重复的 celltype 名称，则将对应列合并（按列求和）并记录日志
+        # If duplicate celltype names exist, merge corresponding columns (sum by column) and log
         dup_names = [name for name in set(celltype_columns) if celltype_columns.count(name) > 1]
         if len(dup_names) > 0:
             composition_by_celltype = composition_df.groupby(by=composition_df.columns, axis=1).sum()
@@ -1263,7 +1262,7 @@ def main():
     sc.pp.log1p(st_proc)
     # Check spatial coordinates
     if 'spatial' not in st_adata.obsm:
-        print(f"⚠️  ST data file {args.st_file} missing spatial coordinates. Falling back to embedding-based KNN for spot graph.")
+        print(f"Warning: ST data file {args.st_file} missing spatial coordinates. Falling back to embedding-based KNN for spot graph.")
         spatial_coords = np.zeros((st_adata.n_obs, 2), dtype=float)
         trainer.use_embedding_knn = True
     else:
@@ -1277,7 +1276,7 @@ def main():
     st_X_raw = st_subset_raw.X.toarray() if hasattr(st_subset_raw.X, 'toarray') else st_subset_raw.X
     st_X_embed = st_subset_norm.X.toarray() if hasattr(st_subset_norm.X, 'toarray') else st_subset_norm.X
 
-    # 根据 scale_basis 选择对应的 counts
+    # Select counts based on scale_basis
     if args.scale_basis == 'none':
         spot_total_counts = None
     elif args.scale_basis == 'all':
@@ -1311,7 +1310,7 @@ def main():
         loss_lambda_reg=args.loss_lambda_reg,
         loss_lambda_sparse=args.loss_lambda_sparse,
         loss_lambda_proportion=args.loss_lambda_proportion,
-        spot_total_counts=spot_total_counts  # ✅ Pass spot total counts instead of cells_per_spot
+        spot_total_counts=spot_total_counts  # Pass spot total counts instead of cells_per_spot
     )
     
     trainer.train_gat_deconvolution(

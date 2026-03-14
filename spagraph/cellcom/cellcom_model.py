@@ -63,6 +63,7 @@ class EdgeAttentionLayer(nn.Module):
             out: [n_nodes, hidden_dim] 节点表示
             attention_scores: [n_edges, num_heads] 边注意力得分
         """
+
         n_edges = edge_attr.size(0)
         n_nodes = node_feat.size(0)
 
@@ -274,6 +275,11 @@ class HeteroSTModel(nn.Module):
         self.lr_id_emb_dim = lr_id_emb_dim
         self.node_recon_head = nn.Linear(output_dim, n_genes)
         
+        # ✅ Mask Token (既然要Mask，就用个Learnable Token，显得高级)
+        self.mask_token = nn.Parameter(torch.zeros(1, n_genes))
+        nn.init.normal_(self.mask_token, std=0.02)
+
+        
         # MLP编码器替代VAE
         self.mlp_encoder = MLPEncoder(
             input_dim=n_genes,
@@ -373,12 +379,46 @@ class HeteroSTModel(nn.Module):
             exist_logits: None（保留占位，不再使用）
             rate_pred: None（保留占位，不再使用）
         """
-        # MLP编码（直接使用原始特征）
-        spot_latent = self.mlp_encoder(expr_raw)  # [k+1, mlp_latent_dim]
-        cell_latent = self.mlp_encoder(cell_expr_raw)  # [(k+1)*n_cells, mlp_latent_dim]
+        n_spots = expr_raw.size(0)
+        n_cells_total = cell_expr_raw.size(0)
 
-        n_spots = spot_latent.size(0)
-        n_cells_total = cell_latent.size(0)
+        # ========== Step 1: Input Masking (True Masked Graph Reconstruction) ==========
+        # 既然要做 Masking，就在输入进 Encoder 之前做！
+        
+        # 1. 准备原始特征
+        expr_raw_input = expr_raw
+        cell_expr_raw_input = cell_expr_raw
+        
+        node_mask = None
+        
+        # 2. 生成 Mask 并替换为 Token (只在训练时或强制Mask时)
+        if node_mask_ratio > 0 and self.training:
+             # 合并以统一计算 mask
+            base_feat = torch.cat([expr_raw, cell_expr_raw], dim=0)
+            n_total = base_feat.size(0)
+            
+            # 生成遮挡掩码
+            rand_mask = torch.rand(n_total, device=base_feat.device, generator=mask_generator)
+            node_mask = (rand_mask < node_mask_ratio)
+            
+            # 如果有被 mask 的节点
+            if node_mask.any():
+                masked_feat = base_feat.clone()
+                # 用可学习的 Token 替换被 Mask 的节点特征
+                masked_feat[node_mask] = self.mask_token.expand(node_mask.sum(), -1)
+                
+                # 拆分回 spot 和 cell
+                expr_raw_input = masked_feat[:n_spots]
+                cell_expr_raw_input = masked_feat[n_spots:]
+            else:
+                node_mask = torch.zeros(n_total, dtype=torch.bool, device=base_feat.device)
+        else:
+            n_total = expr_raw.size(0) + cell_expr_raw.size(0)
+            node_mask = torch.zeros(n_total, dtype=torch.bool, device=expr_raw.device)
+
+        # 3. MLP编码（使用可能是 Masked 的特征！）
+        spot_latent = self.mlp_encoder(expr_raw_input)  # [k+1, mlp_latent_dim]
+        cell_latent = self.mlp_encoder(cell_expr_raw_input)  # [(k+1)*n_cells, mlp_latent_dim]
 
         # Spot节点特征
         spot_feat = spot_latent  # [n_spots, vae_latent_dim]
@@ -504,15 +544,10 @@ class HeteroSTModel(nn.Module):
         spot_repr_out = repr_out[:n_spots]  # [n_spots, output_dim]
         cell_repr_out = repr_out[n_spots:]  # [n_cells_total, output_dim]
 
-        # 节点特征重构（mask 一部分特征做重建）
+        # 节点特征重构（计算 Loss 用的 Mask 已经在前面生成了）
         node_recon_pred = self.node_recon_head(repr_out)  # [n_nodes, n_genes]
-        node_mask = None
-        if node_mask_ratio > 0:
-            base = torch.cat([expr_raw, cell_expr_raw], dim=0)
-            rand_mask = torch.rand(base.shape, device=base.device, generator=mask_generator)
-            node_mask = (rand_mask < node_mask_ratio)
-        else:
-            node_mask = torch.zeros_like(torch.cat([expr_raw, cell_expr_raw], dim=0), dtype=torch.bool)
+        # node_mask 已经在 Step 1 生成
+
 
         # 对比学习投影
         spot_proj = self.projection_head(spot_repr_out)  # [n_spots, output_dim]

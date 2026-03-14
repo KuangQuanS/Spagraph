@@ -1,23 +1,15 @@
-﻿#!/usr/bin/env python3
-"""Minimal CCC analysis pipeline for GSE243275.
-
-This script implements three analysis pieces on top of existing Stage 3 CCC
-outputs:
-1. coordinate permutation negative control,
-2. Moran's I comparison for top attention vs top frequency LR pairs,
-3. boundary enrichment analysis.
-
-The first working version is intentionally scoped to GSE243275 because this is
-the only dataset in the repository that currently exposes the full set of
-inputs needed for a clean rerun workflow.
-"""
+#!/usr/bin/env python3
+"""CCC analysis workflow for the manuscript-priority datasets."""
 
 from __future__ import annotations
 
 import argparse
 import gc
+import os
+import re
 import shutil
 import sys
+import traceback
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -32,7 +24,12 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+SCRIPT_DIR = Path(__file__).resolve().parent
+EVALUATE_DIR = SCRIPT_DIR.parent
+DATA_ROOT = EVALUATE_DIR / "data"
+REPO_ROOT = EVALUATE_DIR.parent
+DATABASE_ROOT = REPO_ROOT / "spagraph_data" / "database"
+
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
@@ -51,54 +48,134 @@ EXPECTED_LR_COLUMNS = {
 
 
 @dataclass(frozen=True)
+class BoundaryConfig:
+    region_name: str
+    group_a_name: str
+    group_a_columns: tuple[str, ...]
+    group_b_name: str
+    group_b_columns: tuple[str, ...]
+    threshold: float = 0.10
+
+
+@dataclass(frozen=True)
 class DatasetConfig:
-    dataset: str
+    key: str
+    dataset_dir: Path
     lr_communication: Path
     composition_csv: Path
-    spot_cell_expr_csv: Path
+    spot_cell_expr_csv: Path | None
     st_h5ad: Path
-    output_dir: Path
-    dcis_columns: tuple[str, ...]
-    myo_columns: tuple[str, ...]
-    n_spot_neighbors: int
-    ligand_expr_threshold: float
-    receptor_expr_threshold: float
-    allow_same_celltype_comm: bool
-    epochs: int
-    batch_size: int
-    seed: int
-    boundary_threshold: float = 0.10
+    boundary: BoundaryConfig
+    n_spot_neighbors: int = 8
+    ligand_expr_threshold: float = 3.0
+    receptor_expr_threshold: float = 3.0
+    allow_same_celltype_comm: bool = True
+    epochs: int = 200
+    batch_size: int = 64
+    seed: int = 42
+
+    @property
+    def output_dir(self) -> Path:
+        return self.dataset_dir / "ccc_analysis"
 
 
 DATASETS = {
     "GSE243275": DatasetConfig(
-        dataset="GSE243275",
-        lr_communication=REPO_ROOT / "spagraph_data" / "evaluate" / "GSE243275" / "lr_communication.csv",
-        composition_csv=REPO_ROOT / "spagraph_data" / "evaluate" / "GSE243275" / "GSM7782699_ST_composition.csv",
-        spot_cell_expr_csv=REPO_ROOT / "spagraph_data" / "evaluate" / "GSE243275" / "GSM7782699_ST_spot_cell_expr.csv",
-        st_h5ad=REPO_ROOT / "spagraph_data" / "database" / "GSE243275" / "GSM7782699_ST.h5ad",
-        output_dir=REPO_ROOT / "spagraph_data" / "evaluate" / "GSE243275" / "ccc_analysis",
-        dcis_columns=("DCIS 1", "DCIS 2"),
-        myo_columns=("Myoepi ACTA2+", "Myoepi KRT15+"),
-        n_spot_neighbors=8,
-        ligand_expr_threshold=3.0,
-        receptor_expr_threshold=3.0,
-        allow_same_celltype_comm=True,
-        epochs=200,
-        batch_size=64,
-        seed=42,
-    )
+        key="GSE243275",
+        dataset_dir=DATA_ROOT / "GSE243275",
+        lr_communication=DATA_ROOT / "GSE243275" / "lr_communication.csv",
+        composition_csv=DATA_ROOT / "GSE243275" / "GSM7782699_ST_composition.csv",
+        spot_cell_expr_csv=DATA_ROOT / "GSE243275" / "GSM7782699_ST_spot_cell_expr.csv",
+        st_h5ad=DATABASE_ROOT / "GSE243275" / "GSM7782699_ST.h5ad",
+        boundary=BoundaryConfig(
+            region_name="myoepithelial_boundary",
+            group_a_name="dcis",
+            group_a_columns=("DCIS 1", "DCIS 2"),
+            group_b_name="myoepi",
+            group_b_columns=("Myoepi ACTA2+", "Myoepi KRT15+"),
+        ),
+    ),
+    "GSE144236": DatasetConfig(
+        key="GSE144236",
+        dataset_dir=DATA_ROOT / "GSE144236",
+        lr_communication=DATA_ROOT / "GSE144236" / "lr_communication.csv",
+        composition_csv=DATA_ROOT / "GSE144236" / "Spatial_composition.csv",
+        spot_cell_expr_csv=DATA_ROOT / "GSE144236" / "Spatial_spot_cell_expr.csv",
+        st_h5ad=DATABASE_ROOT / "GSE144240" / "GSE144236_P2_ST.h5ad",
+        boundary=BoundaryConfig(
+            region_name="tumor_stroma_interface",
+            group_a_name="tumor",
+            group_a_columns=("Epithelial",),
+            group_b_name="stroma",
+            group_b_columns=("Fibroblast",),
+        ),
+    ),
+    "GSE211956_P3": DatasetConfig(
+        key="GSE211956_P3",
+        dataset_dir=DATA_ROOT / "GSE211956" / "P3",
+        lr_communication=DATA_ROOT / "GSE211956" / "P3" / "lr_communication.csv",
+        composition_csv=DATA_ROOT / "GSE211956" / "P3" / "GSE211956_ST_P3_cell_composition.csv",
+        spot_cell_expr_csv=None,
+        st_h5ad=DATABASE_ROOT / "GSE211956" / "GSE211956_ST_P3.h5ad",
+        boundary=BoundaryConfig(
+            region_name="tumor_stroma_interface",
+            group_a_name="tumor",
+            group_a_columns=("Tumour cells",),
+            group_b_name="stroma",
+            group_b_columns=(
+                "Fibro1 (EIF4A3, STAR)",
+                "Fibro2 (RBP1, DCN)",
+                "Fibro3 (RAMP1, CFD)",
+                "Fibro5 (FN1, COL3A1)",
+                "Myofibroblasts",
+            ),
+        ),
+    ),
 }
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Minimal CCC analysis pipeline.")
-    parser.add_argument("--dataset", default="GSE243275", choices=sorted(DATASETS))
+    parser = argparse.ArgumentParser(description="CCC permutation / Moran / niche workflow.")
+    parser.add_argument(
+        "--dataset",
+        nargs="+",
+        default=["all"],
+        choices=["all", *sorted(DATASETS)],
+        help="Datasets to run. Use 'all' to run every configured dataset.",
+    )
     parser.add_argument("--n-permutations", type=int, default=100)
     parser.add_argument("--top-k", type=int, default=20)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--keep-perm-runs", action="store_true")
+    parser.add_argument("--output-root", type=Path, default=None)
+    parser.add_argument("--device", default="cuda")
+    parser.add_argument(
+        "--continue-on-error",
+        action="store_true",
+        help="Keep running the remaining datasets even if one dataset fails.",
+    )
+    parser.add_argument(
+        "--allow-observed-only-missing-perm-inputs",
+        action="store_true",
+        help="If spot_cell_expr is missing, still run observed-only metrics instead of failing.",
+    )
     return parser.parse_args()
+
+
+def resolve_dataset_keys(selected: list[str]) -> list[str]:
+    if "all" in selected:
+        return list(DATASETS)
+    return selected
+
+
+def resolve_output_dir(config: DatasetConfig, output_root: Path | None) -> Path:
+    if output_root is None:
+        return config.output_dir
+    return output_root / config.key
+
+
+def slugify(label: str) -> str:
+    return re.sub(r"\W+", "_", label.strip().lower()).strip("_")
 
 
 def require_existing(path: Path) -> None:
@@ -106,23 +183,55 @@ def require_existing(path: Path) -> None:
         raise FileNotFoundError(f"Required input is missing: {path}")
 
 
+def resolve_spot_cell_expr_csv(config: DatasetConfig, required: bool) -> Path | None:
+    if config.spot_cell_expr_csv is not None and config.spot_cell_expr_csv.exists():
+        return config.spot_cell_expr_csv
+
+    matches = sorted(config.dataset_dir.glob("*_spot_cell_expr.csv"))
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        raise FileNotFoundError(
+            f"{config.key} has multiple '*_spot_cell_expr.csv' files under {config.dataset_dir}: "
+            + ", ".join(str(path.name) for path in matches)
+        )
+    if required:
+        if config.spot_cell_expr_csv is not None:
+            raise FileNotFoundError(
+                f"{config.key} is missing its configured Stage 2 spot-cell expression file: "
+                f"{config.spot_cell_expr_csv}"
+            )
+        raise FileNotFoundError(
+            f"{config.key} is missing a Stage 2 '*_spot_cell_expr.csv' file under {config.dataset_dir}. "
+            "Rerun deconvolution with save_reconstructed_genes=True before permutation reruns."
+        )
+    return None
+
+
+def ensure_permutation_inputs(config: DatasetConfig) -> None:
+    resolve_spot_cell_expr_csv(config, required=True)
+
+
+def read_lr_table(csv_path: Path) -> pd.DataFrame:
+    require_existing(csv_path)
+    try:
+        return pd.read_csv(csv_path, usecols=list(EXPECTED_LR_COLUMNS))
+    except ValueError as exc:
+        raise ValueError(f"{csv_path} is missing required columns from {sorted(EXPECTED_LR_COLUMNS)}") from exc
+
+
 def load_inputs(config: DatasetConfig) -> tuple[pd.DataFrame, pd.DataFrame, sc.AnnData]:
-    require_existing(config.lr_communication)
+    lr_df = read_lr_table(config.lr_communication)
     require_existing(config.composition_csv)
-    require_existing(config.spot_cell_expr_csv)
     require_existing(config.st_h5ad)
 
-    lr_df = pd.read_csv(config.lr_communication)
-    missing_columns = EXPECTED_LR_COLUMNS - set(lr_df.columns)
-    if missing_columns:
-        raise ValueError(
-            f"lr_communication.csv is missing required columns: {sorted(missing_columns)}"
-        )
-
     composition = pd.read_csv(config.composition_csv, index_col=0)
+    composition.index = composition.index.astype(str)
+
     adata = sc.read_h5ad(config.st_h5ad)
     if "spatial" not in adata.obsm:
         raise ValueError(f"Spatial coordinates not found in {config.st_h5ad}")
+    adata.obs_names = adata.obs_names.astype(str)
 
     return lr_df, composition, adata
 
@@ -135,10 +244,7 @@ def build_adjacency(coords: np.ndarray, k: int) -> np.ndarray:
     return adjacency
 
 
-def filter_known_spots(
-    lr_df: pd.DataFrame,
-    valid_spots: set[str],
-) -> pd.DataFrame:
+def filter_known_spots(lr_df: pd.DataFrame, valid_spots: set[str]) -> pd.DataFrame:
     mask = lr_df["src_spot_barcode"].isin(valid_spots) & lr_df["dst_spot_barcode"].isin(valid_spots)
     return lr_df.loc[mask].copy()
 
@@ -186,7 +292,10 @@ def build_pair_spot_map(
     mode: str,
 ) -> np.ndarray:
     values = np.zeros(len(spot_index), dtype=float)
-    pair_df = lr_df.loc[lr_df["lr_pair"] == lr_pair, ["src_spot_barcode", "dst_spot_barcode", "attention_score"]]
+    pair_df = lr_df.loc[
+        lr_df["lr_pair"] == lr_pair,
+        ["src_spot_barcode", "dst_spot_barcode", "attention_score"],
+    ]
     if pair_df.empty:
         return values
 
@@ -223,35 +332,40 @@ def morans_i(values: np.ndarray, adjacency: np.ndarray) -> float:
 def build_boundary_mask(
     composition: pd.DataFrame,
     adjacency: np.ndarray,
-    config: DatasetConfig,
+    boundary: BoundaryConfig,
 ) -> tuple[np.ndarray, pd.DataFrame]:
-    for column in (*config.dcis_columns, *config.myo_columns):
+    required_columns = (*boundary.group_a_columns, *boundary.group_b_columns)
+    for column in required_columns:
         if column not in composition.columns:
             raise ValueError(f"Required composition column is missing: {column}")
 
-    dcis_score = composition.loc[:, config.dcis_columns].sum(axis=1)
-    myo_score = composition.loc[:, config.myo_columns].sum(axis=1)
+    group_a_score = composition.loc[:, boundary.group_a_columns].sum(axis=1)
+    group_b_score = composition.loc[:, boundary.group_b_columns].sum(axis=1)
 
-    dcis_mask = (dcis_score >= config.boundary_threshold) & (dcis_score >= myo_score)
-    myo_mask = (myo_score >= config.boundary_threshold) & (myo_score > dcis_score)
+    group_a_mask = (group_a_score >= boundary.threshold) & (group_a_score >= group_b_score)
+    group_b_mask = (group_b_score >= boundary.threshold) & (group_b_score > group_a_score)
 
-    has_myo_neighbor = adjacency @ myo_mask.to_numpy(dtype=float) > 0
-    has_dcis_neighbor = adjacency @ dcis_mask.to_numpy(dtype=float) > 0
+    has_group_b_neighbor = adjacency @ group_b_mask.to_numpy(dtype=float) > 0
+    has_group_a_neighbor = adjacency @ group_a_mask.to_numpy(dtype=float) > 0
+    boundary_mask = (group_a_mask.to_numpy() & has_group_b_neighbor) | (group_b_mask.to_numpy() & has_group_a_neighbor)
 
-    boundary_mask = (dcis_mask.to_numpy() & has_myo_neighbor) | (myo_mask.to_numpy() & has_dcis_neighbor)
     if not boundary_mask.any():
         raise ValueError(
-            "Boundary mask is empty. Check the composition columns or the boundary threshold."
+            f"{boundary.region_name} boundary mask is empty. "
+            f"Check the configured columns or threshold ({boundary.threshold})."
         )
 
+    group_a_slug = slugify(boundary.group_a_name)
+    group_b_slug = slugify(boundary.group_b_name)
     boundary_df = pd.DataFrame(
         {
             "spot_barcode": composition.index.astype(str),
-            "dcis_score": dcis_score.to_numpy(),
-            "myo_score": myo_score.to_numpy(),
-            "is_dcis_boundary_candidate": dcis_mask.to_numpy(),
-            "is_myo_boundary_candidate": myo_mask.to_numpy(),
+            f"{group_a_slug}_score": group_a_score.to_numpy(),
+            f"{group_b_slug}_score": group_b_score.to_numpy(),
+            f"is_{group_a_slug}_dominant": group_a_mask.to_numpy(),
+            f"is_{group_b_slug}_dominant": group_b_mask.to_numpy(),
             "is_boundary": boundary_mask,
+            "region_name": boundary.region_name,
         }
     )
     return boundary_mask, boundary_df
@@ -317,13 +431,7 @@ def compare_groups(metrics_df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(summary_rows)
 
 
-def save_boxplot(
-    metrics_df: pd.DataFrame,
-    metric: str,
-    title: str,
-    ylabel: str,
-    output_path: Path,
-) -> None:
+def save_boxplot(metrics_df: pd.DataFrame, metric: str, title: str, ylabel: str, output_path: Path) -> None:
     fig, ax = plt.subplots(figsize=(6, 5))
     values = [
         metrics_df.loc[metrics_df["ranking_type"] == "attention", metric].dropna().to_numpy(),
@@ -338,22 +446,12 @@ def save_boxplot(
     plt.close(fig)
 
 
-def save_permutation_figure(
-    perm_summary: pd.DataFrame,
-    observed_summary: pd.DataFrame,
-    output_path: Path,
-) -> None:
+def save_permutation_figure(perm_summary: pd.DataFrame, observed_summary: pd.DataFrame, output_path: Path) -> None:
     fig, axes = plt.subplots(1, 2, figsize=(12, 5))
     metric_specs = [
         ("mean_moran_attention", "mean_moran_frequency", "moran_i", "Mean Moran's I"),
-        (
-            "mean_boundary_attention",
-            "mean_boundary_frequency",
-            "boundary_enrichment",
-            "Mean log2 boundary enrichment",
-        ),
+        ("mean_boundary_attention", "mean_boundary_frequency", "boundary_enrichment", "Mean log2 boundary enrichment"),
     ]
-
     observed_map = observed_summary.set_index("metric")
     colors = {"attention": "#c0392b", "frequency": "#2980b9"}
 
@@ -363,35 +461,11 @@ def save_permutation_figure(
             ax.set_axis_off()
             continue
 
-        ax.hist(
-            perm_summary[att_col].dropna(),
-            bins=20,
-            alpha=0.55,
-            color=colors["attention"],
-            label="perm attention",
-        )
-        ax.hist(
-            perm_summary[freq_col].dropna(),
-            bins=20,
-            alpha=0.55,
-            color=colors["frequency"],
-            label="perm frequency",
-        )
+        ax.hist(perm_summary[att_col].dropna(), bins=20, alpha=0.55, color=colors["attention"], label="perm attention")
+        ax.hist(perm_summary[freq_col].dropna(), bins=20, alpha=0.55, color=colors["frequency"], label="perm frequency")
         if metric_key in observed_map.index:
-            ax.axvline(
-                observed_map.loc[metric_key, "attention_mean"],
-                color=colors["attention"],
-                linestyle="--",
-                linewidth=2,
-                label="obs attention",
-            )
-            ax.axvline(
-                observed_map.loc[metric_key, "frequency_mean"],
-                color=colors["frequency"],
-                linestyle="--",
-                linewidth=2,
-                label="obs frequency",
-            )
+            ax.axvline(observed_map.loc[metric_key, "attention_mean"], color=colors["attention"], linestyle="--", linewidth=2, label="obs attention")
+            ax.axvline(observed_map.loc[metric_key, "frequency_mean"], color=colors["frequency"], linestyle="--", linewidth=2, label="obs frequency")
         ax.set_title(title)
         ax.set_xlabel("Value")
         ax.set_ylabel("Permutation count")
@@ -414,7 +488,7 @@ def analyze_lr_table(
     lr_df = filter_known_spots(lr_df, valid_spots)
     composition = composition.reindex(spot_names).fillna(0.0)
     adjacency = build_adjacency(coords, config.n_spot_neighbors)
-    boundary_mask, boundary_df = build_boundary_mask(composition, adjacency, config)
+    boundary_mask, boundary_df = build_boundary_mask(composition, adjacency, config.boundary)
     spot_index = {barcode: idx for idx, barcode in enumerate(spot_names)}
 
     pair_stats = summarize_pairs(lr_df)
@@ -425,7 +499,6 @@ def analyze_lr_table(
     summary_df = compare_groups(metrics_df)
 
     return {
-        "pair_stats": pair_stats,
         "top_pairs": observed_top_pairs,
         "pair_metrics": metrics_df,
         "group_summary": summary_df,
@@ -433,44 +506,59 @@ def analyze_lr_table(
     }
 
 
-def write_permuted_h5ad(
-    source_h5ad: Path,
-    output_h5ad: Path,
-    permutation_seed: int,
-) -> None:
+def write_permuted_h5ad(source_h5ad: Path, output_h5ad: Path, permutation_seed: int) -> None:
     adata = sc.read_h5ad(source_h5ad)
     coords = np.asarray(adata.obsm["spatial"]).copy()
     rng = np.random.default_rng(permutation_seed)
-    permuted_indices = rng.permutation(coords.shape[0])
-    adata.obsm["spatial"] = coords[permuted_indices]
+    adata.obsm["spatial"] = coords[rng.permutation(coords.shape[0])]
     output_h5ad.parent.mkdir(parents=True, exist_ok=True)
     adata.write(output_h5ad)
 
 
+def link_or_copy_file(source: Path, destination: Path) -> Path:
+    require_existing(source)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.exists():
+        destination.unlink()
+    try:
+        os.link(source, destination)
+    except OSError:
+        shutil.copy2(source, destination)
+    return destination
+
+
+def stage_cellcom_inputs(config: DatasetConfig, output_dir: Path) -> tuple[Path, Path]:
+    staged_dir = output_dir / "_cellcom_inputs"
+    spot_cell_expr_csv = resolve_spot_cell_expr_csv(config, required=True)
+    link_or_copy_file(config.composition_csv, staged_dir / config.composition_csv.name)
+    staged_spot_expr = link_or_copy_file(spot_cell_expr_csv, staged_dir / spot_cell_expr_csv.name)
+    return staged_dir, staged_spot_expr
+
+
 def run_single_permutation(
     config: DatasetConfig,
+    output_dir: Path,
     permutation_index: int,
     base_seed: int,
     top_k: int,
     keep_perm_runs: bool,
     spot_names: list[str],
     composition: pd.DataFrame,
+    device: str,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    perm_root = config.output_dir / "_perm_runs" / f"perm_{permutation_index:03d}"
+    perm_root = output_dir / "_perm_runs" / f"perm_{permutation_index:03d}"
     perm_h5ad = perm_root / "permuted_spatial.h5ad"
     perm_output = perm_root / "cellcom"
     perm_lr_csv = perm_output / "lr_communication.csv"
+    staged_deconv_dir, spot_cell_expr_csv = stage_cellcom_inputs(config, output_dir)
 
-    if not perm_lr_csv.exists():
-        write_permuted_h5ad(
-            source_h5ad=config.st_h5ad,
-            output_h5ad=perm_h5ad,
-            permutation_seed=base_seed + permutation_index,
-        )
+    if not perm_lr_csv.exists() or not perm_h5ad.exists():
+        write_permuted_h5ad(config.st_h5ad, perm_h5ad, base_seed + permutation_index)
         spagraph.cellcom(
-            deconv_dir=str(config.composition_csv.parent),
+            deconv_dir=str(staged_deconv_dir),
             st_h5ad=str(perm_h5ad),
             output_dir=str(perm_output),
+            spot_cell_expr_csv=str(spot_cell_expr_csv),
             n_spot_neighbors=config.n_spot_neighbors,
             ligand_expr_threshold=config.ligand_expr_threshold,
             receptor_expr_threshold=config.receptor_expr_threshold,
@@ -478,11 +566,12 @@ def run_single_permutation(
             epochs=config.epochs,
             batch_size=config.batch_size,
             seed=config.seed,
-            device="cuda",
+            device=device,
         )
 
-    perm_lr_df = pd.read_csv(perm_lr_csv)
+    perm_lr_df = read_lr_table(perm_lr_csv)
     perm_adata = sc.read_h5ad(perm_h5ad)
+    perm_adata.obs_names = perm_adata.obs_names.astype(str)
     perm_results = analyze_lr_table(
         lr_df=perm_lr_df,
         composition=composition,
@@ -508,7 +597,6 @@ def run_single_permutation(
         ].iloc[0],
     }
     summary_df = pd.DataFrame([summary_row])
-
     perm_top_pairs = perm_results["top_pairs"].copy()
     perm_top_pairs.insert(0, "permutation_index", permutation_index)
 
@@ -519,51 +607,149 @@ def run_single_permutation(
     return summary_df, perm_top_pairs
 
 
+def empty_permutation_summary() -> pd.DataFrame:
+    return pd.DataFrame(
+        columns=[
+            "permutation_index",
+            "mean_moran_attention",
+            "mean_moran_frequency",
+            "mean_boundary_attention",
+            "mean_boundary_frequency",
+        ]
+    )
+
+
+def empty_permutation_top_pairs() -> pd.DataFrame:
+    return pd.DataFrame(
+        columns=[
+            "permutation_index",
+            "ranking_type",
+            "rank",
+            "lr_pair",
+            "occurrence_count",
+            "attention_mean",
+            "attention_sum",
+            "original_lr_sum",
+        ]
+    )
+
+
+def save_run_info(
+    config: DatasetConfig,
+    output_dir: Path,
+    top_k: int,
+    requested_n_permutations: int,
+    executed_n_permutations: int,
+    note: str,
+) -> None:
+    try:
+        resolved_spot_cell_expr = resolve_spot_cell_expr_csv(config, required=False)
+    except FileNotFoundError as exc:
+        resolved_spot_cell_expr = f"unresolved ({exc})"
+    info_lines = [
+        f"dataset={config.key}",
+        f"dataset_dir={config.dataset_dir}",
+        f"lr_communication={config.lr_communication}",
+        f"composition_csv={config.composition_csv}",
+        f"spot_cell_expr_csv={resolved_spot_cell_expr if resolved_spot_cell_expr is not None else 'missing'}",
+        f"st_h5ad={config.st_h5ad}",
+        f"output_dir={output_dir}",
+        f"region_name={config.boundary.region_name}",
+        f"group_a={config.boundary.group_a_name}:{','.join(config.boundary.group_a_columns)}",
+        f"group_b={config.boundary.group_b_name}:{','.join(config.boundary.group_b_columns)}",
+        f"boundary_threshold={config.boundary.threshold}",
+        f"top_k={top_k}",
+        f"requested_n_permutations={requested_n_permutations}",
+        f"executed_n_permutations={executed_n_permutations}",
+        f"n_spot_neighbors={config.n_spot_neighbors}",
+    ]
+    if note:
+        info_lines.append(f"note={note}")
+    (output_dir / "analysis_run_info.txt").write_text("\n".join(info_lines) + "\n", encoding="utf-8")
+
+
 def save_outputs(
     config: DatasetConfig,
+    output_dir: Path,
     observed_results: dict[str, pd.DataFrame],
     permutation_summary: pd.DataFrame,
     permutation_top_pairs: pd.DataFrame,
+    top_k: int,
+    requested_n_permutations: int,
+    executed_n_permutations: int,
+    note: str,
 ) -> None:
-    figures_dir = config.output_dir / "figures"
+    figures_dir = output_dir / "figures"
     figures_dir.mkdir(parents=True, exist_ok=True)
 
-    observed_results["top_pairs"].to_csv(config.output_dir / "observed_top_pairs.csv", index=False)
-    observed_results["pair_metrics"].to_csv(config.output_dir / "observed_pair_metrics.csv", index=False)
-    observed_results["group_summary"].to_csv(config.output_dir / "observed_group_summary.csv", index=False)
-    observed_results["boundary_spots"].to_csv(config.output_dir / "boundary_spots.csv", index=False)
-    permutation_summary.to_csv(config.output_dir / "permutation_summary.csv", index=False)
-    permutation_top_pairs.to_csv(config.output_dir / "permutation_top_pairs.csv", index=False)
+    observed_results["top_pairs"].to_csv(output_dir / "observed_top_pairs.csv", index=False)
+    observed_results["pair_metrics"].to_csv(output_dir / "observed_pair_metrics.csv", index=False)
+    observed_results["group_summary"].to_csv(output_dir / "observed_group_summary.csv", index=False)
+    observed_results["boundary_spots"].to_csv(output_dir / "boundary_spots.csv", index=False)
+    permutation_summary.to_csv(output_dir / "permutation_summary.csv", index=False)
+    permutation_top_pairs.to_csv(output_dir / "permutation_top_pairs.csv", index=False)
+    save_run_info(config, output_dir, top_k, requested_n_permutations, executed_n_permutations, note)
 
     save_boxplot(
-        metrics_df=observed_results["pair_metrics"],
-        metric="moran_i",
-        title=f"{config.dataset}: Moran's I for top LR pairs",
-        ylabel="Moran's I",
-        output_path=figures_dir / "moran_attention_vs_frequency.pdf",
+        observed_results["pair_metrics"],
+        "moran_i",
+        f"{config.key}: Moran's I for top LR pairs",
+        "Moran's I",
+        figures_dir / "moran_attention_vs_frequency.pdf",
     )
     save_boxplot(
-        metrics_df=observed_results["pair_metrics"],
-        metric="boundary_enrichment",
-        title=f"{config.dataset}: boundary enrichment for top LR pairs",
-        ylabel="log2 enrichment",
-        output_path=figures_dir / "boundary_enrichment_attention_vs_frequency.pdf",
+        observed_results["pair_metrics"],
+        "boundary_enrichment",
+        f"{config.key}: boundary enrichment for top LR pairs",
+        "log2 enrichment",
+        figures_dir / "boundary_enrichment_attention_vs_frequency.pdf",
     )
     save_permutation_figure(
-        perm_summary=permutation_summary,
-        observed_summary=observed_results["group_summary"],
-        output_path=figures_dir / "permutation_null_distribution.pdf",
+        permutation_summary,
+        observed_results["group_summary"],
+        figures_dir / "permutation_null_distribution.pdf",
     )
 
 
-def main() -> None:
-    args = parse_args()
-    config = DATASETS[args.dataset]
-    config.output_dir.mkdir(parents=True, exist_ok=True)
+def save_combined_outputs(
+    combined_dir: Path,
+    dataset_summaries: list[pd.DataFrame],
+    dataset_pair_metrics: list[pd.DataFrame],
+    dataset_top_pairs: list[pd.DataFrame],
+    run_status_rows: list[dict[str, object]],
+) -> None:
+    combined_dir.mkdir(parents=True, exist_ok=True)
+    if dataset_summaries:
+        pd.concat(dataset_summaries, ignore_index=True).to_csv(combined_dir / "combined_observed_group_summary.csv", index=False)
+    if dataset_pair_metrics:
+        pd.concat(dataset_pair_metrics, ignore_index=True).to_csv(combined_dir / "combined_observed_pair_metrics.csv", index=False)
+    if dataset_top_pairs:
+        pd.concat(dataset_top_pairs, ignore_index=True).to_csv(combined_dir / "combined_observed_top_pairs.csv", index=False)
+    pd.DataFrame(run_status_rows).to_csv(combined_dir / "dataset_run_status.csv", index=False)
+
+
+def run_dataset(config: DatasetConfig, args: argparse.Namespace) -> dict[str, object]:
+    output_dir = resolve_output_dir(config, args.output_root)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    executed_n_permutations = args.n_permutations
+    note = ""
+    if executed_n_permutations > 0:
+        try:
+            ensure_permutation_inputs(config)
+        except FileNotFoundError as exc:
+            if not args.allow_observed_only_missing_perm_inputs:
+                raise
+            note = str(exc)
+            executed_n_permutations = 0
+            print(f"[{config.key}] {note}")
+            print(f"[{config.key}] Falling back to observed-only mode.")
 
     lr_df, composition, adata = load_inputs(config)
     coords = np.asarray(adata.obsm["spatial"])
     spot_names = adata.obs_names.astype(str).tolist()
+
+    print(f"[{config.key}] Running observed analysis...")
     observed_results = analyze_lr_table(
         lr_df=lr_df,
         composition=composition,
@@ -575,15 +761,18 @@ def main() -> None:
 
     permutation_summaries: list[pd.DataFrame] = []
     permutation_top_pair_frames: list[pd.DataFrame] = []
-    for permutation_index in range(1, args.n_permutations + 1):
+    for permutation_index in range(1, executed_n_permutations + 1):
+        print(f"[{config.key}] Permutation {permutation_index}/{executed_n_permutations}")
         summary_df, top_pairs_df = run_single_permutation(
             config=config,
+            output_dir=output_dir,
             permutation_index=permutation_index,
             base_seed=args.seed,
             top_k=args.top_k,
             keep_perm_runs=args.keep_perm_runs,
             spot_names=spot_names,
             composition=composition,
+            device=args.device,
         )
         permutation_summaries.append(summary_df)
         permutation_top_pair_frames.append(top_pairs_df)
@@ -591,43 +780,95 @@ def main() -> None:
     permutation_summary = (
         pd.concat(permutation_summaries, ignore_index=True)
         if permutation_summaries
-        else pd.DataFrame(
-            columns=[
-                "permutation_index",
-                "mean_moran_attention",
-                "mean_moran_frequency",
-                "mean_boundary_attention",
-                "mean_boundary_frequency",
-            ]
-        )
+        else empty_permutation_summary()
     )
     permutation_top_pairs = (
         pd.concat(permutation_top_pair_frames, ignore_index=True)
         if permutation_top_pair_frames
-        else pd.DataFrame(
-            columns=[
-                "permutation_index",
-                "ranking_type",
-                "rank",
-                "lr_pair",
-                "occurrence_count",
-                "attention_mean",
-                "attention_sum",
-                "original_lr_sum",
-            ]
-        )
+        else empty_permutation_top_pairs()
     )
 
     save_outputs(
         config=config,
+        output_dir=output_dir,
         observed_results=observed_results,
         permutation_summary=permutation_summary,
         permutation_top_pairs=permutation_top_pairs,
+        top_k=args.top_k,
+        requested_n_permutations=args.n_permutations,
+        executed_n_permutations=executed_n_permutations,
+        note=note,
     )
 
-    print(f"Observed outputs saved to: {config.output_dir}")
-    if args.n_permutations:
-        print(f"Permutation summaries saved to: {config.output_dir / 'permutation_summary.csv'}")
+    observed_summary = observed_results["group_summary"].copy()
+    observed_summary.insert(0, "dataset", config.key)
+    observed_pair_metrics = observed_results["pair_metrics"].copy()
+    observed_pair_metrics.insert(0, "dataset", config.key)
+    observed_top_pairs = observed_results["top_pairs"].copy()
+    observed_top_pairs.insert(0, "dataset", config.key)
+
+    return {
+        "dataset": config.key,
+        "output_dir": output_dir,
+        "observed_summary": observed_summary,
+        "observed_pair_metrics": observed_pair_metrics,
+        "observed_top_pairs": observed_top_pairs,
+        "status_row": {
+            "dataset": config.key,
+            "output_dir": str(output_dir),
+            "requested_n_permutations": args.n_permutations,
+            "executed_n_permutations": executed_n_permutations,
+            "status": "ok",
+            "note": note,
+        },
+    }
+
+
+def main() -> None:
+    args = parse_args()
+    dataset_keys = resolve_dataset_keys(args.dataset)
+
+    dataset_summaries: list[pd.DataFrame] = []
+    dataset_pair_metrics: list[pd.DataFrame] = []
+    dataset_top_pairs: list[pd.DataFrame] = []
+    run_status_rows: list[dict[str, object]] = []
+
+    for dataset_key in dataset_keys:
+        config = DATASETS[dataset_key]
+        try:
+            result = run_dataset(config, args)
+        except Exception as exc:
+            if not args.continue_on_error:
+                raise
+            print(f"[{config.key}] FAILED: {exc}")
+            traceback.print_exc()
+            run_status_rows.append(
+                {
+                    "dataset": config.key,
+                    "output_dir": str(resolve_output_dir(config, args.output_root)),
+                    "requested_n_permutations": args.n_permutations,
+                    "executed_n_permutations": 0,
+                    "status": "failed",
+                    "note": str(exc),
+                }
+            )
+            continue
+
+        dataset_summaries.append(result["observed_summary"])
+        dataset_pair_metrics.append(result["observed_pair_metrics"])
+        dataset_top_pairs.append(result["observed_top_pairs"])
+        run_status_rows.append(result["status_row"])
+        print(f"[{config.key}] Outputs saved to: {result['output_dir']}")
+
+    combined_dir = args.output_root / "_combined" if args.output_root is not None else DATA_ROOT / "ccc_analysis_summary"
+    save_combined_outputs(
+        combined_dir=combined_dir,
+        dataset_summaries=dataset_summaries,
+        dataset_pair_metrics=dataset_pair_metrics,
+        dataset_top_pairs=dataset_top_pairs,
+        run_status_rows=run_status_rows,
+    )
+    print(f"Combined summaries saved to: {combined_dir}")
 
 
 if __name__ == "__main__":

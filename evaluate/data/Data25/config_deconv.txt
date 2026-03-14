@@ -1,0 +1,66 @@
+============================================================
+Stage 2: GAT Deconvolution (Auto K Grid Search)
+============================================================
+Timestamp: 2025-12-10 15:03:57
+
+Training Hyperparameters:
+  Epochs:        300
+  Learning Rate: 0.005
+  Batch Size:    512
+  Seed:          42
+
+Grid Search:
+  Candidates:    [20, 25, 30, 35, 40]
+  Best k:        30
+  Best Score:    0.895809
+
+Graph Construction:
+  K Spatial:     5
+  K Celltype:    35 (from grid search)
+  Scale Basis:   all
+  Weight Thresh: 0.001
+
+GAT Architecture:
+  Hidden Dim:    512
+  Layers:        4
+  Heads:         4
+  Dropout:       0.1
+
+Loss Weights:
+  Pearson:       1
+  MSE:           0
+  Cosine:        5.0
+  Gene Pearson:  1
+  Gene Cosine:   5.0
+  Reg:           0.1
+  Sparse:        0
+  Proportion:    0.01
+
+Dynamic Cluster Representation:
+  Enabled:       True
+  K Cells/Cluster: 15
+  Learnable Weights: False
+  Precompute KNN: True
+
+Output Options:
+  Save Reconstructed Genes: False
+
+All Trials (Score = Cosine + Gene_Cosine):
+    k=20: Cosine=0.388451, Gene_C=0.511368, Score=0.899819
+    k=25: Cosine=0.388277, Gene_C=0.510054, Score=0.898332
+    k=30: Cosine=0.388074, Gene_C=0.510276, Score=0.898350
+  * k=35: Cosine=0.387632, Gene_C=0.508177, Score=0.895809
+    k=40: Cosine=0.388241, Gene_C=0.509381, Score=0.897622
+
+Final Results:
+  Best Pearson:      0.548504
+  Best MSE:          2.328049
+  Best Cosine:       0.387632
+  Best Gene Pearson: 0.745067
+  Best Gene Cosine:  0.508177
+  N Clusters:        50
+  N Genes:           889
+
+System:
+  Device:        auto
+============================================================

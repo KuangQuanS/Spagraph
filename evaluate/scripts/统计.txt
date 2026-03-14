@@ -1,0 +1,39 @@
+1:RCTD踢掉
+2:RCTD踢掉
+3:RCTD 需要大调
+4:RCTD(差一点)
+5:RCTD/my
+6:RCTD 需要大调
+7:RCTD/my
+8:RCTD/my
+9:RCTD 需要大调
+10:RCTD/my
+11:RCTD 需要大调
+12:RCTD 可以放弃
+13:my
+14:my
+15:RCTD/my
+16:RCTD/my
+17:RCTD(极差)
+18:my
+19:RCTD(差一点点点)
+20:RCTD/my
+21:my
+22:my
+23:RCTD 可以放弃
+24:my
+25:RCTD/my
+26:RCTD(差一点点点点)
+27:my
+28:my
+29:SpatialDWLS
+30:tangram(差一点)
+31:SpatialDWLS
+32:my
+
+RCTD:10
+MY:9
+tangram:1
+SpatialDWLS:2
+
+RCTD MY tangram seurat SpatialDWLS stereoscope Destvi SPOTLIGHT

@@ -1,0 +1,38 @@
+============================================================
+Stage 1: VAE Training Configuration
+============================================================
+Timestamp: 2025-12-24 16:38:46
+
+Input Files:
+  SC File:       /home/maweicheng/ST_data/GSE243275/GSM7782698_SC.h5ad
+  ST File:       /home/maweicheng/ST_data/GSE243275/GSM7782699_ST.h5ad
+  Output Dir:    /home/maweicheng/ST_data/GSE243275/evaluate
+
+Training Hyperparameters:
+  Epochs:        300
+  Learning Rate: 0.0005
+  Batch Size:    512
+  Latent Dim:    256
+  Hidden Dims:   [512, 256]
+  Beta (KL):     0.1
+  Lambda MMD:    0.03
+  Loss Type:     mse
+  Seed:          42
+
+Clustering Hyperparameters:
+  Resolution:    4.0
+  Top N/Type:    100
+  Marker Method: variance
+  Aggregation:   mean
+
+Model Architecture:
+  Dual Decoder:  True
+  Device:        cuda:1
+
+Results:
+  N Clusters:    70
+  N Genes:       2130
+
+Final Loss:
+  Best Loss:     586.475206
+============================================================

@@ -1,0 +1,38 @@
+============================================================
+Stage 1: VAE Training Configuration
+============================================================
+Timestamp: 2025-12-15 16:06:51
+
+Input Files:
+  SC File:       /mnt/d/ST_Graduation_Project_data/database/seqFISH+/scRNA.h5ad
+  ST File:       /mnt/d/ST_Graduation_Project_data/database/seqFISH+/Spatial.h5ad
+  Output Dir:    /mnt/d/ST_Graduation_Project_data/evaluate/seqFISH+
+
+Training Hyperparameters:
+  Epochs:        300
+  Learning Rate: 0.0005
+  Batch Size:    512
+  Latent Dim:    256
+  Hidden Dims:   [512, 256]
+  Beta (KL):     0.1
+  Lambda MMD:    0.03
+  Loss Type:     mse
+  Seed:          42
+
+Clustering Hyperparameters:
+  Resolution:    4.0
+  Top N/Type:    50
+  Marker Method: variance
+  Aggregation:   mean
+
+Model Architecture:
+  Dual Decoder:  True
+  Device:        auto
+
+Results:
+  N Clusters:    68
+  N Genes:       1301
+
+Final Loss:
+  Best Loss:     234.344166
+============================================================

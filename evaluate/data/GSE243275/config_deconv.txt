@@ -1,0 +1,62 @@
+============================================================
+Stage 2: GAT Deconvolution Configuration
+============================================================
+Timestamp: 2025-12-24 16:55:57
+
+Input Files:
+  ST File:       /home/maweicheng/ST_data/GSE243275/GSM7782699_ST.h5ad
+  Output Dir:    /home/maweicheng/ST_data/GSE243275/evaluate
+  Sample Name:   GSM7782699_ST
+
+Training Hyperparameters:
+  Epochs:        300
+  Learning Rate: 0.005
+  Batch Size:    512
+  Print Every:   25
+  Seed:          42
+
+Graph Construction:
+  K Spatial:     5
+  K Celltype:    20 (input: 20)
+  Scale Basis:   all
+  Weight Thresh: 0.001
+
+GAT Architecture:
+  Hidden Dim:    512
+  Layers:        4
+  Heads:         4
+  Dropout:       0.1
+
+Loss Weights:
+  Pearson:       1
+  MSE:           0
+  Cosine:        5.0
+  Gene Pearson:  1
+  Gene Cosine:   5.0
+  Reg:           0.1
+  Sparse:        0
+  Proportion:    0.01
+
+Dynamic Cluster Representation:
+  Enabled:       True
+  K Cells/Cluster: 15
+  Precompute KNN: True
+
+Output Options:
+  Save Reconstructed Genes: True
+
+Results:
+  N Clusters:    70
+  N Genes:       2130
+
+Final Losses:
+  Best Pearson:      0.242207
+  Best MSE:          0.587133
+  Best Cosine:       0.149945
+  Best Gene Pearson: 0.559780
+  Best Gene Cosine:  0.271035
+
+System:
+  Memory Mode:   True
+  Device:        cuda:1
+============================================================

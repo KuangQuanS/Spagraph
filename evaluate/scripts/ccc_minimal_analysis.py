@@ -154,11 +154,6 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Keep running the remaining datasets even if one dataset fails.",
     )
-    parser.add_argument(
-        "--allow-observed-only-missing-perm-inputs",
-        action="store_true",
-        help="If spot_cell_expr is missing, still run observed-only metrics instead of failing.",
-    )
     return parser.parse_args()
 
 
@@ -735,15 +730,7 @@ def run_dataset(config: DatasetConfig, args: argparse.Namespace) -> dict[str, ob
     executed_n_permutations = args.n_permutations
     note = ""
     if executed_n_permutations > 0:
-        try:
-            ensure_permutation_inputs(config)
-        except FileNotFoundError as exc:
-            if not args.allow_observed_only_missing_perm_inputs:
-                raise
-            note = str(exc)
-            executed_n_permutations = 0
-            print(f"[{config.key}] {note}")
-            print(f"[{config.key}] Falling back to observed-only mode.")
+        ensure_permutation_inputs(config)
 
     lr_df, composition, adata = load_inputs(config)
     coords = np.asarray(adata.obsm["spatial"])

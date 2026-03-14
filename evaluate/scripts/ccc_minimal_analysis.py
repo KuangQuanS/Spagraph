@@ -10,7 +10,7 @@ import re
 import shutil
 import sys
 import traceback
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import matplotlib
@@ -66,6 +66,7 @@ class DatasetConfig:
     spot_cell_expr_csv: Path | None
     st_h5ad: Path
     boundary: BoundaryConfig
+    output_dir_override: Path | None = None
     n_spot_neighbors: int = 8
     ligand_expr_threshold: float = 3.0
     receptor_expr_threshold: float = 3.0
@@ -76,6 +77,8 @@ class DatasetConfig:
 
     @property
     def output_dir(self) -> Path:
+        if self.output_dir_override is not None:
+            return self.output_dir_override
         return self.dataset_dir / "ccc_analysis"
 
 
@@ -134,6 +137,15 @@ DATASETS = {
 }
 
 
+def parse_bool(value: str) -> bool:
+    lowered = value.strip().lower()
+    if lowered in {"1", "true", "t", "yes", "y"}:
+        return True
+    if lowered in {"0", "false", "f", "no", "n"}:
+        return False
+    raise argparse.ArgumentTypeError(f"Expected a boolean value, got: {value}")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="CCC permutation / Moran / niche workflow.")
     parser.add_argument(
@@ -143,6 +155,25 @@ def parse_args() -> argparse.Namespace:
         choices=["all", *sorted(DATASETS)],
         help="Datasets to run. Use 'all' to run every configured dataset.",
     )
+    parser.add_argument("--run-name", default=None, help="Explicit run label for custom input mode.")
+    parser.add_argument("--lr-communication-csv", type=Path, default=None)
+    parser.add_argument("--composition-csv", type=Path, default=None)
+    parser.add_argument("--spot-cell-expr-csv", type=Path, default=None)
+    parser.add_argument("--st-h5ad", type=Path, default=None)
+    parser.add_argument("--output-dir", type=Path, default=None)
+    parser.add_argument("--region-name", default=None)
+    parser.add_argument("--group-a-name", default=None)
+    parser.add_argument("--group-a-columns", nargs="+", default=None)
+    parser.add_argument("--group-b-name", default=None)
+    parser.add_argument("--group-b-columns", nargs="+", default=None)
+    parser.add_argument("--boundary-threshold", type=float, default=0.10)
+    parser.add_argument("--n-spot-neighbors", type=int, default=None)
+    parser.add_argument("--ligand-expr-threshold", type=float, default=None)
+    parser.add_argument("--receptor-expr-threshold", type=float, default=None)
+    parser.add_argument("--allow-same-celltype-comm", type=parse_bool, default=None)
+    parser.add_argument("--epochs", type=int, default=None)
+    parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument("--cellcom-seed", type=int, default=None)
     parser.add_argument("--n-permutations", type=int, default=100)
     parser.add_argument("--top-k", type=int, default=20)
     parser.add_argument("--seed", type=int, default=42)
@@ -161,6 +192,109 @@ def resolve_dataset_keys(selected: list[str]) -> list[str]:
     if "all" in selected:
         return list(DATASETS)
     return selected
+
+
+def uses_explicit_config(args: argparse.Namespace) -> bool:
+    explicit_fields = [
+        "run_name",
+        "lr_communication_csv",
+        "composition_csv",
+        "spot_cell_expr_csv",
+        "st_h5ad",
+        "output_dir",
+        "region_name",
+        "group_a_name",
+        "group_a_columns",
+        "group_b_name",
+        "group_b_columns",
+    ]
+    return any(getattr(args, field) is not None for field in explicit_fields)
+
+
+def build_boundary_from_args(args: argparse.Namespace) -> BoundaryConfig:
+    required = {
+        "region_name": args.region_name,
+        "group_a_name": args.group_a_name,
+        "group_a_columns": args.group_a_columns,
+        "group_b_name": args.group_b_name,
+        "group_b_columns": args.group_b_columns,
+    }
+    missing = [name for name, value in required.items() if value is None]
+    if missing:
+        raise ValueError(
+            "Explicit mode is missing boundary arguments: " + ", ".join(missing)
+        )
+    return BoundaryConfig(
+        region_name=args.region_name,
+        group_a_name=args.group_a_name,
+        group_a_columns=tuple(args.group_a_columns),
+        group_b_name=args.group_b_name,
+        group_b_columns=tuple(args.group_b_columns),
+        threshold=args.boundary_threshold,
+    )
+
+
+def apply_runtime_overrides(config: DatasetConfig, args: argparse.Namespace) -> DatasetConfig:
+    overrides = {}
+    if args.output_dir is not None:
+        overrides["output_dir_override"] = args.output_dir
+    if args.n_spot_neighbors is not None:
+        overrides["n_spot_neighbors"] = args.n_spot_neighbors
+    if args.ligand_expr_threshold is not None:
+        overrides["ligand_expr_threshold"] = args.ligand_expr_threshold
+    if args.receptor_expr_threshold is not None:
+        overrides["receptor_expr_threshold"] = args.receptor_expr_threshold
+    if args.allow_same_celltype_comm is not None:
+        overrides["allow_same_celltype_comm"] = args.allow_same_celltype_comm
+    if args.epochs is not None:
+        overrides["epochs"] = args.epochs
+    if args.batch_size is not None:
+        overrides["batch_size"] = args.batch_size
+    if args.cellcom_seed is not None:
+        overrides["seed"] = args.cellcom_seed
+    if not overrides:
+        return config
+    return replace(config, **overrides)
+
+
+def build_explicit_config(args: argparse.Namespace) -> DatasetConfig:
+    if args.output_root is not None:
+        raise ValueError("Explicit mode uses --output-dir and does not support --output-root.")
+
+    required = {
+        "run_name": args.run_name,
+        "lr_communication_csv": args.lr_communication_csv,
+        "composition_csv": args.composition_csv,
+        "spot_cell_expr_csv": args.spot_cell_expr_csv,
+        "st_h5ad": args.st_h5ad,
+        "output_dir": args.output_dir,
+    }
+    missing = [name for name, value in required.items() if value is None]
+    if missing:
+        raise ValueError(
+            "Explicit mode is missing required input arguments: " + ", ".join(missing)
+        )
+
+    boundary = build_boundary_from_args(args)
+    return DatasetConfig(
+        key=args.run_name,
+        dataset_dir=args.composition_csv.parent,
+        lr_communication=args.lr_communication_csv,
+        composition_csv=args.composition_csv,
+        spot_cell_expr_csv=args.spot_cell_expr_csv,
+        st_h5ad=args.st_h5ad,
+        boundary=boundary,
+        output_dir_override=args.output_dir,
+        n_spot_neighbors=args.n_spot_neighbors if args.n_spot_neighbors is not None else 8,
+        ligand_expr_threshold=args.ligand_expr_threshold if args.ligand_expr_threshold is not None else 3.0,
+        receptor_expr_threshold=args.receptor_expr_threshold if args.receptor_expr_threshold is not None else 3.0,
+        allow_same_celltype_comm=(
+            args.allow_same_celltype_comm if args.allow_same_celltype_comm is not None else True
+        ),
+        epochs=args.epochs if args.epochs is not None else 200,
+        batch_size=args.batch_size if args.batch_size is not None else 64,
+        seed=args.cellcom_seed if args.cellcom_seed is not None else args.seed,
+    )
 
 
 def resolve_output_dir(config: DatasetConfig, output_root: Path | None) -> Path:
@@ -813,15 +947,21 @@ def run_dataset(config: DatasetConfig, args: argparse.Namespace) -> dict[str, ob
 
 def main() -> None:
     args = parse_args()
+    if uses_explicit_config(args):
+        config = build_explicit_config(args)
+        result = run_dataset(config, args)
+        print(f"[{config.key}] Outputs saved to: {result['output_dir']}")
+        return
+
     dataset_keys = resolve_dataset_keys(args.dataset)
+    configs = [apply_runtime_overrides(DATASETS[dataset_key], args) for dataset_key in dataset_keys]
 
     dataset_summaries: list[pd.DataFrame] = []
     dataset_pair_metrics: list[pd.DataFrame] = []
     dataset_top_pairs: list[pd.DataFrame] = []
     run_status_rows: list[dict[str, object]] = []
 
-    for dataset_key in dataset_keys:
-        config = DATASETS[dataset_key]
+    for config in configs:
         try:
             result = run_dataset(config, args)
         except Exception as exc:

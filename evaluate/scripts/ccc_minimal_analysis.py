@@ -375,6 +375,21 @@ def read_lr_table(csv_path: Path) -> pd.DataFrame:
         raise ValueError(f"{csv_path} is missing required columns from {sorted(EXPECTED_LR_COLUMNS)}") from exc
 
 
+def resolve_cellcom_lr_csv(cellcom_output_dir: Path) -> Path | None:
+    unified_csv = cellcom_output_dir / "lr_communication.csv"
+    if unified_csv.exists():
+        return unified_csv
+
+    exact_filtered_csv = cellcom_output_dir / "lr_communication_filtered_1.0.csv"
+    if exact_filtered_csv.exists():
+        return exact_filtered_csv
+
+    filtered_candidates = sorted(cellcom_output_dir.glob("lr_communication_filtered_*.csv"))
+    if filtered_candidates:
+        return filtered_candidates[0]
+    return None
+
+
 def load_inputs(config: DatasetConfig) -> tuple[pd.DataFrame, pd.DataFrame, sc.AnnData]:
     lr_df = read_lr_table(config.lr_communication)
     require_existing(config.composition_csv)
@@ -701,13 +716,19 @@ def run_single_permutation(
     composition: pd.DataFrame,
     device: str,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
+    if not (config.export_unified_csv or config.export_filtered_csv):
+        raise ValueError(
+            "Permutation reruns require at least one LR communication export. "
+            "Set --export-unified-csv true or --export-filtered-csv true."
+        )
+
     perm_root = output_dir / "_perm_runs" / f"perm_{permutation_index:03d}"
     perm_h5ad = perm_root / "permuted_spatial.h5ad"
     perm_output = perm_root / "cellcom"
-    perm_lr_csv = perm_output / "lr_communication.csv"
+    perm_lr_csv = resolve_cellcom_lr_csv(perm_output)
     staged_deconv_dir, spot_cell_expr_csv = stage_cellcom_inputs(config, output_dir)
 
-    if not perm_lr_csv.exists() or not perm_h5ad.exists():
+    if perm_lr_csv is None or not perm_h5ad.exists():
         write_permuted_h5ad(config.st_h5ad, perm_h5ad, base_seed + permutation_index)
         spagraph.cellcom(
             deconv_dir=str(staged_deconv_dir),
@@ -726,6 +747,13 @@ def run_single_permutation(
             export_filtered_csv=config.export_filtered_csv,
             seed=config.seed,
             device=device,
+        )
+        perm_lr_csv = resolve_cellcom_lr_csv(perm_output)
+
+    if perm_lr_csv is None:
+        raise FileNotFoundError(
+            f"No permutation LR communication CSV was produced under {perm_output}. "
+            "Check export flags."
         )
 
     perm_lr_df = read_lr_table(perm_lr_csv)

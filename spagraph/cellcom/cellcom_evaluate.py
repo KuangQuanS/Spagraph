@@ -29,7 +29,8 @@ def evaluate_cell_communication(
     spot_names: List[str] = None,
     all_src_barcodes: List[List[str]] = None,
     all_dst_barcodes: List[List[str]] = None,
-    export_unified: bool = True,
+    export_unified: bool = False,
+    export_filtered: bool = True,
     attention_threshold: float = 0.1
 ) -> None:
     """
@@ -328,8 +329,11 @@ def evaluate_cell_communication(
                     f"Unified export:     skipped={skipped_total} (out_of_range={skipped_out_of_range}, missing_mapping={skipped_missing_mapping})"
                 )
             print(f"Unified CSV saved:  {unified_comm_path} (rows={generated_rows})")
+    else:
+        print("Unified export:     skipped (export_unified=False)")
 
         # 生成按注意力阈值过滤后的通讯结果
+    if export_filtered:
         filtered_comm_path = os.path.join(output_dir, f"lr_communication_filtered_{attention_threshold}.csv")
         with open(filtered_comm_path, 'w') as f:
             f.write("src_spot_barcode,dst_spot_barcode,source_cell,target_cell,lr_pair,original_lr_score,attention_score\n")
@@ -399,7 +403,7 @@ def evaluate_cell_communication(
 
         print(f"Filtered CSV saved: {filtered_comm_path}")
     else:
-        print("Export skipped:     export_unified=False")
+        print("Filtered export:    skipped (export_filtered=False)")
 
 def plot_dgi_loss(dgi_train_losses, dgi_val_losses=None, output_dir: str = None, epochs: int = None) -> None:
     """

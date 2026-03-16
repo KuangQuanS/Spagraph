@@ -53,6 +53,8 @@ def _print_stage3_header(args, device: torch.device):
     print(f"Same-Type Comm:     {getattr(args, 'allow_same_celltype_comm', False)}")
     print(f"Min Comm Edges:     {args.min_comm_edges}")
     print(f"Attention Thr:      {args.attention_threshold}")
+    print(f"Export Unified:     {getattr(args, 'export_unified_csv', False)}")
+    print(f"Export Filtered:    {getattr(args, 'export_filtered_csv', True)}")
     print(f"MLP:               {args.mlp_hidden_dims} -> {args.mlp_latent_dim}")
     print(f"GAT Architecture:   {len(gat_hidden_dims)}L × [{', '.join(gat_hidden_dims)}]D × {args.gat_heads}H")
     print(f"Dropout:            {args.gat_dropout}")
@@ -121,6 +123,10 @@ def parse_args():
     parser.add_argument('--lambda_node_recon', type=float, default=0.5, help='节点特征重构损失的权重 (default: 0.5)')
     parser.add_argument('--attention_threshold', type=float, default=1,
                        help='注意力得分阈值，用于过滤边 (default: 0)')
+    parser.add_argument('--export_unified_csv', type=lambda x: str(x).lower() == 'true', default=False,
+                       help='Whether to export full lr_communication.csv (default: False)')
+    parser.add_argument('--export_filtered_csv', type=lambda x: str(x).lower() == 'true', default=True,
+                       help='Whether to export filtered lr_communication CSV (default: True)')
     parser.add_argument('--edge_mask_ratio', type=float, default=0.2, help='mask通讯边的比例 (默认20%%)')
     parser.add_argument('--node_mask_ratio', type=float, default=0.15, help='mask节点特征比例 (默认15%%)')
     parser.add_argument('--mask_seed', type=int, default=1234, help='验证阶段mask的固定随机种子')
@@ -940,6 +946,8 @@ def main(args=None):
         spot_names=spot_names,
         all_src_barcodes=all_src_barcodes,
         all_dst_barcodes=all_dst_barcodes,
+        export_unified=getattr(args, 'export_unified_csv', False),
+        export_filtered=getattr(args, 'export_filtered_csv', True),
         attention_threshold=args.attention_threshold
     )
     

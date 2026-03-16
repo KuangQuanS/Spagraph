@@ -448,6 +448,7 @@ def main(args=None):
     val_mask_losses = []
     train_node_losses = []
     val_node_losses = []
+    learning_rates = []
     
     # ========== 阶段4：训练循环 ==========
     print(f"\n{'='*60}\nStage 3.7: Train\n{'='*60}")
@@ -742,6 +743,7 @@ def main(args=None):
         val_mask_losses.append(avg_val_mask)
         train_node_losses.append(avg_train_node)
         val_node_losses.append(avg_val_node)
+        learning_rates.append(float(optimizer.param_groups[0]['lr']))
         
         # 每个epoch结束时更新学习率调度器
         scheduler.step()
@@ -770,6 +772,21 @@ def main(args=None):
             'Train_Mask': f'{avg_train_mask:.4f}',
             'Train_Node': f'{avg_train_node:.4f}',
         })
+    training_history_path = os.path.join(args.output_dir, "training_history.csv")
+    training_history_df = pd.DataFrame(
+        {
+            "epoch": list(range(1, len(train_losses) + 1)),
+            "train_loss": train_losses,
+            "val_loss": val_losses,
+            "train_mask_loss": train_mask_losses,
+            "val_mask_loss": val_mask_losses,
+            "train_node_loss": train_node_losses,
+            "val_node_loss": val_node_losses,
+            "learning_rate": learning_rates,
+        }
+    )
+    training_history_df.to_csv(training_history_path, index=False)
+    print(f"Training log saved: {training_history_path}")
     # 在训练结束后，用训练好的模型对完整数据集进行一次评估，收集注意力得分
     print(f"\n{'='*60}\nStage 3.8: Evaluate and Save\n{'='*60}")
     print(f"Evaluating:          spots={len(dataset)}, batches={len(eval_dataloader)}")

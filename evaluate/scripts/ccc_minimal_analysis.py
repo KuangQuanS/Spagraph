@@ -73,6 +73,8 @@ class DatasetConfig:
     allow_same_celltype_comm: bool = True
     epochs: int = 200
     batch_size: int = 64
+    num_workers: int = 0
+    save_lr_scores_csv: bool = False
     seed: int = 42
 
     @property
@@ -173,6 +175,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--allow-same-celltype-comm", type=parse_bool, default=None)
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument("--num-workers", type=int, default=None)
+    parser.add_argument("--save-lr-scores-csv", type=parse_bool, default=None)
     parser.add_argument("--cellcom-seed", type=int, default=None)
     parser.add_argument("--n-permutations", type=int, default=100)
     parser.add_argument("--top-k", type=int, default=20)
@@ -250,6 +254,10 @@ def apply_runtime_overrides(config: DatasetConfig, args: argparse.Namespace) -> 
         overrides["epochs"] = args.epochs
     if args.batch_size is not None:
         overrides["batch_size"] = args.batch_size
+    if args.num_workers is not None:
+        overrides["num_workers"] = args.num_workers
+    if args.save_lr_scores_csv is not None:
+        overrides["save_lr_scores_csv"] = args.save_lr_scores_csv
     if args.cellcom_seed is not None:
         overrides["seed"] = args.cellcom_seed
     if not overrides:
@@ -293,6 +301,10 @@ def build_explicit_config(args: argparse.Namespace) -> DatasetConfig:
         ),
         epochs=args.epochs if args.epochs is not None else 200,
         batch_size=args.batch_size if args.batch_size is not None else 64,
+        num_workers=args.num_workers if args.num_workers is not None else 0,
+        save_lr_scores_csv=(
+            args.save_lr_scores_csv if args.save_lr_scores_csv is not None else False
+        ),
         seed=args.cellcom_seed if args.cellcom_seed is not None else args.seed,
     )
 
@@ -694,6 +706,8 @@ def run_single_permutation(
             allow_same_celltype_comm=config.allow_same_celltype_comm,
             epochs=config.epochs,
             batch_size=config.batch_size,
+            num_workers=config.num_workers,
+            save_lr_scores_csv=config.save_lr_scores_csv,
             seed=config.seed,
             device=device,
         )

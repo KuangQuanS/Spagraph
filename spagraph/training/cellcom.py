@@ -54,6 +54,7 @@ def run_cellcom(
     val_split: float = 0.1,
     early_stop_patience: int = 20,
     early_stop_min_delta: float = 0.1,
+    save_lr_scores_csv: bool = False,
     # Legacy support
     args: Optional[Union[argparse.Namespace, Dict[str, Any]]] = None,
     **overrides: Any,
@@ -81,6 +82,7 @@ def run_cellcom(
         mean_expr_threshold: Mean expression threshold for gene filtering
         min_comm_edges: Minimum communication edges threshold
         spot_cell_expr_csv: Pre-computed spot-cell expression CSV (optional)
+        save_lr_scores_csv: Whether to save Stage 3.4 lr_scores.csv
         gat_hidden_dims: GAT hidden dimensions (comma-separated)
         gat_heads: Number of attention heads
         gat_dropout: Dropout probability
@@ -148,6 +150,7 @@ def run_cellcom(
         lr_score_threshold=lr_score_threshold,
         min_comm_edges=min_comm_edges,
         spot_cell_expr_csv=spot_cell_expr_csv,
+        save_lr_scores_csv=save_lr_scores_csv,
         use_hvg_for_communication=use_hvg_for_communication,
         allow_same_celltype_comm=allow_same_celltype_comm,
         gat_hidden_dims=gat_hidden_dims,

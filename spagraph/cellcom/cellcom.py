@@ -98,6 +98,8 @@ def parse_args():
                        help='最小通讯边数阈值，少于此值的spot将被过滤 (default: 1)')
     parser.add_argument('--spot_cell_expr_csv', type=str, default=None,
                        help='预计算的spot-cell全基因表达CSV文件路径，如果提供则跳过构建步骤')
+    parser.add_argument('--save_lr_scores_csv', type=lambda x: str(x).lower() == 'true', default=False,
+                       help='Whether to save Stage 3.4 lr_scores.csv (default: False)')
     parser.add_argument('--use_hvg_for_communication', type=lambda x: str(x).lower() == 'true', default=True,
                        help='只使用高变基因计算LR通讯（而非全部基因），减少计算量并保持特征一致性 (default: True)')
     parser.add_argument(
@@ -331,7 +333,8 @@ def main(args=None):
         n_neighbors=args.n_spot_neighbors,
         hvg_genes=available_activated_genes if args.use_hvg_for_communication else None,
         ligand_expr_threshold=getattr(args, 'ligand_expr_threshold', 3.0),
-        receptor_expr_threshold=getattr(args, 'receptor_expr_threshold', 1.0)
+        receptor_expr_threshold=getattr(args, 'receptor_expr_threshold', 1.0),
+        save_lr_scores_csv=getattr(args, 'save_lr_scores_csv', False),
     )
     print(f"\n{'='*60}\nStage 3.5: Build Dataset\n{'='*60}")
     

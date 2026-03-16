@@ -103,7 +103,8 @@ def calculate_lr_scores(
     hvg_genes: Optional[List[str]] = None,
     ligand_expr_threshold: float = 3.0,
     receptor_expr_threshold: float = 1.0,
-) -> Tuple[np.ndarray, str, Dict[str, Any], Dict[Tuple[int, int], List[Tuple[int, int, float, int]]], Dict[Tuple[str, str], int], Dict[int, Tuple[str, str]]]:
+    save_lr_scores_csv: bool = False,
+) -> Tuple[np.ndarray, Optional[str], Dict[str, Any], Dict[Tuple[int, int], List[Tuple[int, int, float, int]]], Dict[Tuple[str, str], int], Dict[int, Tuple[str, str]]]:
     """Calculate KNN neighborhoods and LR communication scores."""
     if composition is None:
         raise ValueError("composition is required for LR score calculation")
@@ -284,18 +285,22 @@ def calculate_lr_scores(
     if (not allow_same_celltype_comm) and same_celltype_skipped:
         print(f"LR scores:          same-type skipped={same_celltype_skipped}")
 
-    csv_path = os.path.join(output_dir, "lr_scores.csv")
-    df = pd.DataFrame(
-        comm_event_records,
-        columns=["spot_i", "spot_j", "cell_i", "cell_j", "ligand", "receptor", "comm_score", "in_knn", "distance"],
-    )
-    df.to_csv(csv_path, index=False)
-    print(
-        "LR scores saved:    "
-        f"{csv_path} (events={len(df)}, "
-        f"spot_pairs={df.groupby(['spot_i', 'spot_j']).ngroups}, "
-        f"cell_pairs={df.groupby(['cell_i', 'cell_j']).ngroups})"
-    )
+    csv_path: Optional[str] = None
+    if save_lr_scores_csv:
+        csv_path = os.path.join(output_dir, "lr_scores.csv")
+        df = pd.DataFrame(
+            comm_event_records,
+            columns=["spot_i", "spot_j", "cell_i", "cell_j", "ligand", "receptor", "comm_score", "in_knn", "distance"],
+        )
+        df.to_csv(csv_path, index=False)
+        print(
+            "LR scores saved:    "
+            f"{csv_path} (events={len(df)}, "
+            f"spot_pairs={df.groupby(['spot_i', 'spot_j']).ngroups}, "
+            f"cell_pairs={df.groupby(['cell_i', 'cell_j']).ngroups})"
+        )
+    else:
+        print("LR scores saved:    skipped (save_lr_scores_csv=False)")
 
     graph_data = {
         "coords": spot_coords,

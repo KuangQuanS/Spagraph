@@ -472,13 +472,16 @@ def main(args=None):
         print("Early stop:         Disabled")
     
     # 评估 dataloader（对整个数据集进行评估）
+    eval_num_workers = 0
+    if num_workers > 0:
+        print("Eval workers:       0 (forced to avoid too many open files)")
     eval_dataloader = DataLoader(
         dataset,
         batch_size=args.batch_size,
         shuffle=False,
-        num_workers=num_workers,
+        num_workers=eval_num_workers,
         pin_memory=pin_memory,
-        persistent_workers=num_workers > 0,
+        persistent_workers=False,
         collate_fn=hetero_subgraph_collate_fn
     )
 

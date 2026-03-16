@@ -429,16 +429,28 @@ def set_seed(seed: int = 42):
 class STHeteroSubgraphDataset:
     """空间转录组异构图子图数据集 - 以每个spot为中心构建k邻域子图"""
     
-    def __init__(self, st_h5ad_path: str, cluster_expr: pd.DataFrame, 
-                 cell_expr: pd.DataFrame, cell_full_expr: pd.DataFrame,
-                 graph_data: Dict, lr_pairs: List[Tuple[str, str]],
-                 k_neighbors: int = 10,
-                 expr_threshold: float = 1.0,
-                 load_lr_scores_csv: Optional[str] = None,
-                 min_comm_edges: int = 1,
-                 valid_cell_types: Optional[List[str]] = None,
-                 device: str = 'cpu',
-                 spot_cell_expr: Optional[pd.DataFrame] = None):
+    def __init__(
+        self,
+        st_h5ad_path: str,
+        cluster_expr: pd.DataFrame,
+        cell_expr: pd.DataFrame,
+        cell_full_expr: pd.DataFrame,
+        graph_data: Dict,
+        lr_pairs: List[Tuple[str, str]],
+        k_neighbors: int = 10,
+        expr_threshold: float = 1.0,
+        load_lr_scores_csv: Optional[str] = None,
+        min_comm_edges: int = 1,
+        valid_cell_types: Optional[List[str]] = None,
+        device: str = 'cpu',
+        spot_cell_expr: Optional[pd.DataFrame] = None,
+        adata: Optional[sc.AnnData] = None,
+        spot_names: Optional[List[str]] = None,
+        st_X: Optional[np.ndarray] = None,
+        comm_by_spot_pair: Optional[Dict[Tuple[int, int], List[Tuple[int, int, float, int]]]] = None,
+        lr_pair_to_id: Optional[Dict[Tuple[str, str], int]] = None,
+        lr_id_to_pair: Optional[Dict[int, Tuple[str, str]]] = None,
+    ):
         """
         初始化数据集
         Args:
@@ -480,9 +492,15 @@ class STHeteroSubgraphDataset:
         self.comm_by_spot_pair = {}
         
         # 加载ST数据
-        self.adata = sc.read_h5ad(st_h5ad_path)
+        if adata is not None:
+            print("[Dataset] Using in-memory adata")
+            self.adata = adata
+        else:
+            print(f"[Dataset] Using h5ad fallback: {st_h5ad_path}")
+            self.adata = sc.read_h5ad(st_h5ad_path)
         self.adata.var_names_make_unique()
-        self.n_spots = self.adata.n_obs
+        self.spot_names = list(spot_names) if spot_names is not None else self.adata.obs_names.tolist()
+        self.n_spots = len(self.spot_names)
         
         # 获取spot坐标（用于构建邻域）
         self.coords = graph_data.get('coords', None)
@@ -498,11 +516,13 @@ class STHeteroSubgraphDataset:
         self.knn_mask = graph_data.get('knn_mask', None)
         
         # 获取ST中与cluster表达量匹配的基因
-        self.genes = list(set(cluster_expr.columns.tolist()))
+        self.genes = list(dict.fromkeys(cluster_expr.columns.tolist()))
         # 过滤到 adata 中存在的基因
         self.genes = [g for g in self.genes if g in self.adata.var_names]
         # 对于激活基因，我们需要从adata中提取对应的表达
-        if len(self.genes) != self.adata.n_vars:
+        if st_X is not None:
+            self.st_X = st_X
+        elif len(self.genes) != self.adata.n_vars:
             # 如果基因数量不匹配，说明使用的是激活基因子集
             self.st_X = self.adata[:, self.genes].X
         else:
@@ -540,7 +560,19 @@ class STHeteroSubgraphDataset:
         self.cell_names = cell_expr.index.tolist()
         self.gene_names = cell_expr.columns.tolist()
         
-        if load_lr_scores_csv is not None:
+        print("[Dataset] Loading communication index source")
+        if comm_by_spot_pair is not None and lr_pair_to_id is not None and lr_id_to_pair is not None:
+            print("[Dataset] Using in-memory communication cache")
+            self.comm_by_spot_pair = comm_by_spot_pair
+            self.lr_pair_to_id = lr_pair_to_id
+            self.lr_id_to_pair = lr_id_to_pair
+            self.lr_scores_by_spot_pair = None
+            total_cell_pairs = sum(len(v) for v in self.comm_by_spot_pair.values())
+            print(f"[Loaded] Spot pairs with communication: {len(self.comm_by_spot_pair)}")
+            print(f"[Loaded] Spot-cell pairs with communication: {total_cell_pairs}")
+            print(f"[Loaded] Unique LR pairs: {len(self.lr_pair_to_id)}")
+        elif load_lr_scores_csv is not None:
+            print(f"[Dataset] Using CSV fallback: {load_lr_scores_csv}")
             self._load_lr_scores_from_csv(load_lr_scores_csv)
         else:
             raise ValueError("必须提供load_lr_scores_csv")
@@ -549,6 +581,7 @@ class STHeteroSubgraphDataset:
 
         # ========== 确保spot和cell基因顺序一致 ==========
         # 创建从cluster_expr基因顺序到cell_marker_expr基因顺序的映射
+        print("[Dataset] Aligning marker matrices")
         self.spot_gene_order_to_cell = []
         for gene_name in self.cell_marker_expr.columns:
             if gene_name in self.genes:
@@ -563,7 +596,6 @@ class STHeteroSubgraphDataset:
         self.n_marker_genes = len(self.marker_genes)
         self.zero_cell_marker_expr = np.zeros(self.n_marker_genes, dtype=np.float32)
 
-        self.spot_names = self.adata.obs_names.tolist()
         self.composition_values = self.composition.values.astype(np.float32)
         self.cell_name_to_idx = {name: idx for idx, name in enumerate(self.cell_names)}
         self.cells_in_spot = [
@@ -572,6 +604,7 @@ class STHeteroSubgraphDataset:
         ]
         
         # ========== 预计算Spot-Spot高斯权重矩阵（避免__getitem__中重复计算）==========
+        print("[Dataset] Building spatial weight matrix")
         coords = self.coords
         diff = coords[:, np.newaxis, :] - coords[np.newaxis, :, :]  # [n_spots, n_spots, 2]
         dist_matrix = np.sqrt((diff ** 2).sum(axis=2))  # [n_spots, n_spots]
@@ -614,6 +647,7 @@ class STHeteroSubgraphDataset:
                 continue
             row_idx_matrix[spot_idx, cell_idx] = row_idx
         self.spot_cell_row_idx = row_idx_matrix
+        print("[Dataset] Dataset initialization finished")
     
 
     def _load_lr_scores_from_csv(self, csv_path: str):
@@ -625,16 +659,16 @@ class STHeteroSubgraphDataset:
         df = pd.read_csv(csv_path)
         
         # 获取spot名称列表和cell名称列表
-        spot_names = self.adata.obs_names.tolist()
-        cell_names_list = self.cell_expr.index.tolist()
+        spot_name_to_idx = {name: idx for idx, name in enumerate(self.spot_names)}
+        cell_name_to_idx = {name: idx for idx, name in enumerate(self.cell_names)}
         
         # 构建查询字典：{(spot_i_idx, spot_j_idx, cell_i_idx, cell_j_idx, ligand, receptor): score}
         lr_id_counter = 1  # 从1开始，避免与相似度边的ID=0冲突
-        for idx, row in df.iterrows():
-            spot_i_barcode = row['spot_i']
-            spot_j_barcode = row['spot_j']
-            cell_i = row['cell_i']  # "barcode_cell"
-            cell_j = row['cell_j']  # "barcode_cell"
+        for row in df.itertuples(index=False):
+            spot_i_barcode = row.spot_i
+            spot_j_barcode = row.spot_j
+            cell_i = row.cell_i  # "barcode_cell"
+            cell_j = row.cell_j  # "barcode_cell"
             
             # 从cell_i/cell_j中提取cell名称
             # cell_i格式: "barcode_cell"
@@ -646,13 +680,13 @@ class STHeteroSubgraphDataset:
             
             try:
                 # 转换为索引
-                spot_i_idx = spot_names.index(spot_i_barcode)
-                spot_j_idx = spot_names.index(spot_j_barcode)
-                cell_i_idx = cell_names_list.index(cell_i_name)
-                cell_j_idx = cell_names_list.index(cell_j_name)
+                spot_i_idx = spot_name_to_idx[spot_i_barcode]
+                spot_j_idx = spot_name_to_idx[spot_j_barcode]
+                cell_i_idx = cell_name_to_idx[cell_i_name]
+                cell_j_idx = cell_name_to_idx[cell_j_name]
                 
-                ligand = row['ligand']
-                receptor = row['receptor']
+                ligand = row.ligand
+                receptor = row.receptor
                 
                 # 为LR对分配唯一ID
                 lr_pair = (ligand, receptor)
@@ -664,14 +698,14 @@ class STHeteroSubgraphDataset:
                 lr_id = self.lr_pair_to_id[lr_pair]
 
                 # ✅ 聚合 comm_score（同一 spot/cell 对可能对应多个 LR 事件）
-                comm_score = float(row['comm_score'])
+                comm_score = float(row.comm_score)
                 spot_pair_key = (spot_i_idx, spot_j_idx, cell_i_idx, cell_j_idx)
                 pair_data = self.lr_scores_by_spot_pair.get(spot_pair_key)
                 if pair_data is None:
                     self.lr_scores_by_spot_pair[spot_pair_key] = [comm_score, lr_id]
                 else:
                     pair_data[0] += comm_score
-            except ValueError:
+            except KeyError:
                 # 如果barcode或cell名称找不到，跳过这条记录
                 continue
         

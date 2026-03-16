@@ -318,9 +318,9 @@ def main(args=None):
     print(f"Composition shape:  {composition.shape}")
     
     # ========== 阶段3.5：预计算KNN邻域和LR通讯得分 ==========
-    print(f"\n{'='*60}\nStage 3.5: Precompute LR Scores\n{'='*60}")
+    print(f"\n{'='*60}\nStage 3.4: Precompute LR Scores\n{'='*60}")
     
-    knn_mask, csv_path, graph_data = calculate_lr_scores(
+    knn_mask, csv_path, graph_data, comm_by_spot_pair, lr_pair_to_id, lr_id_to_pair = calculate_lr_scores(
         spot_coords=spot_coords,
         composition=composition,
         args=args,
@@ -333,6 +333,7 @@ def main(args=None):
         ligand_expr_threshold=getattr(args, 'ligand_expr_threshold', 3.0),
         receptor_expr_threshold=getattr(args, 'receptor_expr_threshold', 1.0)
     )
+    print(f"\n{'='*60}\nStage 3.5: Build Dataset\n{'='*60}")
     
     dataset = STHeteroSubgraphDataset(
         st_h5ad_path=args.st_h5ad,
@@ -346,7 +347,12 @@ def main(args=None):
         min_comm_edges=args.min_comm_edges,
         valid_cell_types=cell_names,
         device=device,
-        spot_cell_expr=spot_cell_expr_df
+        spot_cell_expr=spot_cell_expr_df,
+        adata=adata,
+        spot_names=spot_names,
+        comm_by_spot_pair=comm_by_spot_pair,
+        lr_pair_to_id=lr_pair_to_id,
+        lr_id_to_pair=lr_id_to_pair
     )
     
     # ========== 数据集划分：训练集和验证集 ==========
@@ -405,7 +411,7 @@ def main(args=None):
         collate_fn=hetero_subgraph_collate_fn_batched
     )
     
-    print(f"\n{'='*60}\nStage 3.4: Build Model\n{'='*60}")
+    print(f"\n{'='*60}\nStage 3.6: Build Model\n{'='*60}")
     gat_hidden_dims = [int(x) for x in args.gat_hidden_dims.split(',')]
     
     n_genes = cluster_expr.shape[1]
@@ -444,7 +450,7 @@ def main(args=None):
     val_node_losses = []
     
     # ========== 阶段4：训练循环 ==========
-    print(f"\n{'='*60}\nStage 3.5: Train\n{'='*60}")
+    print(f"\n{'='*60}\nStage 3.7: Train\n{'='*60}")
 
     # 使用外层tqdm跟踪epoch进度
     # 移除position参数避免Jupyter中重复显示，添加leave=True保持最终状态
@@ -765,7 +771,8 @@ def main(args=None):
             'Train_Node': f'{avg_train_node:.4f}',
         })
     # 在训练结束后，用训练好的模型对完整数据集进行一次评估，收集注意力得分
-    print(f"\nEvaluating:          spots={len(dataset)}, batches={len(eval_dataloader)}")
+    print(f"\n{'='*60}\nStage 3.8: Evaluate and Save\n{'='*60}")
+    print(f"Evaluating:          spots={len(dataset)}, batches={len(eval_dataloader)}")
     
     model.eval()
     all_cc_attention_scores = []

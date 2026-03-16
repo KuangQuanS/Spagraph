@@ -103,7 +103,7 @@ def calculate_lr_scores(
     hvg_genes: Optional[List[str]] = None,
     ligand_expr_threshold: float = 3.0,
     receptor_expr_threshold: float = 1.0,
-) -> Tuple[np.ndarray, str, Dict[str, Any]]:
+) -> Tuple[np.ndarray, str, Dict[str, Any], Dict[Tuple[int, int], List[Tuple[int, int, float, int]]], Dict[Tuple[str, str], int], Dict[int, Tuple[str, str]]]:
     """Calculate KNN neighborhoods and LR communication scores."""
     if composition is None:
         raise ValueError("composition is required for LR score calculation")
@@ -159,9 +159,9 @@ def calculate_lr_scores(
     print(f"LR scores:          valid LR pairs = {len(valid_lr_pairs)}/{len(lr_pairs)}")
 
     composition_values = composition.to_numpy(copy=False)
-    spot_cell_entries: List[List[Tuple[str, str, np.ndarray, float, set[int], set[int]]]] = []
+    spot_cell_entries: List[List[Tuple[int, str, str, np.ndarray, float, set[int], set[int]]]] = []
     for spot_idx, spot_barcode in enumerate(spot_names):
-        entries: List[Tuple[str, str, np.ndarray, float, set[int], set[int]]] = []
+        entries: List[Tuple[int, str, str, np.ndarray, float, set[int], set[int]]] = []
         cell_in_spot = np.where(composition_values[spot_idx] > 1e-6)[0]
         for cell_idx in cell_in_spot:
             celltype = cell_types[cell_idx]
@@ -171,6 +171,7 @@ def calculate_lr_scores(
                 continue
             entries.append(
                 (
+                    cell_idx,
                     celltype,
                     spot_cell_key,
                     spot_cell_expr_array[row_idx, :],
@@ -182,6 +183,10 @@ def calculate_lr_scores(
         spot_cell_entries.append(entries)
 
     comm_event_records = []
+    lr_pair_to_id: Dict[Tuple[str, str], int] = {}
+    lr_id_to_pair: Dict[int, Tuple[str, str]] = {}
+    lr_scores_by_spot_pair: Dict[Tuple[int, int, int, int], List[float | int]] = {}
+    lr_id_counter = 1
     total_pairs = 0
     spots_with_cells = 0
     spots_without_cells = 0
@@ -213,11 +218,11 @@ def calculate_lr_scores(
             if not target_entries:
                 continue
 
-            for celltype_i, spot_cell_i_key, cell_i_expr, total_i, active_lig_set, _ in source_entries:
+            for celltype_i_idx, celltype_i, spot_cell_i_key, cell_i_expr, total_i, active_lig_set, _ in source_entries:
                 if total_i <= 0 or not active_lig_set:
                     continue
 
-                for celltype_j, spot_cell_j_key, cell_j_expr, total_j, _, active_rec_set in target_entries:
+                for celltype_j_idx, celltype_j, spot_cell_j_key, cell_j_expr, total_j, _, active_rec_set in target_entries:
                     if (not allow_same_celltype_comm) and (celltype_i == celltype_j):
                         same_celltype_skipped += 1
                         continue
@@ -241,6 +246,21 @@ def calculate_lr_scores(
                             rec_product = np.prod(cell_j_expr[list(rec_indices)])
                             score = np.log1p(np.sqrt(lig_val * rec_product) * normalization_factor)
                             if score >= lr_score_threshold:
+                                lr_pair = (ligand, receptor)
+                                lr_id = lr_pair_to_id.get(lr_pair)
+                                if lr_id is None:
+                                    lr_id = lr_id_counter
+                                    lr_pair_to_id[lr_pair] = lr_id
+                                    lr_id_to_pair[lr_id] = lr_pair
+                                    lr_id_counter += 1
+
+                                pair_key = (i, j, celltype_i_idx, celltype_j_idx)
+                                pair_data = lr_scores_by_spot_pair.get(pair_key)
+                                if pair_data is None:
+                                    lr_scores_by_spot_pair[pair_key] = [float(score), lr_id]
+                                else:
+                                    pair_data[0] += float(score)
+
                                 comm_event_records.append(
                                     [
                                         spot_i_barcode,
@@ -282,7 +302,13 @@ def calculate_lr_scores(
         "composition": composition,
         "knn_mask": knn_mask,
     }
-    return knn_mask, csv_path, graph_data
+    comm_by_spot_pair: Dict[Tuple[int, int], List[Tuple[int, int, float, int]]] = {}
+    for (spot_i_idx, spot_j_idx, cell_i_idx, cell_j_idx), (total_score, lr_id) in lr_scores_by_spot_pair.items():
+        comm_by_spot_pair.setdefault((spot_i_idx, spot_j_idx), []).append(
+            (cell_i_idx, cell_j_idx, float(total_score), int(lr_id))
+        )
+
+    return knn_mask, csv_path, graph_data, comm_by_spot_pair, lr_pair_to_id, lr_id_to_pair
 
 
 if __name__ == "__main__":

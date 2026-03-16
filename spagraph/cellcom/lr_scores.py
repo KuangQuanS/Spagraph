@@ -1,17 +1,94 @@
 #!/usr/bin/env python3
-"""
-LR Scores Calculation Module
-
-This module provides functions for calculating KNN neighborhoods and LR communication scores
-for spatial transcriptomics data analysis.
-"""
+"""LR communication score calculation utilities."""
 
 import os
+from typing import Any, Dict, List, Optional, Tuple
+
 import numpy as np
 import pandas as pd
 from sklearn.neighbors import kneighbors_graph
-from typing import List, Tuple, Dict, Any, Optional
 from tqdm import tqdm
+
+
+def _build_filtered_gene_indices(gene_names: List[str], gene_name_to_idx: Dict[str, int]) -> set[int]:
+    filtered_indices: set[int] = set()
+    for gene_name in gene_names:
+        gene_upper = gene_name.upper()
+        if gene_upper.startswith("MT-"):
+            filtered_indices.add(gene_name_to_idx[gene_upper])
+        elif gene_upper.startswith("HB"):
+            filtered_indices.add(gene_name_to_idx[gene_upper])
+        elif "PSEUDO" in gene_upper or gene_upper.endswith("-AS1") or gene_upper.startswith("LOC"):
+            filtered_indices.add(gene_name_to_idx[gene_upper])
+    return filtered_indices
+
+
+def _build_active_gene_sets(
+    spot_cell_names: List[str],
+    spot_cell_name_to_idx: Dict[str, int],
+    spot_cell_expr_array: np.ndarray,
+    filtered_gene_indices: set[int],
+    allowed_gene_indices: Optional[set[int]],
+    ligand_expr_threshold: float,
+    receptor_expr_threshold: float,
+) -> Tuple[Dict[str, set[int]], Dict[str, set[int]], Dict[str, float]]:
+    ligand_sets: Dict[str, set[int]] = {}
+    receptor_sets: Dict[str, set[int]] = {}
+    total_counts: Dict[str, float] = {}
+
+    for spot_cell_name in spot_cell_names:
+        idx = spot_cell_name_to_idx[spot_cell_name]
+        cell_expr = spot_cell_expr_array[idx, :]
+        total_count = float(cell_expr.sum())
+        total_counts[spot_cell_name] = total_count
+
+        if total_count > 0:
+            cell_expr_normalized = cell_expr / total_count * 1e4
+        else:
+            cell_expr_normalized = cell_expr
+
+        ligand_active_indices = set(np.where(cell_expr_normalized > ligand_expr_threshold)[0]) - filtered_gene_indices
+        receptor_active_indices = set(np.where(cell_expr_normalized > receptor_expr_threshold)[0]) - filtered_gene_indices
+
+        if allowed_gene_indices is not None:
+            ligand_active_indices &= allowed_gene_indices
+            receptor_active_indices &= allowed_gene_indices
+
+        ligand_sets[spot_cell_name] = ligand_active_indices
+        receptor_sets[spot_cell_name] = receptor_active_indices
+
+    return ligand_sets, receptor_sets, total_counts
+
+
+def _build_valid_lr_pairs(
+    lr_pairs: List[Tuple[str, str]],
+    gene_name_to_idx: Dict[str, int],
+) -> Tuple[List[Tuple[int, Tuple[int, ...], str, str]], Dict[int, List[Tuple[int, Tuple[int, ...], str, str]]]]:
+    valid_lr_pairs: List[Tuple[int, Tuple[int, ...], str, str]] = []
+    valid_lr_pairs_by_ligand: Dict[int, List[Tuple[int, Tuple[int, ...], str, str]]] = {}
+
+    for ligand, receptor in lr_pairs:
+        lig_idx = gene_name_to_idx.get(ligand.upper())
+        if lig_idx is None:
+            continue
+
+        rec_indices: List[int] = []
+        found_all = True
+        for receptor_gene in receptor.split("_"):
+            rec_idx = gene_name_to_idx.get(receptor_gene.strip().upper())
+            if rec_idx is None:
+                found_all = False
+                break
+            rec_indices.append(rec_idx)
+
+        if not found_all:
+            continue
+
+        record = (lig_idx, tuple(rec_indices), ligand, receptor)
+        valid_lr_pairs.append(record)
+        valid_lr_pairs_by_ligand.setdefault(lig_idx, []).append(record)
+
+    return valid_lr_pairs, valid_lr_pairs_by_ligand
 
 
 def calculate_lr_scores(
@@ -25,39 +102,20 @@ def calculate_lr_scores(
     n_neighbors: int = 20,
     hvg_genes: Optional[List[str]] = None,
     ligand_expr_threshold: float = 3.0,
-    receptor_expr_threshold: float = 1.0
+    receptor_expr_threshold: float = 1.0,
 ) -> Tuple[np.ndarray, str, Dict[str, Any]]:
-    """
-    Calculate KNN neighborhoods and LR communication scores.
+    """Calculate KNN neighborhoods and LR communication scores."""
+    if composition is None:
+        raise ValueError("composition is required for LR score calculation")
 
-    Args:
-        spot_coords: Spot coordinates array [n_spots, 2]
-        composition: Cell composition matrix [n_spots, n_cells]
-        args: Arguments object containing various parameters
-        adata: ST data object (AnnData)
-        cell_full_expr: Cell full expression matrix [n_cells, n_genes]
-        lr_pairs: List of LR pairs [(ligand, receptor), ...]
-        output_dir: Output directory for results
-        n_neighbors: Number of neighbors for KNN graph construction
-
-    Returns:
-        Tuple of (knn_mask, csv_path, graph_data)
-    """
-    # 获取spots数量
     n_spots = spot_coords.shape[0]
-
-    # 构建KNN邻域（用于空间图构建，不限制距离）
     knn = kneighbors_graph(spot_coords, n_neighbors=n_neighbors, mode="connectivity", include_self=False)
-    knn_mask = knn.toarray()  # [n_spots, n_spots] - 用于空间图构建
-    
-    # ✅ 在 KNN 邻居内用距离阈值过滤“过远”的邻居
-    # 说明：KNN 总会保留固定数量邻居，在点稀疏区域可能出现非常远的邻居；这里用距离阈值剪枝。
-    lr_comm_distance_threshold = 500.0  # 单位与 spot_coords 一致（例如 μm）
+    knn_mask = knn.toarray()
 
-    # 阈值选择：使用独立参数（不再回退到 mean_expr_threshold）
-    ligand_expr_threshold = getattr(args, 'ligand_expr_threshold', ligand_expr_threshold)
-    receptor_expr_threshold = getattr(args, 'receptor_expr_threshold', receptor_expr_threshold)
-    lr_score_threshold = getattr(args, 'lr_score_threshold', 3.0)
+    lr_comm_distance_threshold = 500.0
+    ligand_expr_threshold = getattr(args, "ligand_expr_threshold", ligand_expr_threshold)
+    receptor_expr_threshold = getattr(args, "receptor_expr_threshold", receptor_expr_threshold)
+    lr_score_threshold = getattr(args, "lr_score_threshold", 3.0)
 
     print(
         "LR scores:          "
@@ -65,159 +123,83 @@ def calculate_lr_scores(
         f"lig_thr={ligand_expr_threshold}, rec_thr={receptor_expr_threshold}, lr_thr={lr_score_threshold}"
     )
 
-    # ✅ 准备数据结构
     spot_names = adata.obs_names.tolist()
-    spot_cell_expr_array = cell_full_expr.values  # [n_spot_cells, n_genes]
-    spot_cell_names = cell_full_expr.index.tolist()  # ['spot_barcode_celltype', ...]
-    gene_names_in_npz = cell_full_expr.columns.tolist()
-    
-    # 构建快速查询字典: spot_cell_name -> array_row_idx
+    spot_cell_expr_array = cell_full_expr.values
+    spot_cell_names = cell_full_expr.index.tolist()
+    gene_names = cell_full_expr.columns.tolist()
     spot_cell_name_to_idx = {name: idx for idx, name in enumerate(spot_cell_names)}
-    
-    # 提取实际存在的细胞类型（从composition的列名）
     cell_types = composition.columns.tolist()
-    
+
     print(f"LR scores:          celltypes={len(cell_types)}, spot-cells={len(spot_cell_names)}")
 
-    # ========== 优化1：预构建基因索引字典 ==========
-    # 避免在循环中重复查找基因索引
-    gene_name_to_idx = {gene.upper(): idx for idx, gene in enumerate(gene_names_in_npz)}
-    
-    # ✅ 如果提供了HVG列表，只使用HVG进行通讯计算
+    gene_name_to_idx = {gene.upper(): idx for idx, gene in enumerate(gene_names)}
     if hvg_genes is not None:
         allowed_gene_indices = {
-            gene_name_to_idx[g.upper()]
-            for g in hvg_genes
-            if g.upper() in gene_name_to_idx
+            gene_name_to_idx[gene.upper()]
+            for gene in hvg_genes
+            if gene.upper() in gene_name_to_idx
         }
-        print(f"LR scores:          comm genes (HVG) = {len(allowed_gene_indices)}/{len(gene_names_in_npz)}")
+        print(f"LR scores:          comm genes (HVG) = {len(allowed_gene_indices)}/{len(gene_names)}")
     else:
         allowed_gene_indices = None
         print("LR scores:          comm genes (ALL)")
 
-    # ========== 过滤不参与通讯的基因 ==========
-    # （静默）过滤不参与通讯的基因
+    filtered_gene_indices = _build_filtered_gene_indices(gene_names, gene_name_to_idx)
+    active_ligand_sets, active_receptor_sets, total_counts = _build_active_gene_sets(
+        spot_cell_names=spot_cell_names,
+        spot_cell_name_to_idx=spot_cell_name_to_idx,
+        spot_cell_expr_array=spot_cell_expr_array,
+        filtered_gene_indices=filtered_gene_indices,
+        allowed_gene_indices=allowed_gene_indices,
+        ligand_expr_threshold=ligand_expr_threshold,
+        receptor_expr_threshold=receptor_expr_threshold,
+    )
 
-    # 定义过滤规则
-    filtered_genes = set()
-    for gene_name in gene_names_in_npz:
-        gene_upper = gene_name.upper()
-        # 1. 线粒体基因 (MT-)
-        if gene_upper.startswith('MT-'):
-            filtered_genes.add(gene_name)
-        # 2. 血红蛋白基因 (HB)
-        elif gene_upper.startswith('HB'):
-            filtered_genes.add(gene_name)
-        # 3. 假基因 (包含 'PSEUDO', '-AS', 'LOC')
-        elif 'PSEUDO' in gene_upper or gene_upper.endswith('-AS1') or gene_upper.startswith('LOC'):
-            filtered_genes.add(gene_name)
-        # 4. 核糖体蛋白基因 (RPS, RPL) - 可选
-        # elif gene_upper.startswith('RPS') or gene_upper.startswith('RPL'):
-        #     filtered_genes.add(gene_name)
-
-    # ========== 筛选每个细胞中的活跃基因（表达值过滤）==========
-    cell_active_genes_ligand = {}  # spot_cell_key -> set of active ligand gene indices
-    cell_active_genes_receptor = {}  # spot_cell_key -> set of active receptor gene indices
-
-    # ✅ 使用CP10k归一化进行活跃基因筛选，配体和受体使用各自的阈值
-    # ligand_expr_threshold: 配体表达阈值（CP10k）
-    # receptor_expr_threshold: 受体表达阈值（CP10k，通常较低）
-    
-    # 过滤掉不参与通讯的基因索引（提前计算）
-    filtered_gene_indices = set()
-    for gene_name in filtered_genes:
-        if gene_name in gene_names_in_npz:
-            gene_idx = gene_names_in_npz.index(gene_name)
-            filtered_gene_indices.add(gene_idx)
-
-    # 遍历每个具体的细胞，计算其活跃基因
-    for spot_cell_name in spot_cell_names:
-        idx = spot_cell_name_to_idx[spot_cell_name]
-        cell_expr = spot_cell_expr_array[idx, :]  # [n_genes]
-        
-        # 对单个细胞进行CP10k归一化
-        total_count = cell_expr.sum()
-        if total_count > 0:
-            cell_expr_normalized = cell_expr / total_count * 1e4  # [n_genes]
-        else:
-            cell_expr_normalized = cell_expr  # 表达全为0的情况
-        
-        # 筛选活跃配体基因：归一化后的表达值 > ligand_expr_threshold（CP10k）
-        ligand_active_mask = cell_expr_normalized > ligand_expr_threshold
-        ligand_active_indices = set(np.where(ligand_active_mask)[0]) - filtered_gene_indices
-        
-        # 筛选活跃受体基因：归一化后的表达值 > receptor_expr_threshold（CP10k）
-        receptor_active_mask = cell_expr_normalized > receptor_expr_threshold
-        receptor_active_indices = set(np.where(receptor_active_mask)[0]) - filtered_gene_indices
-        
-        # ✅ 如果启用HVG限制，进一步过滤只保留HVG
-        if allowed_gene_indices is not None:
-            ligand_active_indices = ligand_active_indices & allowed_gene_indices
-            receptor_active_indices = receptor_active_indices & allowed_gene_indices
-        
-        # 配体和受体使用各自的活跃基因集合
-        cell_active_genes_ligand[spot_cell_name] = ligand_active_indices
-        cell_active_genes_receptor[spot_cell_name] = receptor_active_indices
-
-    # （静默）统计信息可按需添加
-
-    # ========== 优化2：预处理LR对，构建索引映射 ==========
-    # 将LR对转换为索引对，并过滤掉不存在的基因
-    valid_lr_pairs = []
-    for ligand, receptor in lr_pairs:
-        ligand_upper = ligand.upper()
-        lig_idx = gene_name_to_idx.get(ligand_upper)
-
-        if lig_idx is None:
-            continue
-
-        # 处理联合受体
-        receptor_genes = [r.strip() for r in receptor.split('_')]
-        rec_indices = []
-        found_all = True
-
-        for receptor_gene in receptor_genes:
-            receptor_upper = receptor_gene.upper()
-            rec_idx = gene_name_to_idx.get(receptor_upper)
-            if rec_idx is None:
-                found_all = False
-                break
-            rec_indices.append(rec_idx)
-
-        if found_all:
-            valid_lr_pairs.append((lig_idx, rec_indices, ligand, receptor))
-
+    valid_lr_pairs, valid_lr_pairs_by_ligand = _build_valid_lr_pairs(lr_pairs, gene_name_to_idx)
     print(f"LR scores:          valid LR pairs = {len(valid_lr_pairs)}/{len(lr_pairs)}")
 
-    # 初始化通讯事件记录
-    comm_event_records = []
+    composition_values = composition.to_numpy(copy=False)
+    spot_cell_entries: List[List[Tuple[str, str, np.ndarray, float, set[int], set[int]]]] = []
+    for spot_idx, spot_barcode in enumerate(spot_names):
+        entries: List[Tuple[str, str, np.ndarray, float, set[int], set[int]]] = []
+        cell_in_spot = np.where(composition_values[spot_idx] > 1e-6)[0]
+        for cell_idx in cell_in_spot:
+            celltype = cell_types[cell_idx]
+            spot_cell_key = f"{spot_barcode}_{celltype}"
+            row_idx = spot_cell_name_to_idx.get(spot_cell_key)
+            if row_idx is None:
+                continue
+            entries.append(
+                (
+                    celltype,
+                    spot_cell_key,
+                    spot_cell_expr_array[row_idx, :],
+                    total_counts[spot_cell_key],
+                    active_ligand_sets[spot_cell_key],
+                    active_receptor_sets[spot_cell_key],
+                )
+            )
+        spot_cell_entries.append(entries)
 
-    # ========== 计算通讯事件 ==========
+    comm_event_records = []
     total_pairs = 0
     spots_with_cells = 0
     spots_without_cells = 0
     allow_same_celltype_comm = bool(getattr(args, "allow_same_celltype_comm", False))
-    same_celltype_skipped = 0  # 统计跳过的同类型细胞对（仅在关闭同-type通讯时）
+    same_celltype_skipped = 0
 
-    # 遍历所有潜在的LR通信邻居对（KNN邻居，并过滤掉距离过远的邻居）
     for i in tqdm(range(n_spots), desc="Computing LR scores", leave=False):
         spot_i_barcode = spot_names[i]
-
-        # 获取spot i的cell composition
-        composition_i = composition.iloc[i].values
-        cell_in_i = np.where(composition_i > 1e-6)[0]
-
-        if len(cell_in_i) == 0:
+        source_entries = spot_cell_entries[i]
+        if not source_entries:
             spots_without_cells += 1
             continue
 
         spots_with_cells += 1
-
         neighbor_js = np.where(knn_mask[i] == 1)[0]
         if neighbor_js.size == 0:
             continue
 
-        # 距离阈值过滤（只在 KNN 邻居内部过滤）
         diffs = spot_coords[neighbor_js] - spot_coords[i]
         dists = np.sqrt((diffs ** 2).sum(axis=1))
         keep_mask = dists <= lr_comm_distance_threshold
@@ -225,87 +207,53 @@ def calculate_lr_scores(
         dists = dists[keep_mask]
 
         for j, dist_ij in zip(neighbor_js, dists):
-
             total_pairs += 1
             spot_j_barcode = spot_names[j]
-
-            # 获取spot j的cell composition
-            composition_j = composition.iloc[j].values
-            cell_in_j = np.where(composition_j > 1e-6)[0]
-
-            if len(cell_in_j) == 0:
+            target_entries = spot_cell_entries[j]
+            if not target_entries:
                 continue
 
-            # 遍历cell对，计算LR通讯
-            for cell_i_idx in cell_in_i:
-                # ✅ 获取细胞类型名称（从composition的列名）
-                celltype_i = cell_types[cell_i_idx]
-                spot_cell_i_key = f"{spot_i_barcode}_{celltype_i}"
-                
-                # 查询该spot-cell是否存在
-                if spot_cell_i_key not in spot_cell_name_to_idx:
+            for celltype_i, spot_cell_i_key, cell_i_expr, total_i, active_lig_set, _ in source_entries:
+                if total_i <= 0 or not active_lig_set:
                     continue
-                
-                idx_i = spot_cell_name_to_idx[spot_cell_i_key]
-                cell_i_expr = spot_cell_expr_array[idx_i, :]
 
-                for cell_j_idx in cell_in_j:
-                    # ✅ 获取细胞类型名称
-                    celltype_j = cell_types[cell_j_idx]
-                    spot_cell_j_key = f"{spot_j_barcode}_{celltype_j}"
-                    
-                    # 查询该spot-cell是否存在
-                    if spot_cell_j_key not in spot_cell_name_to_idx:
-                        continue
-                    
-                    idx_j = spot_cell_name_to_idx[spot_cell_j_key]
-                    cell_j_expr = spot_cell_expr_array[idx_j, :]
-
-                    # ✅ 可选：跳过相同细胞类型之间的通讯（同-type）
+                for celltype_j, spot_cell_j_key, cell_j_expr, total_j, _, active_rec_set in target_entries:
                     if (not allow_same_celltype_comm) and (celltype_i == celltype_j):
                         same_celltype_skipped += 1
                         continue
+                    if total_j <= 0 or not active_rec_set:
+                        continue
 
-                    # ========== 优化4：向量化LR得分计算 ==========
-                    # 预计算cell表达总量（避免在内层循环重复计算）
-                    total_i = cell_i_expr.sum()
-                    total_j = cell_j_expr.sum()
-                    
-                    if total_i <= 0 or total_j <= 0:
-                        continue
-                    
-                    # 预计算归一化因子
                     normalization_factor = 1e4 / np.sqrt(total_i * total_j)
-                    
-                    # 缓存活跃基因集合到局部变量（避免重复字典查找）
-                    active_lig_set = cell_active_genes_ligand.get(spot_cell_i_key, set())
-                    active_rec_set = cell_active_genes_receptor.get(spot_cell_j_key, set())
-                    
-                    if not active_lig_set or not active_rec_set:
-                        continue
-                    
-                    # 遍历所有有效LR pairs
-                    for lig_idx, rec_indices, ligand, receptor in valid_lr_pairs:
-                        # 快速检查：ligand是否活跃
-                        if lig_idx not in active_lig_set:
+                    for lig_idx in active_lig_set:
+                        ligand_pairs = valid_lr_pairs_by_ligand.get(lig_idx)
+                        if not ligand_pairs:
                             continue
-                        
-                        # 快速检查：所有receptor是否都活跃
-                        if not all(rec_idx in active_rec_set for rec_idx in rec_indices):
-                            continue
-                        
-                        # 获取配体和受体的表达值并计算得分
+
                         lig_val = cell_i_expr[lig_idx]
-                        rec_product = np.prod(cell_j_expr[rec_indices])
-                        score = np.log1p(np.sqrt(lig_val * rec_product) * normalization_factor)
-                        
-                        # 过滤低于阈值的通讯事件
-                        if score >= lr_score_threshold:
-                            comm_event_records.append([
-                                spot_i_barcode, spot_j_barcode, 
-                                spot_cell_i_key, spot_cell_j_key,
-                                ligand, receptor, score, 1, float(dist_ij)
-                            ])
+                        if lig_val <= 0:
+                            continue
+
+                        for _, rec_indices, ligand, receptor in ligand_pairs:
+                            if not all(rec_idx in active_rec_set for rec_idx in rec_indices):
+                                continue
+
+                            rec_product = np.prod(cell_j_expr[list(rec_indices)])
+                            score = np.log1p(np.sqrt(lig_val * rec_product) * normalization_factor)
+                            if score >= lr_score_threshold:
+                                comm_event_records.append(
+                                    [
+                                        spot_i_barcode,
+                                        spot_j_barcode,
+                                        spot_cell_i_key,
+                                        spot_cell_j_key,
+                                        ligand,
+                                        receptor,
+                                        score,
+                                        1,
+                                        float(dist_ij),
+                                    ]
+                                )
 
     print(
         "LR scores:          "
@@ -316,14 +264,11 @@ def calculate_lr_scores(
     if (not allow_same_celltype_comm) and same_celltype_skipped:
         print(f"LR scores:          same-type skipped={same_celltype_skipped}")
 
-    # ✅ 使用 output_dir 保存 LR 通讯得分
     csv_path = os.path.join(output_dir, "lr_scores.csv")
-
     df = pd.DataFrame(
         comm_event_records,
-        columns=['spot_i', 'spot_j', 'cell_i', 'cell_j', 'ligand', 'receptor', 'comm_score', 'in_knn', 'distance']
+        columns=["spot_i", "spot_j", "cell_i", "cell_j", "ligand", "receptor", "comm_score", "in_knn", "distance"],
     )
-    
     df.to_csv(csv_path, index=False)
     print(
         "LR scores saved:    "
@@ -332,16 +277,13 @@ def calculate_lr_scores(
         f"cell_pairs={df.groupby(['cell_i', 'cell_j']).ngroups})"
     )
 
-    # 准备graph_data字典（只包含坐标和composition）
     graph_data = {
-        'coords': spot_coords,
-        'composition': composition,
-        'knn_mask': knn_mask,  # 传入预计算的KNN邻接矩阵
+        "coords": spot_coords,
+        "composition": composition,
+        "knn_mask": knn_mask,
     }
-
     return knn_mask, csv_path, graph_data
 
 
-if __name__ == '__main__':
-    # This module is meant to be imported, not run directly
+if __name__ == "__main__":
     print("This is an LR scores calculation module. Import and use the calculate_lr_scores() function.")

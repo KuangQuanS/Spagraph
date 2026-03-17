@@ -46,6 +46,13 @@ EXPECTED_LR_COLUMNS = {
     "attention_score",
 }
 
+ANALYSIS_MODE = "moran_only"
+PAIR_SIGNAL = "original_lr_score_sum"
+MIN_PAIR_OCCURRENCE = 30
+OBSERVED_RUN_DIRNAME = "_observed_run"
+OBSERVED_CELLCOM_DIRNAME = "cellcom"
+CELLCOM_UNIFIED_CSV = "lr_communication.csv"
+
 
 @dataclass(frozen=True)
 class BoundaryConfig:
@@ -61,7 +68,7 @@ class BoundaryConfig:
 class DatasetConfig:
     key: str
     dataset_dir: Path
-    lr_communication: Path
+    lr_communication: Path | None
     composition_csv: Path
     spot_cell_expr_csv: Path | None
     st_h5ad: Path
@@ -220,24 +227,12 @@ def uses_explicit_config(args: argparse.Namespace) -> bool:
 
 
 def build_boundary_from_args(args: argparse.Namespace) -> BoundaryConfig:
-    required = {
-        "region_name": args.region_name,
-        "group_a_name": args.group_a_name,
-        "group_a_columns": args.group_a_columns,
-        "group_b_name": args.group_b_name,
-        "group_b_columns": args.group_b_columns,
-    }
-    missing = [name for name, value in required.items() if value is None]
-    if missing:
-        raise ValueError(
-            "Explicit mode is missing boundary arguments: " + ", ".join(missing)
-        )
     return BoundaryConfig(
-        region_name=args.region_name,
-        group_a_name=args.group_a_name,
-        group_a_columns=tuple(args.group_a_columns),
-        group_b_name=args.group_b_name,
-        group_b_columns=tuple(args.group_b_columns),
+        region_name=args.region_name or "ignored",
+        group_a_name=args.group_a_name or "ignored",
+        group_a_columns=tuple(args.group_a_columns or ()),
+        group_b_name=args.group_b_name or "ignored",
+        group_b_columns=tuple(args.group_b_columns or ()),
         threshold=args.boundary_threshold,
     )
 
@@ -279,7 +274,6 @@ def build_explicit_config(args: argparse.Namespace) -> DatasetConfig:
 
     required = {
         "run_name": args.run_name,
-        "lr_communication_csv": args.lr_communication_csv,
         "composition_csv": args.composition_csv,
         "spot_cell_expr_csv": args.spot_cell_expr_csv,
         "st_h5ad": args.st_h5ad,
@@ -376,34 +370,21 @@ def read_lr_table(csv_path: Path) -> pd.DataFrame:
 
 
 def resolve_cellcom_lr_csv(cellcom_output_dir: Path) -> Path | None:
-    unified_csv = cellcom_output_dir / "lr_communication.csv"
+    unified_csv = cellcom_output_dir / CELLCOM_UNIFIED_CSV
     if unified_csv.exists():
         return unified_csv
-
-    exact_filtered_csv = cellcom_output_dir / "lr_communication_filtered_1.0.csv"
-    if exact_filtered_csv.exists():
-        return exact_filtered_csv
-
-    filtered_candidates = sorted(cellcom_output_dir.glob("lr_communication_filtered_*.csv"))
-    if filtered_candidates:
-        return filtered_candidates[0]
     return None
 
 
-def load_inputs(config: DatasetConfig) -> tuple[pd.DataFrame, pd.DataFrame, sc.AnnData]:
-    lr_df = read_lr_table(config.lr_communication)
-    require_existing(config.composition_csv)
+def load_inputs(config: DatasetConfig) -> sc.AnnData:
     require_existing(config.st_h5ad)
-
-    composition = pd.read_csv(config.composition_csv, index_col=0)
-    composition.index = composition.index.astype(str)
 
     adata = sc.read_h5ad(config.st_h5ad)
     if "spatial" not in adata.obsm:
         raise ValueError(f"Spatial coordinates not found in {config.st_h5ad}")
     adata.obs_names = adata.obs_names.astype(str)
 
-    return lr_df, composition, adata
+    return adata
 
 
 def build_adjacency(coords: np.ndarray, k: int) -> np.ndarray:
@@ -435,6 +416,16 @@ def summarize_pairs(lr_df: pd.DataFrame) -> pd.DataFrame:
     ).reset_index(drop=True)
 
 
+def filter_candidate_pairs(pair_stats: pd.DataFrame, min_pair_occurrence: int) -> pd.DataFrame:
+    filtered = pair_stats.loc[pair_stats["occurrence_count"] >= min_pair_occurrence].copy()
+    if filtered.empty:
+        raise ValueError(
+            f"No LR pairs satisfy occurrence_count >= {min_pair_occurrence}. "
+            "Lower the threshold or inspect the Stage 3 communication export."
+        )
+    return filtered.reset_index(drop=True)
+
+
 def top_pairs(pair_stats: pd.DataFrame, top_k: int, ranking_type: str) -> pd.DataFrame:
     if ranking_type == "attention":
         ranked = pair_stats.sort_values(
@@ -459,24 +450,17 @@ def build_pair_spot_map(
     lr_df: pd.DataFrame,
     lr_pair: str,
     spot_index: dict[str, int],
-    mode: str,
 ) -> np.ndarray:
     values = np.zeros(len(spot_index), dtype=float)
     pair_df = lr_df.loc[
         lr_df["lr_pair"] == lr_pair,
-        ["src_spot_barcode", "dst_spot_barcode", "attention_score"],
+        ["src_spot_barcode", "dst_spot_barcode", "original_lr_score"],
     ]
     if pair_df.empty:
         return values
 
-    if mode == "attention":
-        src_contrib = pair_df.groupby("src_spot_barcode")["attention_score"].sum()
-        dst_contrib = pair_df.groupby("dst_spot_barcode")["attention_score"].sum()
-    elif mode == "frequency":
-        src_contrib = pair_df.groupby("src_spot_barcode").size()
-        dst_contrib = pair_df.groupby("dst_spot_barcode").size()
-    else:
-        raise ValueError(f"Unknown map mode: {mode}")
+    src_contrib = pair_df.groupby("src_spot_barcode")["original_lr_score"].sum()
+    dst_contrib = pair_df.groupby("dst_spot_barcode")["original_lr_score"].sum()
 
     for barcode, value in src_contrib.items():
         values[spot_index[barcode]] += float(value)
@@ -554,7 +538,6 @@ def evaluate_top_pairs(
     top_pairs_df: pd.DataFrame,
     spot_index: dict[str, int],
     adjacency: np.ndarray,
-    boundary_mask: np.ndarray,
 ) -> pd.DataFrame:
     rows = []
     for record in top_pairs_df.itertuples(index=False):
@@ -562,31 +545,31 @@ def evaluate_top_pairs(
             lr_df=lr_df,
             lr_pair=record.lr_pair,
             spot_index=spot_index,
-            mode=record.ranking_type,
         )
         rows.append(
             {
                 "ranking_type": record.ranking_type,
                 "rank": record.rank,
                 "lr_pair": record.lr_pair,
+                "occurrence_count": record.occurrence_count,
+                "attention_mean": record.attention_mean,
                 "pair_activity_sum": float(values.sum()),
                 "moran_i": morans_i(values, adjacency),
-                "boundary_enrichment": boundary_enrichment(values, boundary_mask),
             }
         )
     return pd.DataFrame(rows)
 
 
 def compare_groups(metrics_df: pd.DataFrame) -> pd.DataFrame:
-    summary_rows = []
-    for metric in ("moran_i", "boundary_enrichment"):
-        attention = metrics_df.loc[metrics_df["ranking_type"] == "attention", metric].dropna()
-        frequency = metrics_df.loc[metrics_df["ranking_type"] == "frequency", metric].dropna()
-        p_value = float("nan")
-        if len(attention) > 0 and len(frequency) > 0:
-            p_value = float(mannwhitneyu(attention, frequency, alternative="two-sided").pvalue)
+    metric = "moran_i"
+    attention = metrics_df.loc[metrics_df["ranking_type"] == "attention", metric].dropna()
+    frequency = metrics_df.loc[metrics_df["ranking_type"] == "frequency", metric].dropna()
+    p_value = float("nan")
+    if len(attention) > 0 and len(frequency) > 0:
+        p_value = float(mannwhitneyu(attention, frequency, alternative="two-sided").pvalue)
 
-        summary_rows.append(
+    return pd.DataFrame(
+        [
             {
                 "metric": metric,
                 "attention_mean": attention.mean() if len(attention) else float("nan"),
@@ -597,8 +580,8 @@ def compare_groups(metrics_df: pd.DataFrame) -> pd.DataFrame:
                 "frequency_n": len(frequency),
                 "mannwhitney_pvalue": p_value,
             }
-        )
-    return pd.DataFrame(summary_rows)
+        ]
+    )
 
 
 def save_boxplot(metrics_df: pd.DataFrame, metric: str, title: str, ylabel: str, output_path: Path) -> None:
@@ -617,26 +600,43 @@ def save_boxplot(metrics_df: pd.DataFrame, metric: str, title: str, ylabel: str,
 
 
 def save_permutation_figure(perm_summary: pd.DataFrame, observed_summary: pd.DataFrame, output_path: Path) -> None:
-    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
-    metric_specs = [
-        ("mean_moran_attention", "mean_moran_frequency", "moran_i", "Mean Moran's I"),
-        ("mean_boundary_attention", "mean_boundary_frequency", "boundary_enrichment", "Mean log2 boundary enrichment"),
-    ]
+    fig, ax = plt.subplots(figsize=(8, 5))
     observed_map = observed_summary.set_index("metric")
     colors = {"attention": "#c0392b", "frequency": "#2980b9"}
-
-    for ax, (att_col, freq_col, metric_key, title) in zip(axes, metric_specs):
-        if perm_summary.empty:
-            ax.text(0.5, 0.5, "No permutations requested", ha="center", va="center")
-            ax.set_axis_off()
-            continue
-
-        ax.hist(perm_summary[att_col].dropna(), bins=20, alpha=0.55, color=colors["attention"], label="perm attention")
-        ax.hist(perm_summary[freq_col].dropna(), bins=20, alpha=0.55, color=colors["frequency"], label="perm frequency")
-        if metric_key in observed_map.index:
-            ax.axvline(observed_map.loc[metric_key, "attention_mean"], color=colors["attention"], linestyle="--", linewidth=2, label="obs attention")
-            ax.axvline(observed_map.loc[metric_key, "frequency_mean"], color=colors["frequency"], linestyle="--", linewidth=2, label="obs frequency")
-        ax.set_title(title)
+    if perm_summary.empty:
+        ax.text(0.5, 0.5, "No permutations requested", ha="center", va="center")
+        ax.set_axis_off()
+    else:
+        ax.hist(
+            perm_summary["mean_moran_attention"].dropna(),
+            bins=20,
+            alpha=0.55,
+            color=colors["attention"],
+            label="perm attention",
+        )
+        ax.hist(
+            perm_summary["mean_moran_frequency"].dropna(),
+            bins=20,
+            alpha=0.55,
+            color=colors["frequency"],
+            label="perm frequency",
+        )
+        if "moran_i" in observed_map.index:
+            ax.axvline(
+                observed_map.loc["moran_i", "attention_mean"],
+                color=colors["attention"],
+                linestyle="--",
+                linewidth=2,
+                label="obs attention",
+            )
+            ax.axvline(
+                observed_map.loc["moran_i", "frequency_mean"],
+                color=colors["frequency"],
+                linestyle="--",
+                linewidth=2,
+                label="obs frequency",
+            )
+        ax.set_title("Mean Moran's I")
         ax.set_xlabel("Value")
         ax.set_ylabel("Permutation count")
         ax.legend()
@@ -648,31 +648,28 @@ def save_permutation_figure(perm_summary: pd.DataFrame, observed_summary: pd.Dat
 
 def analyze_lr_table(
     lr_df: pd.DataFrame,
-    composition: pd.DataFrame,
     spot_names: list[str],
     coords: np.ndarray,
     config: DatasetConfig,
     top_k: int,
+    min_pair_occurrence: int = MIN_PAIR_OCCURRENCE,
 ) -> dict[str, pd.DataFrame]:
     valid_spots = set(spot_names)
     lr_df = filter_known_spots(lr_df, valid_spots)
-    composition = composition.reindex(spot_names).fillna(0.0)
     adjacency = build_adjacency(coords, config.n_spot_neighbors)
-    boundary_mask, boundary_df = build_boundary_mask(composition, adjacency, config.boundary)
     spot_index = {barcode: idx for idx, barcode in enumerate(spot_names)}
 
-    pair_stats = summarize_pairs(lr_df)
+    pair_stats = filter_candidate_pairs(summarize_pairs(lr_df), min_pair_occurrence=min_pair_occurrence)
     top_attention = top_pairs(pair_stats, top_k=top_k, ranking_type="attention")
     top_frequency = top_pairs(pair_stats, top_k=top_k, ranking_type="frequency")
     observed_top_pairs = pd.concat([top_attention, top_frequency], ignore_index=True)
-    metrics_df = evaluate_top_pairs(lr_df, observed_top_pairs, spot_index, adjacency, boundary_mask)
+    metrics_df = evaluate_top_pairs(lr_df, observed_top_pairs, spot_index, adjacency)
     summary_df = compare_groups(metrics_df)
 
     return {
         "top_pairs": observed_top_pairs,
         "pair_metrics": metrics_df,
         "group_summary": summary_df,
-        "boundary_spots": boundary_df,
     }
 
 
@@ -705,6 +702,55 @@ def stage_cellcom_inputs(config: DatasetConfig, output_dir: Path) -> tuple[Path,
     return staged_dir, staged_spot_expr
 
 
+def run_cellcom_rerun(
+    config: DatasetConfig,
+    staged_deconv_dir: Path,
+    spot_cell_expr_csv: Path,
+    st_h5ad: Path,
+    cellcom_output_dir: Path,
+    device: str,
+) -> Path:
+    spagraph.cellcom(
+        deconv_dir=str(staged_deconv_dir),
+        st_h5ad=str(st_h5ad),
+        output_dir=str(cellcom_output_dir),
+        spot_cell_expr_csv=str(spot_cell_expr_csv),
+        n_spot_neighbors=config.n_spot_neighbors,
+        ligand_expr_threshold=config.ligand_expr_threshold,
+        receptor_expr_threshold=config.receptor_expr_threshold,
+        allow_same_celltype_comm=config.allow_same_celltype_comm,
+        epochs=config.epochs,
+        batch_size=config.batch_size,
+        num_workers=config.num_workers,
+        save_lr_scores_csv=config.save_lr_scores_csv,
+        export_unified_csv=True,
+        export_filtered_csv=False,
+        seed=config.seed,
+        device=device,
+    )
+    unified_csv = cellcom_output_dir / CELLCOM_UNIFIED_CSV
+    require_existing(unified_csv)
+    return unified_csv
+
+
+def run_observed_cellcom(
+    config: DatasetConfig,
+    output_dir: Path,
+    staged_deconv_dir: Path,
+    spot_cell_expr_csv: Path,
+    device: str,
+) -> Path:
+    observed_output_dir = output_dir / OBSERVED_RUN_DIRNAME / OBSERVED_CELLCOM_DIRNAME
+    return run_cellcom_rerun(
+        config=config,
+        staged_deconv_dir=staged_deconv_dir,
+        spot_cell_expr_csv=spot_cell_expr_csv,
+        st_h5ad=config.st_h5ad,
+        cellcom_output_dir=observed_output_dir,
+        device=device,
+    )
+
+
 def run_single_permutation(
     config: DatasetConfig,
     output_dir: Path,
@@ -713,55 +759,28 @@ def run_single_permutation(
     top_k: int,
     keep_perm_runs: bool,
     spot_names: list[str],
-    composition: pd.DataFrame,
+    staged_deconv_dir: Path,
+    spot_cell_expr_csv: Path,
     device: str,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    if not (config.export_unified_csv or config.export_filtered_csv):
-        raise ValueError(
-            "Permutation reruns require at least one LR communication export. "
-            "Set --export-unified-csv true or --export-filtered-csv true."
-        )
-
     perm_root = output_dir / "_perm_runs" / f"perm_{permutation_index:03d}"
     perm_h5ad = perm_root / "permuted_spatial.h5ad"
     perm_output = perm_root / "cellcom"
-    perm_lr_csv = resolve_cellcom_lr_csv(perm_output)
-    staged_deconv_dir, spot_cell_expr_csv = stage_cellcom_inputs(config, output_dir)
-
-    if perm_lr_csv is None or not perm_h5ad.exists():
-        write_permuted_h5ad(config.st_h5ad, perm_h5ad, base_seed + permutation_index)
-        spagraph.cellcom(
-            deconv_dir=str(staged_deconv_dir),
-            st_h5ad=str(perm_h5ad),
-            output_dir=str(perm_output),
-            spot_cell_expr_csv=str(spot_cell_expr_csv),
-            n_spot_neighbors=config.n_spot_neighbors,
-            ligand_expr_threshold=config.ligand_expr_threshold,
-            receptor_expr_threshold=config.receptor_expr_threshold,
-            allow_same_celltype_comm=config.allow_same_celltype_comm,
-            epochs=config.epochs,
-            batch_size=config.batch_size,
-            num_workers=config.num_workers,
-            save_lr_scores_csv=config.save_lr_scores_csv,
-            export_unified_csv=config.export_unified_csv,
-            export_filtered_csv=config.export_filtered_csv,
-            seed=config.seed,
-            device=device,
-        )
-        perm_lr_csv = resolve_cellcom_lr_csv(perm_output)
-
-    if perm_lr_csv is None:
-        raise FileNotFoundError(
-            f"No permutation LR communication CSV was produced under {perm_output}. "
-            "Check export flags."
-        )
+    write_permuted_h5ad(config.st_h5ad, perm_h5ad, base_seed + permutation_index)
+    perm_lr_csv = run_cellcom_rerun(
+        config=config,
+        staged_deconv_dir=staged_deconv_dir,
+        spot_cell_expr_csv=spot_cell_expr_csv,
+        st_h5ad=perm_h5ad,
+        cellcom_output_dir=perm_output,
+        device=device,
+    )
 
     perm_lr_df = read_lr_table(perm_lr_csv)
     perm_adata = sc.read_h5ad(perm_h5ad)
     perm_adata.obs_names = perm_adata.obs_names.astype(str)
     perm_results = analyze_lr_table(
         lr_df=perm_lr_df,
-        composition=composition,
         spot_names=spot_names,
         coords=np.asarray(perm_adata.obsm["spatial"]),
         config=config,
@@ -775,12 +794,6 @@ def run_single_permutation(
         ].iloc[0],
         "mean_moran_frequency": perm_results["group_summary"].loc[
             perm_results["group_summary"]["metric"] == "moran_i", "frequency_mean"
-        ].iloc[0],
-        "mean_boundary_attention": perm_results["group_summary"].loc[
-            perm_results["group_summary"]["metric"] == "boundary_enrichment", "attention_mean"
-        ].iloc[0],
-        "mean_boundary_frequency": perm_results["group_summary"].loc[
-            perm_results["group_summary"]["metric"] == "boundary_enrichment", "frequency_mean"
         ].iloc[0],
     }
     summary_df = pd.DataFrame([summary_row])
@@ -800,8 +813,6 @@ def empty_permutation_summary() -> pd.DataFrame:
             "permutation_index",
             "mean_moran_attention",
             "mean_moran_frequency",
-            "mean_boundary_attention",
-            "mean_boundary_frequency",
         ]
     )
 
@@ -834,13 +845,18 @@ def save_run_info(
     except FileNotFoundError as exc:
         resolved_spot_cell_expr = f"unresolved ({exc})"
     info_lines = [
+        f"analysis_mode={ANALYSIS_MODE}",
         f"dataset={config.key}",
         f"dataset_dir={config.dataset_dir}",
-        f"lr_communication={config.lr_communication}",
+        f"legacy_lr_communication_input={config.lr_communication if config.lr_communication is not None else 'ignored'}",
         f"composition_csv={config.composition_csv}",
         f"spot_cell_expr_csv={resolved_spot_cell_expr if resolved_spot_cell_expr is not None else 'missing'}",
         f"st_h5ad={config.st_h5ad}",
         f"output_dir={output_dir}",
+        f"observed_source={OBSERVED_RUN_DIRNAME}/{OBSERVED_CELLCOM_DIRNAME}/{CELLCOM_UNIFIED_CSV}",
+        f"pair_signal={PAIR_SIGNAL}",
+        f"min_pair_occurrence={MIN_PAIR_OCCURRENCE}",
+        "boundary_args_ignored=true",
         f"region_name={config.boundary.region_name}",
         f"group_a={config.boundary.group_a_name}:{','.join(config.boundary.group_a_columns)}",
         f"group_b={config.boundary.group_b_name}:{','.join(config.boundary.group_b_columns)}",
@@ -872,10 +888,17 @@ def save_outputs(
     observed_results["top_pairs"].to_csv(output_dir / "observed_top_pairs.csv", index=False)
     observed_results["pair_metrics"].to_csv(output_dir / "observed_pair_metrics.csv", index=False)
     observed_results["group_summary"].to_csv(output_dir / "observed_group_summary.csv", index=False)
-    observed_results["boundary_spots"].to_csv(output_dir / "boundary_spots.csv", index=False)
     permutation_summary.to_csv(output_dir / "permutation_summary.csv", index=False)
     permutation_top_pairs.to_csv(output_dir / "permutation_top_pairs.csv", index=False)
     save_run_info(config, output_dir, top_k, requested_n_permutations, executed_n_permutations, note)
+
+    stale_paths = [
+        output_dir / "boundary_spots.csv",
+        figures_dir / "boundary_enrichment_attention_vs_frequency.pdf",
+    ]
+    for stale_path in stale_paths:
+        if stale_path.exists():
+            stale_path.unlink()
 
     save_boxplot(
         observed_results["pair_metrics"],
@@ -884,18 +907,17 @@ def save_outputs(
         "Moran's I",
         figures_dir / "moran_attention_vs_frequency.pdf",
     )
-    save_boxplot(
-        observed_results["pair_metrics"],
-        "boundary_enrichment",
-        f"{config.key}: boundary enrichment for top LR pairs",
-        "log2 enrichment",
-        figures_dir / "boundary_enrichment_attention_vs_frequency.pdf",
-    )
-    save_permutation_figure(
-        permutation_summary,
-        observed_results["group_summary"],
-        figures_dir / "permutation_null_distribution.pdf",
-    )
+
+    permutation_figure_path = figures_dir / "permutation_null_distribution.pdf"
+    if permutation_summary.empty:
+        if permutation_figure_path.exists():
+            permutation_figure_path.unlink()
+    else:
+        save_permutation_figure(
+            permutation_summary,
+            observed_results["group_summary"],
+            permutation_figure_path,
+        )
 
 
 def save_combined_outputs(
@@ -920,18 +942,28 @@ def run_dataset(config: DatasetConfig, args: argparse.Namespace) -> dict[str, ob
     output_dir.mkdir(parents=True, exist_ok=True)
 
     executed_n_permutations = args.n_permutations
-    note = ""
-    if executed_n_permutations > 0:
-        ensure_permutation_inputs(config)
-
-    lr_df, composition, adata = load_inputs(config)
+    note = (
+        "Moran-only workflow: observed is rerun under _observed_run/cellcom, "
+        "boundary arguments are ignored, and Moran maps use summed original_lr_score."
+    )
+    adata = load_inputs(config)
     coords = np.asarray(adata.obsm["spatial"])
     spot_names = adata.obs_names.astype(str).tolist()
+    staged_deconv_dir, spot_cell_expr_csv = stage_cellcom_inputs(config, output_dir)
 
-    print(f"[{config.key}] Running observed analysis...")
+    print(f"[{config.key}] Rerunning observed Stage 3...")
+    observed_lr_csv = run_observed_cellcom(
+        config=config,
+        output_dir=output_dir,
+        staged_deconv_dir=staged_deconv_dir,
+        spot_cell_expr_csv=spot_cell_expr_csv,
+        device=args.device,
+    )
+    observed_lr_df = read_lr_table(observed_lr_csv)
+
+    print(f"[{config.key}] Running observed Moran analysis...")
     observed_results = analyze_lr_table(
-        lr_df=lr_df,
-        composition=composition,
+        lr_df=observed_lr_df,
         spot_names=spot_names,
         coords=coords,
         config=config,
@@ -950,7 +982,8 @@ def run_dataset(config: DatasetConfig, args: argparse.Namespace) -> dict[str, ob
             top_k=args.top_k,
             keep_perm_runs=args.keep_perm_runs,
             spot_names=spot_names,
-            composition=composition,
+            staged_deconv_dir=staged_deconv_dir,
+            spot_cell_expr_csv=spot_cell_expr_csv,
             device=args.device,
         )
         permutation_summaries.append(summary_df)

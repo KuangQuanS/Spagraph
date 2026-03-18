@@ -286,11 +286,39 @@ def resolve_spot_cell_expr_csv(config: DatasetConfig, required: bool) -> Path | 
 def read_lr_table(csv_path: Path) -> pd.DataFrame:
     require_existing(csv_path)
     try:
-        return pd.read_csv(csv_path, usecols=list(EXPECTED_LR_COLUMNS))
+        lr_df = pd.read_csv(csv_path, usecols=list(EXPECTED_LR_COLUMNS), low_memory=False)
     except ValueError as exc:
         raise ValueError(
             f"{csv_path} is missing required columns from {sorted(EXPECTED_LR_COLUMNS)}"
         ) from exc
+    lr_df["lr_pair"] = lr_df["lr_pair"].astype(str)
+    lr_df["src_spot_barcode"] = lr_df["src_spot_barcode"].astype(str)
+    lr_df["dst_spot_barcode"] = lr_df["dst_spot_barcode"].astype(str)
+    lr_df["source_cell"] = lr_df["source_cell"].astype(str)
+    lr_df["target_cell"] = lr_df["target_cell"].astype(str)
+
+    bad_masks = {}
+    for column in ("original_lr_score", "attention_score"):
+        numeric = pd.to_numeric(lr_df[column], errors="coerce")
+        bad_mask = numeric.isna()
+        bad_masks[column] = bad_mask
+        lr_df[column] = numeric
+
+    invalid_mask = bad_masks["original_lr_score"] | bad_masks["attention_score"]
+    invalid_count = int(invalid_mask.sum())
+    if invalid_count:
+        examples = lr_df.loc[invalid_mask, ["lr_pair", "original_lr_score", "attention_score"]].head(3)
+        print(
+            f"WARNING: dropped {invalid_count} malformed LR rows from {csv_path.name} "
+            f"after numeric coercion"
+        )
+        if not examples.empty:
+            print(examples.to_string(index=False))
+        lr_df = lr_df.loc[~invalid_mask].copy()
+
+    if lr_df.empty:
+        raise ValueError(f"{csv_path} contains no valid LR rows after numeric coercion")
+    return lr_df
 
 
 def load_spatial_adata(st_h5ad: Path) -> sc.AnnData:

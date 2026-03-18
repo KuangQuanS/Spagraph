@@ -16,6 +16,7 @@ def run_cellcom(
     deconv_dir: Optional[str] = None,
     st_h5ad: Optional[str] = None,
     output_dir: Optional[str] = None,
+    composition_csv: Optional[str] = None,
     # MLP parameters
     mlp_latent_dim: int = 64,
     mlp_hidden_dims: str = '256,128',
@@ -146,6 +147,7 @@ def run_cellcom(
         deconv_dir=deconv_dir,
         st_h5ad=st_h5ad,
         output_dir=output_dir,
+        composition_csv=composition_csv,
         mlp_latent_dim=mlp_latent_dim,
         mlp_hidden_dims=mlp_hidden_dims,
         n_spot_neighbors=n_spot_neighbors,

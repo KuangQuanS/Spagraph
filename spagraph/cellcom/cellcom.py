@@ -216,7 +216,15 @@ def main(args=None):
     # 4. 加载spot-cluster反卷积比例矩阵
     cluster_composition_file = os.path.join(deconv_dir, '*_composition.csv')
     cluster_composition_files = glob.glob(cluster_composition_file)
-    cluster_composition = pd.read_csv(cluster_composition_files[0], index_col=0)
+    if getattr(args, 'composition_csv', None) and os.path.exists(args.composition_csv):
+        cluster_composition = pd.read_csv(args.composition_csv, index_col=0)
+    else:
+        if not cluster_composition_files:
+            raise FileNotFoundError(
+                f"No composition CSV found under {deconv_dir}. "
+                f"Provide composition_csv explicitly or ensure '*_composition.csv' exists."
+            )
+        cluster_composition = pd.read_csv(cluster_composition_files[0], index_col=0)
 
     # 记录cluster数量
     n_clusters = cluster_composition.shape[1]

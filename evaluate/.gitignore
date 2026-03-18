@@ -5,7 +5,6 @@ data/**
 !data/**/*.py
 !data/**/*.R
 !data/**/*.md
-!data/**/*.txt
 
 scripts/**/__pycache__/
 scripts/**/*.pyc

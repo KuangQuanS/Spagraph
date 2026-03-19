@@ -68,8 +68,10 @@ LR_COMM_PATH = DATA_DIR / "lr_communication.csv"
 FIGURE_ROOT = DATA_DIR / "figures"
 ATTENTION_OUTPUT_DIR = FIGURE_ROOT / "top_attention_lr_pairs"
 FREQUENCY_OUTPUT_DIR = FIGURE_ROOT / "top_frequency_lr_pairs"
+INTERFACE_MAP_OUTPUT_DIR = FIGURE_ROOT / "pathology_interface"
 ATTENTION_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 FREQUENCY_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+INTERFACE_MAP_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 TOP_PAIRS_PER_GROUP = 5
 TOP_EDGES_PER_PAIR = 500
@@ -80,8 +82,21 @@ PATHOLOGY_REGION_NAME = "Epithelial-Stromal Interface"
 PATHOLOGY_REGION_FILL = "#FFD166"
 PATHOLOGY_REGION_EDGE = "#C47F00"
 PATHOLOGY_REGION_MAX_COMPONENTS = 2
-PATHOLOGY_REGION_POINT_SIZE = 120
+PATHOLOGY_REGION_POINT_SIZE = 72
 MAX_EDGES_PER_SPOT_PAIR = 5
+INTERFACE_MAP_FIGSIZE = (6.6, 5.8)
+INTERFACE_CLASS_COLORS = {
+    "Fibroblast-rich": "#E5E5E5",
+    "Epithelial-rich": "#4F3796",
+    "Epithelial-Stromal Interface": "#F5C518",
+}
+FIG_SIZE = (8.2, 6.2)
+TITLE_FONT_SIZE = 16
+TITLE_PAD = 12
+LEGEND_FONT_SIZE = 10
+LEGEND_TITLE_FONT_SIZE = 11
+LEGEND_MARKER_SIZE = 9
+OVERLAY_LEGEND_FONT_SIZE = 9
 
 
 print("Loading data...")
@@ -129,25 +144,25 @@ if "spatial" in adata.uns:
     )
 
 
-def _build_pathology_region_overlay() -> tuple[str | None, list[dict[str, set[str]]]]:
+def _build_pathology_region_overlay() -> tuple[str | None, list[dict[str, set[str]]], pd.DataFrame | None]:
     if DATA_DIR.name != "GSE144236":
-        return None, []
+        return None, [], None
 
     composition_path = DATA_DIR / "Spatial_composition.csv"
     if not composition_path.exists():
-        return None, []
+        return None, [], None
 
     composition = pd.read_csv(composition_path, index_col=0)
     required = ["Epithelial", "Fibroblast", "Mac", "CD1C", "Tcell"]
     missing = [col for col in required if col not in composition.columns]
     if missing:
         print(f"Skip pathology region overlay: missing composition columns {missing}")
-        return None, []
+        return None, [], None
 
     composition.index = composition.index.astype(str)
     common_spots = composition.index.intersection(coords.index.astype(str))
     if len(common_spots) == 0:
-        return None, []
+        return None, [], None
     composition = composition.loc[common_spots].copy()
 
     epithelial = composition["Epithelial"].astype(float)
@@ -198,7 +213,17 @@ def _build_pathology_region_overlay() -> tuple[str | None, list[dict[str, set[st
 
     selected_spots = set(expanded.index[expanded])
     if not selected_spots:
-        return PATHOLOGY_REGION_NAME, []
+        region_df = pd.DataFrame(
+            {
+                "spot": common_spots,
+                "x": coords.loc[common_spots, "x"].astype(float).to_numpy() * scale_factor,
+                "y": coords.loc[common_spots, "y"].astype(float).to_numpy() * scale_factor,
+                "is_epithelial_rich": ep_values,
+                "is_fibroblast_rich": fib_values,
+                "is_interface": np.zeros(len(common_spots), dtype=bool),
+            }
+        )
+        return PATHOLOGY_REGION_NAME, [], region_df
 
     selected_index_lookup = {spot: idx for idx, spot in enumerate(common_spots)}
     selected_spot_list = [spot for spot in common_spots if spot in selected_spots]
@@ -242,10 +267,93 @@ def _build_pathology_region_overlay() -> tuple[str | None, list[dict[str, set[st
         f"{sum(len(item['spots']) for item in region_components)} spots across {len(region_components)} components "
         f"[ep_thr={ep_thr:.3f}, fib_thr={fib_thr:.3f}, immune_thr={immune_thr:.3f}]"
     )
-    return PATHOLOGY_REGION_NAME, region_components
+    kept_spots = {spot for item in region_components for spot in item["spots"]}
+    region_df = pd.DataFrame(
+        {
+            "spot": common_spots,
+            "x": coords.loc[common_spots, "x"].astype(float).to_numpy() * scale_factor,
+            "y": coords.loc[common_spots, "y"].astype(float).to_numpy() * scale_factor,
+            "is_epithelial_rich": ep_values,
+            "is_fibroblast_rich": fib_values,
+            "is_interface": np.array([spot in kept_spots for spot in common_spots], dtype=bool),
+        }
+    )
+    return PATHOLOGY_REGION_NAME, region_components, region_df
 
 
-PATHOLOGY_REGION_LABEL, PATHOLOGY_REGION_COMPONENTS = _build_pathology_region_overlay()
+PATHOLOGY_REGION_LABEL, PATHOLOGY_REGION_COMPONENTS, PATHOLOGY_REGION_DF = _build_pathology_region_overlay()
+
+
+def plot_pathology_interface_map() -> None:
+    if PATHOLOGY_REGION_LABEL is None or PATHOLOGY_REGION_DF is None:
+        return
+
+    fig, ax = plt.subplots(figsize=INTERFACE_MAP_FIGSIZE)
+    sc.pl.spatial(adata, color=None, alpha_img=0.28, size=0.1, show=False, ax=ax)
+
+    region_df = PATHOLOGY_REGION_DF.copy()
+    interface_df = region_df.loc[region_df["is_interface"]].copy()
+    epithelial_df = region_df.loc[region_df["is_epithelial_rich"] & ~region_df["is_interface"]].copy()
+    fibroblast_df = region_df.loc[region_df["is_fibroblast_rich"] & ~region_df["is_interface"]].copy()
+
+    if not fibroblast_df.empty:
+        ax.scatter(
+            fibroblast_df["x"],
+            fibroblast_df["y"],
+            s=60,
+            c=INTERFACE_CLASS_COLORS["Fibroblast-rich"],
+            edgecolors="none",
+            alpha=0.9,
+            zorder=3,
+        )
+    if not epithelial_df.empty:
+        ax.scatter(
+            epithelial_df["x"],
+            epithelial_df["y"],
+            s=60,
+            c=INTERFACE_CLASS_COLORS["Epithelial-rich"],
+            edgecolors="none",
+            alpha=0.95,
+            zorder=4,
+        )
+    if not interface_df.empty:
+        ax.scatter(
+            interface_df["x"],
+            interface_df["y"],
+            s=70,
+            c=INTERFACE_CLASS_COLORS["Epithelial-Stromal Interface"],
+            edgecolors="#A66B00",
+            linewidths=0.35,
+            alpha=0.95,
+            zorder=5,
+        )
+
+    if not ax.yaxis_inverted():
+        ax.invert_yaxis()
+    ax.axis("off")
+    ax.set_title("Spatial Mapping of the Epithelial-Stromal Interface", fontsize=15, pad=10)
+
+    handles = [
+        Line2D([0], [0], marker="o", color="w", markerfacecolor=INTERFACE_CLASS_COLORS["Fibroblast-rich"], markeredgecolor="none", markersize=8, linewidth=0, label="Fibroblast-rich"),
+        Line2D([0], [0], marker="o", color="w", markerfacecolor=INTERFACE_CLASS_COLORS["Epithelial-rich"], markeredgecolor="none", markersize=8, linewidth=0, label="Epithelial-rich"),
+        Line2D([0], [0], marker="o", color="w", markerfacecolor=INTERFACE_CLASS_COLORS["Epithelial-Stromal Interface"], markeredgecolor="#A66B00", markersize=8, linewidth=0, label="Interface"),
+    ]
+    ax.legend(
+        handles=handles,
+        loc="center left",
+        bbox_to_anchor=(1.01, 0.5),
+        frameon=False,
+        fontsize=10,
+        handletextpad=0.4,
+        labelspacing=0.4,
+    )
+
+    save_path = INTERFACE_MAP_OUTPUT_DIR / "epithelial_stromal_interface_map.pdf"
+    plt.tight_layout(pad=0.4)
+    plt.savefig(save_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    gc.collect()
+    print(f"Saved: {save_path}")
 
 
 def _select_nearest_pathology_boundary(
@@ -368,9 +476,9 @@ def plot_edges(
         norm_scores = (scores - score_min) / (score_max - score_min + 1e-12)
     else:
         norm_scores = np.zeros_like(scores, dtype=float)
-    widths = 2.0 + 2.5 * norm_scores
+    widths = 1.0 + 1.8 * norm_scores
 
-    fig, ax = plt.subplots(figsize=(10, 10))
+    fig, ax = plt.subplots(figsize=FIG_SIZE)
     sc.pl.spatial(adata, color=None, alpha_img=0.4, size=0.1, show=False, ax=ax)
 
     coords_plot = coords.copy()
@@ -392,9 +500,9 @@ def plot_edges(
                 region_coords["y"],
                 s=PATHOLOGY_REGION_POINT_SIZE,
                 c=PATHOLOGY_REGION_FILL,
-                alpha=0.35,
+                alpha=0.12,
                 edgecolors=PATHOLOGY_REGION_EDGE,
-                linewidths=1.0,
+                linewidths=0.45,
                 zorder=3,
             )
 
@@ -418,10 +526,10 @@ def plot_edges(
         if cell_type not in global_cell_to_marker:
             global_cell_to_marker[cell_type] = MARKERS[len(global_cell_to_marker) % len(MARKERS)]
 
-    line_color = "#32CD32"
-    src_color = "#00FFFF"
-    dst_color = "#FF00FF"
-    outline_effect = [pe.Stroke(linewidth=3.0, foreground="black"), pe.Normal()]
+    line_color = "#2E8B57"
+    src_color = "#24C7D9"
+    dst_color = "#E048C8"
+    outline_effect = [pe.Stroke(linewidth=2.1, foreground="black"), pe.Normal()]
 
     valid_widths = widths[: len(edges)]
     rng = np.random.default_rng(_stable_seed(str(output_dir), lr_name))
@@ -437,21 +545,21 @@ def plot_edges(
         ax.scatter(
             src_x_jitter,
             src_y_jitter,
-            s=40,
+            s=32,
             color=src_color,
             marker=src_marker,
             edgecolor="black",
-            linewidth=0.5,
+            linewidth=0.35,
             zorder=6,
         )
         ax.scatter(
             dst_x_jitter,
             dst_y_jitter,
-            s=40,
+            s=32,
             color=dst_color,
             marker=dst_marker,
             edgecolor="black",
-            linewidth=0.5,
+            linewidth=0.35,
             zorder=6,
         )
 
@@ -463,7 +571,7 @@ def plot_edges(
             arrowstyle="-",
             linewidth=float(width),
             color=line_color,
-            alpha=0.85,
+            alpha=0.72,
             shrinkA=0.0,
             shrinkB=0.0,
             zorder=5,
@@ -474,25 +582,72 @@ def plot_edges(
     if not ax.yaxis_inverted():
         ax.invert_yaxis()
 
-    ax.set_title(f"{lr_name}\n({score_col})", fontsize=20, fontweight="bold", pad=20)
+    ax.set_title(
+        f"{lr_name}\n({score_col})",
+        fontsize=TITLE_FONT_SIZE,
+        fontweight="bold",
+        pad=TITLE_PAD,
+    )
     ax.axis("off")
 
-    legend_elements = [
+    celltype_elements = [
         Line2D(
             [0],
             [0],
             marker=global_cell_to_marker[cell_type],
             color="w",
-            markerfacecolor="gray",
+            markerfacecolor="#B8B8B8",
             markeredgecolor="black",
-            markersize=20,
+            markersize=LEGEND_MARKER_SIZE,
             linewidth=0,
             label=cell_type,
         )
         for cell_type in current_cells
     ]
+    if celltype_elements:
+        cell_legend = ax.legend(
+            handles=celltype_elements,
+            loc="upper right",
+            bbox_to_anchor=(0.985, 0.985),
+            framealpha=0.92,
+            fancybox=True,
+            edgecolor="#D0D0D0",
+            fontsize=LEGEND_FONT_SIZE,
+            title="Cell Type",
+            title_fontsize=LEGEND_TITLE_FONT_SIZE,
+            labelspacing=0.35,
+            handletextpad=0.45,
+            borderpad=0.45,
+        )
+        ax.add_artist(cell_legend)
+
+    overlay_elements = [
+        Line2D([0], [0], color=line_color, linewidth=2.0, label="Interaction edge"),
+        Line2D(
+            [0],
+            [0],
+            marker="o",
+            color="w",
+            markerfacecolor=src_color,
+            markeredgecolor="black",
+            markersize=LEGEND_MARKER_SIZE - 1,
+            linewidth=0,
+            label="Ligand side",
+        ),
+        Line2D(
+            [0],
+            [0],
+            marker="o",
+            color="w",
+            markerfacecolor=dst_color,
+            markeredgecolor="black",
+            markersize=LEGEND_MARKER_SIZE - 1,
+            linewidth=0,
+            label="Receptor side",
+        ),
+    ]
     if show_pathology_region:
-        legend_elements.append(
+        overlay_elements.append(
             Line2D(
                 [0],
                 [0],
@@ -500,26 +655,29 @@ def plot_edges(
                 color="w",
                 markerfacecolor=PATHOLOGY_REGION_FILL,
                 markeredgecolor=PATHOLOGY_REGION_EDGE,
-                markersize=16,
+                markersize=LEGEND_MARKER_SIZE,
                 linewidth=0,
                 label=PATHOLOGY_REGION_LABEL,
             )
         )
-    if legend_elements:
-        ax.legend(
-            handles=legend_elements,
-            loc="center left",
-            fontsize=18,
-            framealpha=0.95,
-            title="Cell Type",
-            title_fontsize=18,
-            ncol=1,
-            bbox_to_anchor=(1, 0.5),
-        )
+
+    overlay_legend = ax.legend(
+        handles=overlay_elements,
+        loc="lower right",
+        bbox_to_anchor=(0.985, 0.02),
+        framealpha=0.90,
+        fancybox=True,
+        edgecolor="#D0D0D0",
+        fontsize=OVERLAY_LEGEND_FONT_SIZE,
+        labelspacing=0.30,
+        handletextpad=0.45,
+        borderpad=0.40,
+    )
+    ax.add_artist(overlay_legend)
 
     safe_name = lr_name.replace("/", "_")
     save_path = output_dir / f"{rank:02d}_{safe_name}_{score_col}.pdf"
-    plt.tight_layout()
+    plt.tight_layout(pad=0.5)
     plt.savefig(save_path, dpi=300, bbox_inches="tight")
     plt.close(fig)
     gc.collect()
@@ -537,6 +695,7 @@ def _plot_group(selection_df: pd.DataFrame, output_dir: Path, group_name: str) -
             plot_edges(pair_df, pair_name, score_column, output_dir=output_dir, rank=rank)
 
 
+plot_pathology_interface_map()
 _plot_group(attention_pairs, ATTENTION_OUTPUT_DIR, "top attention")
 _plot_group(frequency_pairs, FREQUENCY_OUTPUT_DIR, "top frequency")
 

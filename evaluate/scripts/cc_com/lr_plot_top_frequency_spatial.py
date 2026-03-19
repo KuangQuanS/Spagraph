@@ -16,6 +16,7 @@ import pandas as pd
 import scanpy as sc
 from matplotlib.lines import Line2D
 from matplotlib.patches import FancyArrowPatch
+from scipy.spatial import distance_matrix
 from sklearn.neighbors import kneighbors_graph
 
 
@@ -86,11 +87,11 @@ PATHOLOGY_REGION_POINT_SIZE = 72
 MAX_EDGES_PER_SPOT_PAIR = 5
 INTERFACE_MAP_FIGSIZE = (6.6, 5.8)
 INTERFACE_CLASS_COLORS = {
-    "Fibroblast-rich": "#E5E5E5",
-    "Epithelial-rich": "#4F3796",
-    "Epithelial-Stromal Interface": "#F5C518",
+    "Fibroblast-rich": "#E0E0E0",
+    "Epithelial-rich": "#4C2A85",
+    "Epithelial-Stromal Interface": "#FFD700",
 }
-FIG_SIZE = (8.2, 6.2)
+FIG_SIZE = (9.4, 6.2)
 TITLE_FONT_SIZE = 16
 TITLE_PAD = 12
 LEGEND_FONT_SIZE = 10
@@ -173,13 +174,17 @@ def _build_pathology_region_overlay() -> tuple[str | None, list[dict[str, set[st
         + composition["Tcell"].astype(float)
     )
 
-    ep_thr = max(0.35, float(epithelial.quantile(0.65)))
-    fib_thr = max(0.15, float(fibroblast.quantile(0.65)))
-    immune_thr = max(0.05, float(immune.quantile(0.70)))
+    interface_score = epithelial * fibroblast * np.maximum(immune, 0.05)
+    if float(interface_score.max()) > float(interface_score.min()):
+        interface_scaled = (interface_score - interface_score.min()) / (interface_score.max() - interface_score.min())
+    else:
+        interface_scaled = pd.Series(np.zeros(len(interface_score), dtype=float), index=interface_score.index)
 
-    ep_mask = epithelial >= ep_thr
-    fib_mask = fibroblast >= fib_thr
-    immune_mask = immune >= immune_thr
+    boundary_threshold = float(np.percentile(interface_scaled.to_numpy(), 95))
+    interface_mask = interface_scaled >= boundary_threshold
+    if not interface_mask.any():
+        boundary_threshold = float(np.percentile(interface_scaled.to_numpy(), 90))
+        interface_mask = interface_scaled >= boundary_threshold
 
     local_coords = coords.loc[common_spots, ["x", "y"]].to_numpy(dtype=float)
     adjacency = kneighbors_graph(
@@ -189,48 +194,26 @@ def _build_pathology_region_overlay() -> tuple[str | None, list[dict[str, set[st
         include_self=False,
     ).tolil()
 
-    interface_mask = np.zeros(len(common_spots), dtype=bool)
-    ep_values = ep_mask.to_numpy()
-    fib_values = fib_mask.to_numpy()
-    for idx in range(len(common_spots)):
-        neighbors = adjacency.rows[idx]
-        if not neighbors:
-            continue
-        if ep_values[idx] and fib_values[neighbors].any():
-            interface_mask[idx] = True
-        elif fib_values[idx] and ep_values[neighbors].any():
-            interface_mask[idx] = True
+    ep_values = epithelial.to_numpy()
+    fib_values = fibroblast.to_numpy()
+    interface_values = interface_mask.to_numpy()
 
-    interface_series = pd.Series(interface_mask, index=common_spots)
-    expanded = interface_series.copy()
-    for idx, spot in enumerate(common_spots):
-        neighbors = adjacency.rows[idx]
-        if interface_mask[idx]:
-            continue
-        if neighbors and interface_mask[neighbors].any():
-            if ep_values[idx] or fib_values[idx] or immune_mask.iloc[idx]:
-                expanded.iloc[idx] = True
+    boundary_spots = composition.index[interface_mask].astype(str)
+    boundary_coords = coords.loc[boundary_spots, ["x", "y"]].to_numpy(dtype=float)
+    if boundary_coords.size == 0:
+        signed_distance = np.where(ep_values >= fib_values, -1.0, 1.0)
+    else:
+        min_distances = distance_matrix(local_coords, boundary_coords).min(axis=1)
+        direction = np.where(ep_values >= fib_values, -1.0, 1.0)
+        signed_distance = min_distances * direction
+        signed_distance[interface_values] = 0.0
 
-    selected_spots = set(expanded.index[expanded])
-    if not selected_spots:
-        region_df = pd.DataFrame(
-            {
-                "spot": common_spots,
-                "x": coords.loc[common_spots, "x"].astype(float).to_numpy() * scale_factor,
-                "y": coords.loc[common_spots, "y"].astype(float).to_numpy() * scale_factor,
-                "is_epithelial_rich": ep_values,
-                "is_fibroblast_rich": fib_values,
-                "is_interface": np.zeros(len(common_spots), dtype=bool),
-            }
-        )
-        return PATHOLOGY_REGION_NAME, [], region_df
-
+    selected_spots = set(boundary_spots)
     selected_index_lookup = {spot: idx for idx, spot in enumerate(common_spots)}
-    selected_spot_list = [spot for spot in common_spots if spot in selected_spots]
     visited: set[str] = set()
     components: list[list[str]] = []
-    for spot in selected_spot_list:
-        if spot in visited:
+    for spot in common_spots:
+        if spot not in selected_spots or spot in visited:
             continue
         stack = [spot]
         component: list[str] = []
@@ -251,31 +234,28 @@ def _build_pathology_region_overlay() -> tuple[str | None, list[dict[str, set[st
     region_components: list[dict[str, set[str]]] = []
     for component in kept_components:
         component_set = set(component)
-        boundary_spots: set[str] = set()
-        for spot in component_set:
-            idx = selected_index_lookup[spot]
-            neighbors = adjacency.rows[idx]
-            if not neighbors:
-                boundary_spots.add(spot)
-                continue
-            if any(common_spots[neighbor_idx] not in component_set for neighbor_idx in neighbors):
-                boundary_spots.add(spot)
-        region_components.append({"spots": component_set, "boundary_spots": boundary_spots})
+        region_components.append({"spots": component_set, "boundary_spots": component_set})
+
+    kept_spots = {spot for item in region_components for spot in item["spots"]}
+    is_interface = np.array([spot in kept_spots for spot in common_spots], dtype=bool)
+    is_epithelial_rich = (~is_interface) & (signed_distance < 0)
+    is_fibroblast_rich = (~is_interface) & (signed_distance > 0)
 
     print(
         f"Pathology region overlay ({PATHOLOGY_REGION_NAME}): "
-        f"{sum(len(item['spots']) for item in region_components)} spots across {len(region_components)} components "
-        f"[ep_thr={ep_thr:.3f}, fib_thr={fib_thr:.3f}, immune_thr={immune_thr:.3f}]"
+        f"{len(kept_spots)} interface spots across {len(region_components)} components "
+        f"[boundary_threshold={boundary_threshold:.3f}]"
     )
-    kept_spots = {spot for item in region_components for spot in item["spots"]}
     region_df = pd.DataFrame(
         {
             "spot": common_spots,
             "x": coords.loc[common_spots, "x"].astype(float).to_numpy() * scale_factor,
             "y": coords.loc[common_spots, "y"].astype(float).to_numpy() * scale_factor,
-            "is_epithelial_rich": ep_values,
-            "is_fibroblast_rich": fib_values,
-            "is_interface": np.array([spot in kept_spots for spot in common_spots], dtype=bool),
+            "is_epithelial_rich": is_epithelial_rich,
+            "is_fibroblast_rich": is_fibroblast_rich,
+            "is_interface": is_interface,
+            "signed_distance": signed_distance,
+            "interface_score_scaled": interface_scaled.to_numpy(),
         }
     )
     return PATHOLOGY_REGION_NAME, region_components, region_df
@@ -289,7 +269,7 @@ def plot_pathology_interface_map() -> None:
         return
 
     fig, ax = plt.subplots(figsize=INTERFACE_MAP_FIGSIZE)
-    sc.pl.spatial(adata, color=None, alpha_img=0.28, size=0.1, show=False, ax=ax)
+    sc.pl.spatial(adata, color=None, alpha_img=0.14, size=0.1, show=False, ax=ax)
 
     region_df = PATHOLOGY_REGION_DF.copy()
     interface_df = region_df.loc[region_df["is_interface"]].copy()
@@ -300,31 +280,31 @@ def plot_pathology_interface_map() -> None:
         ax.scatter(
             fibroblast_df["x"],
             fibroblast_df["y"],
-            s=60,
+            s=68,
             c=INTERFACE_CLASS_COLORS["Fibroblast-rich"],
             edgecolors="none",
-            alpha=0.9,
+            alpha=0.95,
             zorder=3,
         )
     if not epithelial_df.empty:
         ax.scatter(
             epithelial_df["x"],
             epithelial_df["y"],
-            s=60,
+            s=68,
             c=INTERFACE_CLASS_COLORS["Epithelial-rich"],
             edgecolors="none",
-            alpha=0.95,
+            alpha=0.98,
             zorder=4,
         )
     if not interface_df.empty:
         ax.scatter(
             interface_df["x"],
             interface_df["y"],
-            s=70,
+            s=78,
             c=INTERFACE_CLASS_COLORS["Epithelial-Stromal Interface"],
             edgecolors="#A66B00",
-            linewidths=0.35,
-            alpha=0.95,
+            linewidths=0.5,
+            alpha=0.98,
             zorder=5,
         )
 
@@ -342,7 +322,9 @@ def plot_pathology_interface_map() -> None:
         handles=handles,
         loc="center left",
         bbox_to_anchor=(1.01, 0.5),
-        frameon=False,
+        frameon=True,
+        framealpha=0.92,
+        edgecolor="#D0D0D0",
         fontsize=10,
         handletextpad=0.4,
         labelspacing=0.4,
@@ -500,9 +482,9 @@ def plot_edges(
                 region_coords["y"],
                 s=PATHOLOGY_REGION_POINT_SIZE,
                 c=PATHOLOGY_REGION_FILL,
-                alpha=0.12,
+                alpha=0.30,
                 edgecolors=PATHOLOGY_REGION_EDGE,
-                linewidths=0.45,
+                linewidths=0.55,
                 zorder=3,
             )
 
@@ -607,8 +589,8 @@ def plot_edges(
     if celltype_elements:
         cell_legend = ax.legend(
             handles=celltype_elements,
-            loc="upper right",
-            bbox_to_anchor=(0.985, 0.985),
+            loc="upper left",
+            bbox_to_anchor=(1.02, 0.98),
             framealpha=0.92,
             fancybox=True,
             edgecolor="#D0D0D0",
@@ -663,8 +645,8 @@ def plot_edges(
 
     overlay_legend = ax.legend(
         handles=overlay_elements,
-        loc="lower right",
-        bbox_to_anchor=(0.985, 0.02),
+        loc="lower left",
+        bbox_to_anchor=(1.02, 0.04),
         framealpha=0.90,
         fancybox=True,
         edgecolor="#D0D0D0",
@@ -677,7 +659,7 @@ def plot_edges(
 
     safe_name = lr_name.replace("/", "_")
     save_path = output_dir / f"{rank:02d}_{safe_name}_{score_col}.pdf"
-    plt.tight_layout(pad=0.5)
+    plt.tight_layout(pad=0.5, rect=(0.0, 0.0, 0.82, 1.0))
     plt.savefig(save_path, dpi=300, bbox_inches="tight")
     plt.close(fig)
     gc.collect()

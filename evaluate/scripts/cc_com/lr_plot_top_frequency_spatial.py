@@ -72,15 +72,16 @@ ATTENTION_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 FREQUENCY_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 TOP_PAIRS_PER_GROUP = 5
-TOP_EDGES_PER_PAIR = 5000
+TOP_EDGES_PER_PAIR = 500
 MIN_EVENT_COUNT = 10
 OFFSET_RANGE = 20.0
 SCORE_COLUMNS = ("original_lr_score", "attention_score")
-PATHOLOGY_REGION_NAME = "Invasive Front"
+PATHOLOGY_REGION_NAME = "Epithelial-Stromal Interface"
 PATHOLOGY_REGION_FILL = "#FFD166"
 PATHOLOGY_REGION_EDGE = "#C47F00"
 PATHOLOGY_REGION_MAX_COMPONENTS = 2
 PATHOLOGY_REGION_POINT_SIZE = 120
+MAX_EDGES_PER_SPOT_PAIR = 5
 
 
 print("Loading data...")
@@ -128,25 +129,25 @@ if "spatial" in adata.uns:
     )
 
 
-def _build_pathology_region_overlay() -> tuple[str | None, set[str], set[str]]:
+def _build_pathology_region_overlay() -> tuple[str | None, list[dict[str, set[str]]]]:
     if DATA_DIR.name != "GSE144236":
-        return None, set(), set()
+        return None, []
 
     composition_path = DATA_DIR / "Spatial_composition.csv"
     if not composition_path.exists():
-        return None, set(), set()
+        return None, []
 
     composition = pd.read_csv(composition_path, index_col=0)
     required = ["Epithelial", "Fibroblast", "Mac", "CD1C", "Tcell"]
     missing = [col for col in required if col not in composition.columns]
     if missing:
         print(f"Skip pathology region overlay: missing composition columns {missing}")
-        return None, set(), set()
+        return None, []
 
     composition.index = composition.index.astype(str)
     common_spots = composition.index.intersection(coords.index.astype(str))
     if len(common_spots) == 0:
-        return None, set(), set()
+        return None, []
     composition = composition.loc[common_spots].copy()
 
     epithelial = composition["Epithelial"].astype(float)
@@ -197,7 +198,7 @@ def _build_pathology_region_overlay() -> tuple[str | None, set[str], set[str]]:
 
     selected_spots = set(expanded.index[expanded])
     if not selected_spots:
-        return PATHOLOGY_REGION_NAME, set(), set()
+        return PATHOLOGY_REGION_NAME, []
 
     selected_index_lookup = {spot: idx for idx, spot in enumerate(common_spots)}
     selected_spot_list = [spot for spot in common_spots if spot in selected_spots]
@@ -222,27 +223,57 @@ def _build_pathology_region_overlay() -> tuple[str | None, set[str], set[str]]:
 
     components.sort(key=len, reverse=True)
     kept_components = components[:PATHOLOGY_REGION_MAX_COMPONENTS]
-    kept_spots = {spot for component in kept_components for spot in component}
-
-    boundary_spots: set[str] = set()
-    for spot in kept_spots:
-        idx = selected_index_lookup[spot]
-        neighbors = adjacency.rows[idx]
-        if not neighbors:
-            boundary_spots.add(spot)
-            continue
-        if any(common_spots[neighbor_idx] not in kept_spots for neighbor_idx in neighbors):
-            boundary_spots.add(spot)
+    region_components: list[dict[str, set[str]]] = []
+    for component in kept_components:
+        component_set = set(component)
+        boundary_spots: set[str] = set()
+        for spot in component_set:
+            idx = selected_index_lookup[spot]
+            neighbors = adjacency.rows[idx]
+            if not neighbors:
+                boundary_spots.add(spot)
+                continue
+            if any(common_spots[neighbor_idx] not in component_set for neighbor_idx in neighbors):
+                boundary_spots.add(spot)
+        region_components.append({"spots": component_set, "boundary_spots": boundary_spots})
 
     print(
         f"Pathology region overlay ({PATHOLOGY_REGION_NAME}): "
-        f"{len(kept_spots)} spots, {len(boundary_spots)} boundary spots "
+        f"{sum(len(item['spots']) for item in region_components)} spots across {len(region_components)} components "
         f"[ep_thr={ep_thr:.3f}, fib_thr={fib_thr:.3f}, immune_thr={immune_thr:.3f}]"
     )
-    return PATHOLOGY_REGION_NAME, kept_spots, boundary_spots
+    return PATHOLOGY_REGION_NAME, region_components
 
 
-PATHOLOGY_REGION_LABEL, PATHOLOGY_REGION_SPOTS, PATHOLOGY_REGION_BOUNDARY_SPOTS = _build_pathology_region_overlay()
+PATHOLOGY_REGION_LABEL, PATHOLOGY_REGION_COMPONENTS = _build_pathology_region_overlay()
+
+
+def _select_nearest_pathology_boundary(
+    edges: pd.DataFrame,
+) -> set[str]:
+    if not PATHOLOGY_REGION_COMPONENTS or edges.empty:
+        return set()
+
+    event_points = np.concatenate(
+        [
+            edges[["src_x", "src_y"]].to_numpy(dtype=float),
+            edges[["dst_x", "dst_y"]].to_numpy(dtype=float),
+        ],
+        axis=0,
+    )
+    event_center = np.nanmean(event_points, axis=0)
+
+    best_boundary: set[str] = set()
+    best_distance = float("inf")
+    for component in PATHOLOGY_REGION_COMPONENTS:
+        component_spots = sorted(component["spots"])
+        component_points = coords.loc[component_spots, ["x", "y"]].to_numpy(dtype=float)
+        component_center = np.nanmean(component_points, axis=0)
+        distance = float(np.linalg.norm(component_center - event_center))
+        if distance < best_distance:
+            best_distance = distance
+            best_boundary = component["boundary_spots"]
+    return best_boundary
 
 pair_stats = (
     df.groupby("lr_pair", as_index=False)
@@ -310,7 +341,13 @@ def plot_edges(
         print(f"Skip {lr_name} ({score_col}): no events found")
         return
 
-    edges = sub_df.sort_values(score_col, ascending=False).head(TOP_EDGES_PER_PAIR).copy()
+    edges = (
+        sub_df.sort_values(score_col, ascending=False)
+        .groupby(["src_spot_barcode", "dst_spot_barcode"], as_index=False, sort=False)
+        .head(MAX_EDGES_PER_SPOT_PAIR)
+        .head(TOP_EDGES_PER_PAIR)
+        .copy()
+    )
     edges["src_x"] = edges["src_spot_barcode"].map(coords["x"])
     edges["src_y"] = edges["src_spot_barcode"].map(coords["y"])
     edges["dst_x"] = edges["dst_spot_barcode"].map(coords["x"])
@@ -343,10 +380,11 @@ def plot_edges(
     show_pathology_region = (
         score_col == "attention_score"
         and PATHOLOGY_REGION_LABEL is not None
-        and bool(PATHOLOGY_REGION_BOUNDARY_SPOTS)
+        and bool(PATHOLOGY_REGION_COMPONENTS)
     )
     if show_pathology_region:
-        region_spots = sorted(PATHOLOGY_REGION_BOUNDARY_SPOTS.intersection(coords_plot.index.astype(str)))
+        region_boundary_spots = _select_nearest_pathology_boundary(edges)
+        region_spots = sorted(region_boundary_spots.intersection(coords_plot.index.astype(str)))
         if region_spots:
             region_coords = coords_plot.loc[region_spots]
             ax.scatter(

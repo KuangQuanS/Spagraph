@@ -229,3 +229,4 @@ evaluate/data/**/modality_alignment_umap*.png
 evaluate/data/**/modality_alignment_umap*.pdf
 evaluate/data/**/vae_training_curves.pdf
 evaluate/data/**/dominant_cell_type.pdf
+manuscript.docx

@@ -512,8 +512,10 @@ class STHeteroSubgraphDataset:
         if self.composition is None:
             raise ValueError("composition必须在graph_data中提供")
         
-        # 获取预计算的KNN邻接矩阵
+        # 获取预计算的KNN邻接矩阵（保留密集格式供子图提取使用）
         self.knn_mask = graph_data.get('knn_mask', None)
+        if self.knn_mask is not None and hasattr(self.knn_mask, 'toarray'):
+            self.knn_mask = self.knn_mask.toarray()  # ensure dense for indexing
         
         # 获取ST中与cluster表达量匹配的基因
         self.genes = list(dict.fromkeys(cluster_expr.columns.tolist()))
@@ -603,13 +605,18 @@ class STHeteroSubgraphDataset:
             for i in range(self.n_spots)
         ]
         
-        # ========== 预计算Spot-Spot高斯权重矩阵（避免__getitem__中重复计算）==========
-        print("[Dataset] Building spatial weight matrix")
+        # ========== 预计算Spot-Spot高斯权重（仅KNN邻居，稀疏存储）==========
+        print("[Dataset] Building sparse spatial weight matrix")
         coords = self.coords
-        diff = coords[:, np.newaxis, :] - coords[np.newaxis, :, :]  # [n_spots, n_spots, 2]
-        dist_matrix = np.sqrt((diff ** 2).sum(axis=2))  # [n_spots, n_spots]
         sigma = 50.0
-        self.spot_weight_matrix = np.exp(-dist_matrix ** 2 / (2 * sigma ** 2)).astype(np.float32)  # [n_spots, n_spots]
+        # Only compute weights for KNN neighbors instead of full N×N
+        rows, cols = np.where(self.knn_mask == 1)
+        dists = np.sqrt(((coords[rows] - coords[cols]) ** 2).sum(axis=1))
+        weights = np.exp(-dists ** 2 / (2 * sigma ** 2)).astype(np.float32)
+        from scipy.sparse import csr_matrix
+        self.spot_weight_matrix = csr_matrix(
+            (weights, (rows, cols)), shape=(self.n_spots, self.n_spots)
+        )
 
         # 预先对齐 spot 表达矩阵到 marker 基因顺序
         self.st_X_marker = np.zeros(
@@ -791,14 +798,18 @@ class STHeteroSubgraphDataset:
         edge_index_like_list = []
         edge_attr_like_list = []
         
-        # 5a. Spot-Spot边（基于KNN关系 + 高斯权重）- 使用预计算的权重矩阵
-        knn_sub = self.knn_mask[np.ix_(subgraph_spot_indices, subgraph_spot_indices)]  # [k+1, k+1]
-        weight_sub = self.spot_weight_matrix[np.ix_(subgraph_spot_indices, subgraph_spot_indices)]  # [k+1, k+1]
-        
+        # 5a. Spot-Spot边（基于KNN关系 + 高斯权重）- 使用预计算的稀疏权重矩阵
+        idx = np.array(subgraph_spot_indices)
+        knn_sub = self.knn_mask[np.ix_(idx, idx)]
+        weight_sub = self.spot_weight_matrix[np.ix_(idx, idx)]
+        # sparse→dense for the small subgraph (typically ~7×7)
+        if hasattr(weight_sub, 'toarray'):
+            weight_sub = weight_sub.toarray()
+
         # 找到有效边：KNN邻居 & 权重 > 阈值 & 非自环
         valid_mask = (knn_sub == 1) & (weight_sub > 1e-4)
-        np.fill_diagonal(valid_mask, False)  # 排除自环
-        
+        np.fill_diagonal(valid_mask, False)
+
         # 提取边索引和权重
         src_indices, dst_indices = np.where(valid_mask)
         weights = weight_sub[valid_mask]

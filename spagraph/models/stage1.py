@@ -309,14 +309,18 @@ class coEncoder:
         test_X = np.vstack([sc_test, st_test])
         
         train_modality = np.concatenate([
-            np.zeros(len(sc_train)), 
+            np.zeros(len(sc_train)),
             np.ones(len(st_train))
         ])
 
         test_modality = np.concatenate([
-            np.zeros(len(sc_test)), 
+            np.zeros(len(sc_test)),
             np.ones(len(st_test))
         ])
+
+        # Build label arrays for conditional MMD (SC: cluster id, ST: -1)
+        train_labels = np.concatenate([y_train, np.full(len(st_train), -1)])
+        test_labels = np.concatenate([y_test, np.full(len(st_test), -1)])
         
         # Keep ALL SC data (train + test) for cluster embedding computation
         # Note: Save raw counts for all genes (for later scaling and expression reconstruction)
@@ -544,7 +548,9 @@ class coEncoder:
             output_dir=self.output_dir if self.save_to_disk else None,
             print_every=print_every,
             patience=20,
-            min_delta=1
+            min_delta=1,
+            train_labels=train_labels,
+            test_labels=test_labels,
         )
         
         # Save training data for cluster center computation

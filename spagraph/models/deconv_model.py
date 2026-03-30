@@ -338,69 +338,76 @@ def zinb_loss_function(mean, disp, pi, x, mu, log_var, beta=1.0, eps=1e-8, ridge
     
     return total_loss, recon_loss, kl_div
 
-def compute_mmd(x, y, kernel='rbf', gamma=None):
+def compute_mmd(x, y, kernel='rbf', gamma=None, max_samples=512):
     """
-    Compute Maximum Mean Discrepancy (MMD) between two distributions
-    
+    Compute Maximum Mean Discrepancy (MMD) between two distributions.
+
+    Uses minibatch sampling (Gretton et al. 2012) to avoid O(n²) full
+    pairwise kernel matrices.  The estimator is consistent and unbiased
+    for the squared MMD.
+
     Args:
         x: Tensor of shape (n_samples_x, n_features) - SC embeddings
         y: Tensor of shape (n_samples_y, n_features) - ST embeddings
         kernel: Kernel type ('rbf' or 'linear')
         gamma: RBF kernel bandwidth (if None, use median heuristic)
-    
+        max_samples: Maximum number of samples to use for kernel computation.
+            Keeps memory O(max_samples²) instead of O(n²).
+
     Returns:
         mmd_loss: Scalar MMD loss value
     """
-    # Ensure tensors are on the same device
     device = x.device
     y = y.to(device)
-    
+
     n_x = x.size(0)
     n_y = y.size(0)
-    
+
     if kernel == 'rbf':
-        # Compute pairwise distances
         def compute_kernel(a, b, gamma):
             """RBF kernel K(a,b) = exp(-gamma * ||a-b||^2)"""
-            # a: (n, d), b: (m, d)
-            # output: (n, m)
-            a_norm = (a ** 2).sum(1).view(-1, 1)  # (n, 1)
-            b_norm = (b ** 2).sum(1).view(1, -1)  # (1, m)
-            dist = a_norm + b_norm - 2.0 * torch.mm(a, b.transpose(0, 1))  # (n, m)
+            a_norm = (a ** 2).sum(1).view(-1, 1)
+            b_norm = (b ** 2).sum(1).view(1, -1)
+            dist = a_norm + b_norm - 2.0 * torch.mm(a, b.transpose(0, 1))
             return torch.exp(-gamma * dist)
-        
-        # Use median heuristic for gamma if not specified
+
+        # Subsample to cap memory at O(max_samples²)
+        if n_x > max_samples:
+            idx_x = torch.randperm(n_x, device=device)[:max_samples]
+            x_s = x[idx_x]
+        else:
+            x_s = x
+        if n_y > max_samples:
+            idx_y = torch.randperm(n_y, device=device)[:max_samples]
+            y_s = y[idx_y]
+        else:
+            y_s = y
+
+        # Median heuristic for gamma on the (already small) subsample
         if gamma is None:
-            # Sample a subset for efficiency
-            n_samples = min(1000, n_x, n_y)
-            x_sample = x[:n_samples]
-            y_sample = y[:n_samples]
-            
-            # Compute pairwise distances
-            xy = torch.cat([x_sample, y_sample], dim=0)
-            dists = torch.cdist(xy, xy, p=2)
-            
-            # Median heuristic: gamma = 1 / (2 * median^2)
-            median_dist = torch.median(dists[dists > 0])
-            gamma = 1.0 / (2 * median_dist ** 2 + 1e-8)
-        
-        # Compute kernels
-        K_xx = compute_kernel(x, x, gamma)
-        K_yy = compute_kernel(y, y, gamma)
-        K_xy = compute_kernel(x, y, gamma)
-        
-        # MMD^2 = E[K(x,x')] + E[K(y,y')] - 2*E[K(x,y)]
-        mmd_loss = K_xx.sum() / (n_x * n_x) + K_yy.sum() / (n_y * n_y) - 2 * K_xy.sum() / (n_x * n_y)
-        
+            with torch.no_grad():
+                xy = torch.cat([x_s, y_s], dim=0)
+                dists = torch.cdist(xy, xy, p=2)
+                median_dist = torch.median(dists[dists > 0])
+                gamma = 1.0 / (2 * median_dist ** 2 + 1e-8)
+
+        # Compute kernels on subsampled data: O(max_samples²) instead of O(n²)
+        K_xx = compute_kernel(x_s, x_s, gamma)
+        K_yy = compute_kernel(y_s, y_s, gamma)
+        K_xy = compute_kernel(x_s, y_s, gamma)
+
+        n_xs = x_s.size(0)
+        n_ys = y_s.size(0)
+        mmd_loss = K_xx.sum() / (n_xs * n_xs) + K_yy.sum() / (n_ys * n_ys) - 2 * K_xy.sum() / (n_xs * n_ys)
+
     elif kernel == 'linear':
-        # Linear kernel: K(a,b) = <a,b>
         mean_x = x.mean(0)
         mean_y = y.mean(0)
         mmd_loss = torch.sum((mean_x - mean_y) ** 2)
-    
+
     else:
         raise ValueError(f"Unknown kernel: {kernel}")
-    
+
     return mmd_loss
 
 # ================================
@@ -509,77 +516,105 @@ class HeterogeneousGATDeconvolution(nn.Module):
             nn.Linear(gat_hidden_dim, 1)
 
         )
-        
-    def build_heterogeneous_graph(self, 
+
+        # Cached spatial KNN edges (invariant across forward passes)
+        self._cached_spatial_edge_index: Optional[torch.Tensor] = None
+        self._cached_spatial_edge_attr: Optional[torch.Tensor] = None
+        self._cached_spatial_n_spots: int = -1
+
+    def invalidate_graph_cache(self):
+        """Call to force recomputation of spatial edges (e.g. after data change)."""
+        self._cached_spatial_edge_index = None
+        self._cached_spatial_edge_attr = None
+        self._cached_spatial_n_spots = -1
+
+    def _build_spatial_edges(self, spatial_coords: torch.Tensor,
+                             spot_embeddings: torch.Tensor,
+                             use_embedding_knn: bool) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Build spot-spot KNN edges. Cached when using spatial coords (invariant)."""
+        n_spots = spatial_coords.shape[0]
+        device = spatial_coords.device
+        use_spatial = (not use_embedding_knn
+                       and spatial_coords is not None
+                       and spatial_coords.shape[0] > 1)
+
+        # Return cache if spatial coords haven't changed
+        if (use_spatial
+                and self._cached_spatial_edge_index is not None
+                and self._cached_spatial_n_spots == n_spots):
+            return (self._cached_spatial_edge_index.to(device),
+                    self._cached_spatial_edge_attr.to(device))
+
+        k_spatial = min(int(self.k_spatial), n_spots - 1)
+        with torch.no_grad():
+            if use_spatial:
+                dists = torch.cdist(spatial_coords, spatial_coords)
+            else:
+                spot_norm = F.normalize(spot_embeddings, p=2, dim=1)
+                sim = spot_norm @ spot_norm.t()
+                dists = 1.0 - sim
+
+            diag_idx = torch.arange(n_spots, device=device)
+            dists[diag_idx, diag_idx] = float('inf')
+
+            knn_dists, knn_idx = torch.topk(dists, k=k_spatial, largest=False)
+            dist_std = knn_dists.std()
+            weights = torch.exp(-knn_dists / (dist_std + 1e-8)).reshape(-1, 1)
+
+            src = torch.arange(n_spots, device=device).unsqueeze(1).expand(-1, k_spatial)
+            src_flat = src.reshape(-1)
+            dst_flat = knn_idx.reshape(-1)
+
+            fwd = torch.stack([src_flat, dst_flat], dim=0)
+            bwd = torch.stack([dst_flat, src_flat], dim=0)
+            edge_index = torch.cat([fwd, bwd], dim=1)
+            edge_attr = torch.cat([weights, weights], dim=0)
+
+        # Cache only when using spatial coords (they don't change during training)
+        if use_spatial:
+            self._cached_spatial_edge_index = edge_index
+            self._cached_spatial_edge_attr = edge_attr
+            self._cached_spatial_n_spots = n_spots
+
+        return edge_index, edge_attr
+
+    def build_heterogeneous_graph(self,
                                 spot_embeddings: torch.Tensor,
                                 spatial_coords: torch.Tensor,
                                 celltype_prototypes: torch.Tensor,
                                 use_embedding_knn: bool = False) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """构建异构图：Spot节点 + CellType节点
-        
+
         注意：celltype_prototypes参数用于计算Spot-CellType边的相似度（在原始VAE embedding空间）
               而self.celltype_embeddings用于GAT的节点特征（已投影到gat_hidden_dim空间）
         """
         n_spots = spot_embeddings.shape[0]
         n_cell_types = celltype_prototypes.shape[0]
         device = spot_embeddings.device
-        
+
         # 1. 处理节点特征
-        # Spot节点特征：投影到GAT hidden dim
-        spot_features = self.spot_projection(spot_embeddings)  # [n_spots, gat_hidden_dim]
-        
-        # CellType节点特征：使用已初始化的可学习embedding
-        celltype_features = self.celltype_embeddings  # [n_cell_types, gat_hidden_dim]
-        
-        # 合并节点特征 [spots; celltypes]
+        spot_features = self.spot_projection(spot_embeddings)
+        celltype_features = self.celltype_embeddings
         node_features = torch.cat([spot_features, celltype_features], dim=0)
-        
-        # 2. 构建边（torch 向量化，避免 sklearn + Python 双重循环）
+
+        # 2. 构建边
         edge_indices: List[torch.Tensor] = []
         edge_attrs: List[torch.Tensor] = []
-        
-        # 2.1 Spot-Spot边（空间KNN或嵌入KNN）
+
+        # 2.1 Spot-Spot边（空间KNN — cached when using spatial coords）
         if n_spots > 1 and self.k_spatial > 0:
-            k_spatial = min(int(self.k_spatial), n_spots - 1)
-            with torch.no_grad():
-                if (
-                    not use_embedding_knn
-                    and spatial_coords is not None
-                    and spatial_coords.shape[0] > 1
-                ):
-                    # Euclidean KNN in spatial space
-                    dists = torch.cdist(spatial_coords, spatial_coords)  # [n_spots, n_spots]
-                else:
-                    # Cosine distance KNN in embedding space: dist = 1 - cos_sim
-                    spot_norm = F.normalize(spot_embeddings, p=2, dim=1)
-                    sim = spot_norm @ spot_norm.t()
-                    dists = 1.0 - sim
+            sp_ei, sp_ea = self._build_spatial_edges(
+                spatial_coords, spot_embeddings, use_embedding_knn)
+            edge_indices.append(sp_ei)
+            edge_attrs.append(sp_ea)
 
-                # Exclude self
-                diag_idx = torch.arange(n_spots, device=device)
-                dists[diag_idx, diag_idx] = float('inf')
-
-                knn_dists, knn_idx = torch.topk(dists, k=k_spatial, largest=False)
-                dist_std = knn_dists.std()
-                weights = torch.exp(-knn_dists / (dist_std + 1e-8)).reshape(-1, 1)
-
-                src = torch.arange(n_spots, device=device).unsqueeze(1).expand(-1, k_spatial)
-                src_flat = src.reshape(-1)
-                dst_flat = knn_idx.reshape(-1)
-
-                edge_indices.append(torch.stack([src_flat, dst_flat], dim=0))
-                edge_indices.append(torch.stack([dst_flat, src_flat], dim=0))
-                edge_attrs.append(weights)
-                edge_attrs.append(weights)
-        
         # 2.2 Spot-CellType边（每个spot连接k个最相似的celltype）
         if n_spots > 0 and n_cell_types > 0 and self.k_celltype > 0:
             k_neighbors = min(int(self.k_celltype), n_cell_types)
             with torch.no_grad():
-                # Cosine similarity in original VAE embedding space
                 spot_norm = F.normalize(spot_embeddings, p=2, dim=1)
                 cell_norm = F.normalize(celltype_prototypes, p=2, dim=1)
-                sim_matrix = spot_norm @ cell_norm.t()  # [n_spots, n_cell_types]
+                sim_matrix = spot_norm @ cell_norm.t()
 
                 top_sim, top_idx = torch.topk(sim_matrix, k=k_neighbors, dim=1, largest=True)
 
@@ -592,15 +627,14 @@ class HeterogeneousGATDeconvolution(nn.Module):
                 edge_indices.append(torch.stack([dst_node, src], dim=0))
                 edge_attrs.append(sim_vals)
                 edge_attrs.append(sim_vals)
-        
-        # 拼接为 tensor
+
         if edge_indices:
             edge_index = torch.cat(edge_indices, dim=1).to(torch.long)
             edge_attr = torch.cat(edge_attrs, dim=0).to(torch.float)
         else:
             edge_index = torch.zeros((2, 0), dtype=torch.long, device=device)
             edge_attr = torch.zeros((0, 1), dtype=torch.float, device=device)
-        
+
         return edge_index, edge_attr, node_features
     
     def forward(self, 
@@ -982,17 +1016,13 @@ class SpatialDeconvolutionLoss(nn.Module):
             corr = numerator / (denominator + 1e-8)
             return corr
         
-        # # Log-transform (避免高表达基因主导)
-        # reconstructed_log = torch.log1p(reconstructed_spot_marker)
-        # true_log = torch.log1p(true_spot_expression)
-
-
-        # normalize_total 到 1e4 并 log1p
+        # Log-transform: 用 log1p 压缩量级差异，避免高表达基因主导
+        # 只对真值做 normalize_total（作为参考标准），预测不归一化，让模型学到正确的 scale
         def normalize_total(mat, target_sum=1e4):
             scale = target_sum / (mat.sum(dim=1, keepdim=True) + 1e-8)
             return mat * scale
 
-        reconstructed_log = torch.log1p(normalize_total(reconstructed_spot_marker, 1e4))
+        reconstructed_log = torch.log1p(reconstructed_spot_marker)
         true_log = torch.log1p(normalize_total(true_spot_expression, 1e4))
 
         pearson_corr = pearson_correlation(reconstructed_log, true_log)
@@ -1017,19 +1047,23 @@ class SpatialDeconvolutionLoss(nn.Module):
         sparsity_loss = -torch.mean(attention_weights * torch.log(attention_weights + 1e-8))
 
         # ============ 6. 基因维度 Pearson/Cosine（跨 spot） ============
+        # NOTE: 这些指标跨 batch 维度计算，统计量随 batch 组成变化，
+        # 不适合做训练 loss（梯度不稳定），但仍作为监控指标记录。
+        # lambda_gene_pearson / lambda_gene_cosine 默认为 0，不参与梯度。
         gene_pearson_loss = torch.tensor(0.0, device=attention_weights.device)
         gene_cosine_loss = torch.tensor(0.0, device=attention_weights.device)
-        if reconstructed_log.shape[0] > 1:  # 至少两个spot才有意义
-            rec_T = reconstructed_log.transpose(0, 1)  # [n_genes, batch]
-            true_T = true_log.transpose(0, 1)
-            rec_centered = rec_T - rec_T.mean(dim=1, keepdim=True)
-            true_centered = true_T - true_T.mean(dim=1, keepdim=True)
-            num = (rec_centered * true_centered).sum(dim=1)
-            denom = torch.sqrt((rec_centered.pow(2).sum(dim=1)) * (true_centered.pow(2).sum(dim=1)) + 1e-8)
-            gene_corr = num / (denom + 1e-8)
-            gene_pearson_loss = 1.0 - gene_corr.mean()
-            gene_cos = F.cosine_similarity(rec_T, true_T, dim=1)
-            gene_cosine_loss = 1.0 - gene_cos.mean()
+        if reconstructed_log.shape[0] > 1:
+            with torch.no_grad():
+                rec_T = reconstructed_log.detach().transpose(0, 1)
+                true_T = true_log.detach().transpose(0, 1)
+                rec_centered = rec_T - rec_T.mean(dim=1, keepdim=True)
+                true_centered = true_T - true_T.mean(dim=1, keepdim=True)
+                num = (rec_centered * true_centered).sum(dim=1)
+                denom = torch.sqrt((rec_centered.pow(2).sum(dim=1)) * (true_centered.pow(2).sum(dim=1)) + 1e-8)
+                gene_corr = num / (denom + 1e-8)
+                gene_pearson_loss = 1.0 - gene_corr.mean()
+                gene_cos = F.cosine_similarity(rec_T, true_T, dim=1)
+                gene_cosine_loss = 1.0 - gene_cos.mean()
 
         proportion_loss = torch.tensor(0.0, device=attention_weights.device)
         
@@ -1085,29 +1119,81 @@ import anndata as ad
 
 class SimpleDataset:
     """Simple dataset for VAE training"""
-    def __init__(self, X, modality):
+    def __init__(self, X, modality, labels=None):
         self.X = torch.FloatTensor(X)
         self.modality = torch.LongTensor(modality)
-    
+        # labels: cluster id for SC cells, -1 for ST spots (no ground truth)
+        if labels is not None:
+            self.labels = torch.LongTensor(labels)
+        else:
+            self.labels = torch.full((len(X),), -1, dtype=torch.long)
+
     def __len__(self):
         return len(self.X)
-    
+
     def __getitem__(self, idx):
-        return self.X[idx], self.modality[idx]
+        return self.X[idx], self.modality[idx], self.labels[idx]
+
+
+def _compute_conditional_mmd(z, sc_mask, st_mask, batch_labels, device):
+    """Compute per-celltype conditional MMD between SC and ST embeddings.
+
+    For SC cells, ``batch_labels`` carries the ground-truth cluster id.
+    For ST spots, ``batch_labels == -1``; these are assigned a pseudo-label
+    by nearest SC cluster centroid in latent space.
+
+    Falls back to global MMD when conditional matching yields too few
+    per-type pairs (< 4 samples on either side).
+    """
+    sc_z = z[sc_mask]
+    st_z = z[st_mask]
+    sc_labels = batch_labels[sc_mask]
+    st_labels = batch_labels[st_mask]
+
+    # Assign pseudo-labels to ST spots (those with label == -1)
+    needs_pseudo = (st_labels == -1)
+    if needs_pseudo.any() and len(sc_z) > 0:
+        unique_labels = sc_labels.unique()
+        # Compute SC cluster centroids
+        centroids = torch.stack([sc_z[sc_labels == lb].mean(dim=0) for lb in unique_labels])
+        # Assign each ST spot to nearest centroid
+        dists = torch.cdist(st_z[needs_pseudo], centroids)
+        pseudo_ids = unique_labels[dists.argmin(dim=1)]
+        st_labels = st_labels.clone()
+        st_labels[needs_pseudo] = pseudo_ids
+
+    # Accumulate per-celltype MMD
+    all_labels = torch.cat([sc_labels, st_labels]).unique()
+    mmd_total = torch.tensor(0.0, device=device)
+    n_valid = 0
+    min_samples = 4  # need enough samples for meaningful kernel estimate
+
+    for lb in all_labels:
+        sc_ct = sc_z[sc_labels == lb]
+        st_ct = st_z[st_labels == lb]
+        if len(sc_ct) >= min_samples and len(st_ct) >= min_samples:
+            mmd_total = mmd_total + compute_mmd(sc_ct, st_ct, kernel='rbf')
+            n_valid += 1
+
+    if n_valid > 0:
+        return mmd_total / n_valid
+
+    # Fallback: global MMD (not enough per-type samples in this batch)
+    return compute_mmd(sc_z, st_z, kernel='rbf')
 
 
 def train_vae_epoch(vae, train_loader, optimizer, device, loss_type='mse', beta=1.0, lambda_mmd=0.0):
     """Train VAE for one epoch
-    
+
     Args:
         vae: VAE model (can be VAE or DualDecoderVAE)
-        train_loader: Training data loader
+        train_loader: Training data loader (yields (data, modality, labels))
         optimizer: Optimizer
         device: Device (cuda/cpu)
         loss_type: 'mse' or 'zinb'
         beta: KL divergence weight
         lambda_mmd: MMD loss weight
-    
+
     Returns:
         avg_loss, avg_recon, avg_kl, avg_mmd
     """
@@ -1116,19 +1202,19 @@ def train_vae_epoch(vae, train_loader, optimizer, device, loss_type='mse', beta=
     epoch_recon = 0.0
     epoch_kl = 0.0
     epoch_mmd = 0.0
-    
+
     # 检查是否是双解码器架构
     is_dual_decoder = hasattr(vae, 'decoder_sc') and hasattr(vae, 'decoder_st')
-    
-    for batch_data, batch_modality in train_loader:
+
+    for batch_data, batch_modality, batch_labels in train_loader:
         batch_data = batch_data.to(device)
         batch_modality = batch_modality.to(device)
-        
+        batch_labels = batch_labels.to(device)
+
         optimizer.zero_grad()
-        
+
         # VAE forward pass
         if is_dual_decoder:
-            # 双解码器: 需要传入modality参数
             if loss_type == 'zinb':
                 mean, disp, pi, mu, log_var, z = vae(batch_data, batch_modality)
                 total_loss, recon_loss, kl_div = zinb_loss_function(
@@ -1143,37 +1229,39 @@ def train_vae_epoch(vae, train_loader, optimizer, device, loss_type='mse', beta=
         # Compute MMD loss for modality alignment
         mmd_loss = torch.tensor(0.0, device=device)
         if lambda_mmd > 0:
-            # Separate SC and ST embeddings in this batch
             sc_mask = batch_modality == 0
             st_mask = batch_modality == 1
-            
-            # Only compute MMD if both modalities present in batch
+
             if sc_mask.sum() > 0 and st_mask.sum() > 0:
-                sc_embeddings = z[sc_mask]
-                st_embeddings = z[st_mask]
-                mmd_loss = compute_mmd(sc_embeddings, st_embeddings, kernel='rbf')
-        
+                # Use conditional MMD when labels are available (any non -1 label)
+                has_labels = (batch_labels != -1).any()
+                if has_labels:
+                    mmd_loss = _compute_conditional_mmd(
+                        z, sc_mask, st_mask, batch_labels, device)
+                else:
+                    mmd_loss = compute_mmd(z[sc_mask], z[st_mask], kernel='rbf')
+
         # Total loss with MMD
         total_loss = total_loss + lambda_mmd * mmd_loss
-        
+
         # Normalize loss
         total_loss = total_loss / len(batch_data)
         recon_loss = recon_loss / len(batch_data)
         kl_div = kl_div / len(batch_data)
-        
+
         total_loss.backward()
         optimizer.step()
-        
+
         epoch_loss += total_loss.item()
         epoch_recon += recon_loss.item()
         epoch_kl += kl_div.item()
         epoch_mmd += mmd_loss.item() if lambda_mmd > 0 else 0.0
-    
+
     avg_loss = epoch_loss / len(train_loader)
     avg_recon = epoch_recon / len(train_loader)
     avg_kl = epoch_kl / len(train_loader)
     avg_mmd = epoch_mmd / len(train_loader)
-    
+
     return avg_loss, avg_recon, avg_kl, avg_mmd
 
 
@@ -1197,12 +1285,12 @@ def evaluate_vae(vae, test_loader, device, loss_type='mse', beta=1.0):
     is_dual_decoder = hasattr(vae, 'decoder_sc') and hasattr(vae, 'decoder_st')
     
     with torch.no_grad():
-        for batch_data, batch_modality in test_loader:
-            batch_data = batch_data.to(device)
-            batch_modality = batch_modality.to(device)
-            
+        for batch in test_loader:
+            batch_data = batch[0].to(device)
+            batch_modality = batch[1].to(device)
+            # batch[2] is labels, not needed for evaluation loss
+
             if is_dual_decoder:
-                # 双解码器: 需要传入modality参数
                 if loss_type == 'zinb':
                     mean, disp, pi, mu, log_var, z = vae(batch_data, batch_modality)
                     loss, _, _ = zinb_loss_function(mean, disp, pi, batch_data, mu, log_var, beta)
@@ -1210,25 +1298,24 @@ def evaluate_vae(vae, test_loader, device, loss_type='mse', beta=1.0):
                     recon_data, mu, log_var, z = vae(batch_data, batch_modality)
                     loss, _, _ = vae_loss_function(recon_data, batch_data, mu, log_var, beta)
             else:
-                # 单解码器: 不需要modality参数
                 if loss_type == 'zinb':
                     mean, disp, pi, mu, log_var, z = vae(batch_data)
                     loss, _, _ = zinb_loss_function(mean, disp, pi, batch_data, mu, log_var, beta)
                 else:
                     recon_data, mu, log_var, z = vae(batch_data)
                     loss, _, _ = vae_loss_function(recon_data, batch_data, mu, log_var, beta)
-                
+
             total_loss += loss.item() / len(batch_data)
-    
+
     return total_loss / len(test_loader)
 
 
 def train_vae(vae, train_X, test_X, train_modality, test_modality, device,
-              batch_size=256, n_epochs=100, lr=1e-3, beta=1.0, loss_type='mse', 
+              batch_size=256, n_epochs=100, lr=1e-3, beta=1.0, loss_type='mse',
               lambda_mmd=1.0, output_dir="./stage1_results", print_every=50,
-              patience=20, min_delta=1.0):
+              patience=20, min_delta=1.0, train_labels=None, test_labels=None):
     """Train VAE with optional MMD loss for modality alignment
-    
+
     Args:
         vae: VAE model
         train_X: Training data
@@ -1244,18 +1331,20 @@ def train_vae(vae, train_X, test_X, train_modality, test_modality, device,
         lambda_mmd: MMD loss weight
         output_dir: Output directory for saving plots
         print_every: Print loss every N epochs (default: 50)
-    
+        train_labels: Cluster labels for training data (SC: cluster id, ST: -1). Enables conditional MMD.
+        test_labels: Cluster labels for test data.
+
     Returns:
         best_loss
     """
     # Data loader
     from torch.utils.data import DataLoader
-    train_dataset = SimpleDataset(train_X, train_modality)
+    train_dataset = SimpleDataset(train_X, train_modality, train_labels)
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    
+
     # Create test loader only if test data exists
     if test_X is not None:
-        test_dataset = SimpleDataset(test_X, test_modality)
+        test_dataset = SimpleDataset(test_X, test_modality, test_labels)
         test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
     else:
         test_loader = None

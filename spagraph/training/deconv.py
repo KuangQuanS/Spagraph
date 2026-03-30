@@ -136,8 +136,8 @@ def run_deconv(
     lambda_pearson: float = 1,
     lambda_mse: float = 0,
     lambda_cosine: float = 5.0,
-    lambda_gene_pearson: float = 1,
-    lambda_gene_cosine: float = 5.0,
+    lambda_gene_pearson: float = 0,   # disabled: gene-level metrics are batch-dependent, used for monitoring only
+    lambda_gene_cosine: float = 0,    # disabled: gene-level metrics are batch-dependent, used for monitoring only
     lambda_reg: float = 0.1,
     lambda_sparse: float = 0,
     lambda_proportion: float = 0.01,
@@ -639,14 +639,15 @@ def run_deconv_auto_k(
             **deconv_kwargs
         )
         
-        # 计算评分：mse + cosine + gene_pearson（越小越好）
+        # 计算评分：pearson + cosine（越小越好）
+        # gene_pearson/gene_cosine 仅作监控指标，不参与选 k
         pearson = result['metrics']['pearson']
         cosine = result['metrics']['cosine']
         mse = result['metrics']['mse']
         gene_pearson = result['metrics']['gene_pearson']
         gene_cosine = result['metrics']['gene_cosine']
-        score = gene_cosine + cosine
-        
+        score = pearson + cosine
+
         # 保存摘要（不保存完整的 deconv 矩阵，节省内存）
         trial_summary = {
             'k_celltype': k,
@@ -658,17 +659,17 @@ def run_deconv_auto_k(
             'score': score
         }
         all_trials.append(trial_summary)
-        
+
         # 更新最优结果（保存完整结果）
         is_best = score < best_score
         if is_best:
             best_score = score
             best_k = k
             best_result = result  # 保留最优的完整结果
-        
+
         # 打印结果（紧凑格式）
         status = "*" if is_best else " "
-        print(f"{status} Score={score:.4f} (C={cosine:.4f}, GC={gene_cosine:.4f})")
+        print(f"{status} Score={score:.4f} (P={pearson:.4f}, C={cosine:.4f})")
         
         # 如果启用 save_all_trials 且提供了 output_dir，保存当前trial的deconv矩阵
         if save_all_trials and output_dir is not None:

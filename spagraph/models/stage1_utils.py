@@ -150,9 +150,9 @@ def compute_clusters_and_marker_genes(adata,
 
                     clf.fit(X, y)
                     coef = clf.coef_.ravel()
-                    
-                    final_selected_genes = [g for g, c in zip(selected_genes, coef) if abs(c) > 1e-5]
-                    final_selected_genes = sorted(final_selected_genes, key=lambda g: abs(coef[selected_genes.index(g)]), reverse=True)
+
+                    gene_to_coef = {g: abs(c) for g, c in zip(selected_genes, coef) if abs(c) > 1e-5}
+                    final_selected_genes = sorted(gene_to_coef, key=gene_to_coef.get, reverse=True)
     
                 elif marker_selection_method == 'variance':
                     # Apply variance threshold filtering
@@ -173,17 +173,17 @@ def compute_clusters_and_marker_genes(adata,
                     X = sub_adata.X
                     if hasattr(X, 'toarray'):
                         X = X.toarray()
-                    
-                    # Calculate correlation with cluster membership
-                    y = (adata_full.obs['leiden'] == cluster).astype(int)
-                    correlations = []
-                    for i in range(X.shape[1]):
-                        corr = np.corrcoef(X[:, i], y)[0, 1]
-                        if not np.isnan(corr):
-                            correlations.append(abs(corr))
-                        else:
-                            correlations.append(0)
-                    
+
+                    # Vectorized Pearson correlation with cluster membership
+                    y = (adata_full.obs['leiden'] == cluster).values.astype(np.float64)
+                    X_f = X.astype(np.float64)
+                    X_centered = X_f - X_f.mean(axis=0)
+                    y_centered = y - y.mean()
+                    numer = (X_centered * y_centered[:, None]).sum(axis=0)
+                    denom = np.sqrt((X_centered ** 2).sum(axis=0) * (y_centered ** 2).sum() + 1e-12)
+                    correlations = np.abs(numer / denom)
+                    correlations = np.nan_to_num(correlations, nan=0.0)
+
                     # Select genes with highest absolute correlation
                     top_indices = np.argsort(correlations)[-min(len(selected_genes), top_n):]
                     final_selected_genes = [selected_genes[i] for i in top_indices]

@@ -34,16 +34,16 @@ def _require_existing(path: Path) -> None:
     if not path.exists():
         raise FileNotFoundError(f"Required input is missing: {path}")
 
-# ================= 配置区域 =================
-# GSE243275
-# DATA_DIR = Path("./evaluate/GSE243275")
-# ST_H5AD_PATH = Path("./database/GSE243275/GSM7782699_ST.h5ad")
-# TARGET_LR_PAIRS = ["DLL4_NOTCH3", "VEGFC_KDR", "PDGFD_PDGFRB", "FN1_CD44"]
-# SPOT_DISPLAY_SIZE = 50      # Spot显示大小：控制空间图上点的大小（用于空间中心性图等）
-# TOP_PAIRS = 15            # Top配体对数量：柱状图中显示频率/注意力最高的前N个LR配体对
-# TOP_SPOTS = 200           # Top Spots数量：空间图上高亮显示得分最高的前N个spots
-# TOP_EDGES_PER_PAIR = 100  # 每个配体对的连线数：空间连线图中每个LR对最多显示N条得分最高的边，防止图像过于混乱
-# offset_range = 20.0       # 抖动范围：为重叠的点添加随机偏移量，避免空间连线图中的点完全重叠
+#================= 配置区域 =================
+#GSE243275
+DATA_DIR = Path("D:\Spagraph\evaluate\data\GSE243275")
+ST_H5AD_PATH = Path("D:\Spagraph\spagraph_data\database\GSE243275\GSM7782699_ST.h5ad")
+TARGET_LR_PAIRS = ["DLL4_NOTCH3", "VEGFC_KDR", "PDGFD_PDGFRB", "FN1_CD44"]
+SPOT_DISPLAY_SIZE = 50      # Spot显示大小：控制空间图上点的大小（用于空间中心性图等）
+TOP_PAIRS = 15            # Top配体对数量：柱状图中显示频率/注意力最高的前N个LR配体对
+TOP_SPOTS = 200           # Top Spots数量：空间图上高亮显示得分最高的前N个spots
+TOP_EDGES_PER_PAIR = 100  # 每个配体对的连线数：空间连线图中每个LR对最多显示N条得分最高的边，防止图像过于混乱
+offset_range = 20.0       # 抖动范围：为重叠的点添加随机偏移量，避免空间连线图中的点完全重叠
 
 # CID44971
 # DATA_DIR = Path("./evaluate/CID44971")
@@ -55,17 +55,17 @@ def _require_existing(path: Path) -> None:
 # TOP_EDGES_PER_PAIR = 100  # 每个配体对的连线数：空间连线图中每个LR对最多显示N条得分最高的边，防止图像过于混乱
 # offset_range = 20.0       # 抖动范围：为重叠的点添加随机偏移量，避免空间连线图中的点完全重叠
 
-# GSE144236
-DATA_DIR = DATA_ROOT / "GSE144236"
-ST_H5AD_PATH = DATABASE_ROOT / "GSE144240" / "GSE144236_P2_ST.h5ad"
-#TARGET_LR_PAIRS = ["LAMB3_CD44", "ANGPTL4_SDC1", "LAMB3_ITGA6_ITGB1"]
-TARGET_LR_PAIRS = ["ANXA1"]
-SPOT_DISPLAY_SIZE = 150
-TOP_SPOTS = 50
-TOP_PAIRS = 15            # Top配体对数量：柱状图中显示频率/注意力最高的前N个LR配体对
-TOP_SPOTS = 50           # Top Spots数量：空间图上高亮显示得分最高的前N个spots
-TOP_EDGES_PER_PAIR = 50  # 每个配体对的连线数：空间连线图中每个LR对最多显示N条得分最高的边，防止图像过于混乱
-offset_range = 20.0       # 抖动范围：为重叠的点添加随机偏移量，避免空间连线图中的点完全重叠
+# # GSE144236
+# DATA_DIR = DATA_ROOT / "GSE144236"
+# ST_H5AD_PATH = DATABASE_ROOT / "GSE144240" / "GSE144236_P2_ST.h5ad"
+# #TARGET_LR_PAIRS = ["LAMB3_CD44", "ANGPTL4_SDC1", "LAMB3_ITGA6_ITGB1"]
+# TARGET_LR_PAIRS = ["ANXA1"]
+# SPOT_DISPLAY_SIZE = 150
+# TOP_SPOTS = 50
+# TOP_PAIRS = 15            # Top配体对数量：柱状图中显示频率/注意力最高的前N个LR配体对
+# TOP_SPOTS = 50           # Top Spots数量：空间图上高亮显示得分最高的前N个spots
+# TOP_EDGES_PER_PAIR = 50  # 每个配体对的连线数：空间连线图中每个LR对最多显示N条得分最高的边，防止图像过于混乱
+# offset_range = 20.0       # 抖动范围：为重叠的点添加随机偏移量，避免空间连线图中的点完全重叠
 
 # GSE211956_P2
 # DATA_DIR = Path("./evaluate/GSE211956/P2")

@@ -169,23 +169,19 @@ def plot_gene_heatmaps(coords, gt_vec, pred_vec, target_gene: str, output_pdf: s
     print(summarize("GT", gt_vec))
     print(summarize("Pred", pred_vec))
 
-    # 为 Ground truth 与 Prediction 分别绘制两张干净的图片（无坐标轴）
-
-    # 绘制单张的帮助函数
-    def _plot_single(vals, title, outpath, caption=None):
+    # 娑?Ground truth 娑?Prediction 閸掑棗鍩嗙紒妯哄煑娑撱倕绱堕獮鎻掑櫍閻ㄥ嫬娴橀悧鍥风礄閺冪姴娼楅弽鍥叡閿?
+    # 缂佹ê鍩楅崡鏇炵炊閻ㄥ嫬搴滈崝鈺佸毐閺?    def _plot_single(vals, title, outpath, caption=None):
         vmax = np.percentile(vals, clip_percentile)
         vmin = np.percentile(vals, 100 - clip_percentile) if log1p else 0.0
         fig, ax = plt.subplots(1, 1, figsize=(6, 6), dpi=300)
         
-        # 设置背景为白色
-        bg_color = 'white'
+        # 鐠佸墽鐤嗛懗灞炬珯娑撹櫣娅ч懝?        bg_color = 'white'
         fig.patch.set_facecolor(bg_color)
         ax.set_facecolor(bg_color)
         
         sc = ax.scatter(coords[:, 0], coords[:, 1], c=vals, cmap="viridis", s=16, vmin=vmin, vmax=vmax, edgecolors='none')
         ax.set_title(f"{title} - {target_gene}", fontsize=12, fontweight='bold')
-        # 移除刻度与脊线，不保留色条
-        ax.set_xticks([]); ax.set_yticks([])
+        # 缁夊娅庨崚璇插娑撳氦鍓ㄧ痪鍖＄礉娑撳秳绻氶悾娆掑閺?        ax.set_xticks([]); ax.set_yticks([])
         for spine in ax.spines.values():
             spine.set_visible(False)
         ax.set_aspect('equal')
@@ -360,17 +356,24 @@ def compute_metrics(gt_mat: np.ndarray, pred_mat: np.ndarray, genes):
 def compute_ars(metrics_list: List[pd.DataFrame]) -> pd.DataFrame:
     """Compute Average Ranking Score (ARS) for multiple methods.
     
-    ARS aggregates PCC, SSIM, RMSE, and JSD to evaluate relative accuracy.
-    Ranking rules:
-    - PCC, SSIM: ascending order (smallest value gets rank 1)
-    - RMSE, JS: descending order (largest value gets rank 1)
-    - ARS: higher is better
+    ARS is computed in three steps:
+    1. For each method, average PCC / SSIM / RMSE / JS across all rows in its metrics DataFrame.
+    2. Rank methods separately for each averaged metric using the ranking directions defined below.
+    3. Average the four ranks and divide by (4 * number of methods) to normalize the score.
+    
+    Important note:
+    - This implementation treats a larger rank value as better overall, so ARS is interpreted as higher-is-better.
+    - In other words, ARS here is a normalized average rank score, not a direct average of raw metric values.
+    
+    Ranking directions used by this implementation:
+    - PCC, SSIM: ascending=True in pandas.rank()
+    - RMSE, JS: ascending=False in pandas.rank()
     
     Args:
-        metrics_list: List of DataFrames, each containing metrics for one method
+        metrics_list: List of DataFrames, each containing metrics for one method.
         
     Returns:
-        DataFrame with method rankings and ARS scores
+        DataFrame with per-method mean metrics, ranks, and ARS scores.
     """
     if len(metrics_list) == 0:
         return pd.DataFrame()
@@ -390,16 +393,16 @@ def compute_ars(metrics_list: List[pd.DataFrame]) -> pd.DataFrame:
     
     stats_df = pd.DataFrame(method_stats)
     
-    # Rank methods
-    # PCC/SSIM: ascending=True → smallest value gets rank 1
-    # RMSE/JS: ascending=False → largest value gets rank 1
+    # Rank methods on the per-method mean metrics.
+    # In this implementation, larger rank values correspond to better overall performance.
+    # Therefore the final ARS is interpreted as higher-is-better.
     stats_df['rank_pcc'] = stats_df['mean_pcc'].rank(ascending=True, method='average')
     stats_df['rank_ssim'] = stats_df['mean_ssim'].rank(ascending=True, method='average')
     stats_df['rank_rmse'] = stats_df['mean_rmse'].rank(ascending=False, method='average')
     stats_df['rank_js'] = stats_df['mean_js'].rank(ascending=False, method='average')
     
-    # Compute ARS as sum of ranks divided by (4 * number of methods)
-    # This normalizes ARS to be between 0 and 1, with 1 being the best
+    # Compute ARS as the normalized average of the four metric ranks.
+    # Because better methods receive larger overall ranks in this implementation, ARS is higher-is-better.
     stats_df['ARS'] = (stats_df['rank_pcc'] + stats_df['rank_ssim'] + 
                        stats_df['rank_rmse'] + stats_df['rank_js']) / (4.0 * n_methods)
     
@@ -424,8 +427,7 @@ def save_ars_barplot(ars_df: pd.DataFrame, labels: List[str], output_csv: str):
         'Stereoscope': '#999999'
     }
     
-    # 动态调整图表高度
-    fig_height = max(6, len(labels) * 0.5)
+    # 閸斻劍鈧浇鐨熼弫鏉戞禈鐞涖劑鐝惔?    fig_height = max(6, len(labels) * 0.5)
     fig, ax = plt.subplots(figsize=(8, fig_height))
     
     # Prepare data with method names
@@ -443,13 +445,11 @@ def save_ars_barplot(ars_df: pd.DataFrame, labels: List[str], output_csv: str):
     bars = ax.barh(y_pos, ars_values, color=bar_colors, alpha=0.8, height=0.7, 
                    edgecolor='black', linewidth=0.5)
     
-    # 添加数值标签
-    for i, (bar, ars_val) in enumerate(zip(bars, ars_values)):
+    # 濞ｈ濮為弫鏉库偓鍏肩垼缁?    for i, (bar, ars_val) in enumerate(zip(bars, ars_values)):
         ax.text(ars_val + 0.01, bar.get_y() + bar.get_height()/2, 
                 f'{ars_val:.3f}', ha='left', va='center', fontsize=10, fontweight='bold')
     
-    # 反转y轴，使第一个方法显示在顶部
-    ax.invert_yaxis()
+    # 閸欏秷娴唝鏉炶揪绱濇担璺儑娑撯偓娑擃亝鏌熷▔鏇熸▔缁€鍝勬躬妞ゅ爼鍎?    ax.invert_yaxis()
     
     ax.set_yticks(y_pos)
     ax.set_yticklabels(method_names, fontsize=12)
@@ -458,8 +458,7 @@ def save_ars_barplot(ars_df: pd.DataFrame, labels: List[str], output_csv: str):
     ax.grid(True, alpha=0.3, linestyle='--', axis='x')
     ax.tick_params(axis='y', labelsize=12)
     
-    # 移除顶部和右侧边框
-    ax.spines['top'].set_visible(False)
+    # 缁夊娅庢い鍫曞劥閸滃苯褰告笟褑绔熷?    ax.spines['top'].set_visible(False)
     ax.spines['right'].set_visible(False)
     
     plt.tight_layout()
@@ -572,21 +571,17 @@ def save_multi_boxplots(metrics_list: List[pd.DataFrame], labels: List[str],
     # Get colors for labels
     box_colors = [colors.get(label, '#0072B2') for label in labels]
     
-    # 为每个指标创建独立的横向箱型图
-    out_prefix = output_csv.rsplit('.', 1)[0]
+    # 娑撶儤鐦℃稉顏呭瘹閺嶅洤鍨卞铏瑰缁斿娈戝Ο顏勬倻缁犲崬鐎烽崶?    out_prefix = output_csv.rsplit('.', 1)[0]
     
     for metric in metric_cols:
-        # 收集该指标在所有方法上的数据
-        box_data = []
+        # 閺€鍫曟肠鐠囥儲瀵氶弽鍥ф躬閹碘偓閺堝鏌熷▔鏇氱瑐閻ㄥ嫭鏆熼幑?        box_data = []
         for m in metrics_list:
             box_data.append(m[metric].dropna().values)
         
-        # 动态调整图表高度：根据数据集数量
-        fig_height = max(6, n_methods * 0.25)
+        # 閸斻劍鈧浇鐨熼弫鏉戞禈鐞涖劑鐝惔锔肩窗閺嶈宓侀弫鐗堝祦闂嗗棙鏆熼柌?        fig_height = max(6, n_methods * 0.25)
         fig, ax = plt.subplots(figsize=(8, fig_height))
         
-        # 绘制横向箱线图（采用你喜欢的样式）
-        bp = ax.boxplot(box_data, vert=False, tick_labels=labels, patch_artist=True,
+        # 缂佹ê鍩楀Ο顏勬倻缁犺京鍤庨崶鎾呯礄闁插洨鏁ゆ担鐘叉灘濞嗐垻娈戦弽宄扮础閿?        bp = ax.boxplot(box_data, vert=False, tick_labels=labels, patch_artist=True,
                        whis=[5, 95], showfliers=False,
                        showmeans=True,
                        meanprops=dict(marker='D', markerfacecolor='#FF8C00', markeredgecolor='black', 
@@ -596,28 +591,23 @@ def save_multi_boxplots(metrics_list: List[pd.DataFrame], labels: List[str],
                        capprops=dict(color='black', linewidth=1.5),
                        boxprops=dict(linewidth=1.5))
         
-        # 给每个箱子上色
-        for patch, color in zip(bp['boxes'], box_colors):
+        # 缂佹瑦鐦℃稉顏嗩唸鐎涙劒绗傞懝?        for patch, color in zip(bp['boxes'], box_colors):
             patch.set_facecolor(color)
             patch.set_alpha(0.8)
             patch.set_edgecolor('black')
             patch.set_linewidth(1)
         
-        # 反转y轴，使第一个方法显示在顶部
-        ax.invert_yaxis()
+        # 閸欏秷娴唝鏉炶揪绱濇担璺儑娑撯偓娑擃亝鏌熷▔鏇熸▔缁€鍝勬躬妞ゅ爼鍎?        ax.invert_yaxis()
         
-        # 设置标签和标题
-        ax.set_xlabel(metric.replace('_', ' ').upper(), fontsize=14)
+        # 鐠佸墽鐤嗛弽鍥╊劮閸滃本鐖ｆ０?        ax.set_xlabel(metric.replace('_', ' ').upper(), fontsize=14)
         #ax.set_title(f'{metric.replace("_", " ").upper()} Distribution (n={n_methods})', fontsize=16, fontweight='bold', pad=20)
         ax.grid(True, alpha=0.3, linestyle='--', axis='x')
         ax.tick_params(axis='y', labelsize=12)
         
-        # 移除顶部和右侧边框
-        ax.spines['top'].set_visible(False)
+        # 缁夊娅庢い鍫曞劥閸滃苯褰告笟褑绔熷?        ax.spines['top'].set_visible(False)
         ax.spines['right'].set_visible(False)
         
-        # 保存单独的图片
-        metric_png = f"{out_prefix}_{metric}_boxplot.pdf"
+        # 娣囨繂鐡ㄩ崡鏇犲閻ㄥ嫬娴橀悧?        metric_png = f"{out_prefix}_{metric}_boxplot.pdf"
         plt.tight_layout()
         plt.savefig(metric_png, dpi=300, bbox_inches='tight')
         plt.close(fig)
@@ -889,7 +879,7 @@ def main():
             
             # Compute and display ARS for multiple methods
             print("\n" + "="*60)
-            print("Average Ranking Score (ARS) - Based on PCC, SSIM, RMSE, JS")
+            print("Average Ranking Score (ARS) - normalized average rank over mean PCC / SSIM / RMSE / JS")
             print("="*60)
             ars_df = compute_ars(metrics_list)
             for idx, row in ars_df.iterrows():
@@ -899,7 +889,7 @@ def main():
                 print(f"  Mean SSIM: {row['mean_ssim']:.4f} (Rank: {row['rank_ssim']:.1f})")
                 print(f"  Mean RMSE: {row['mean_rmse']:.4f} (Rank: {row['rank_rmse']:.1f})")
                 print(f"  Mean JS: {row['mean_js']:.4f} (Rank: {row['rank_js']:.1f})")
-                print(f"  >>> ARS: {row['ARS']:.4f} (Higher is better) <<<")
+                print(f"  >>> ARS: {row['ARS']:.4f} (normalized average rank; higher is better) <<<")
             
             # Save ARS to CSV
             ars_output = f"{out_prefix}_ARS.csv"
@@ -1003,8 +993,8 @@ def main():
             print(f"Target gene '{target_gene}' PCC: {pcc:.6f}" if np.isfinite(pcc) else
                   f"Target gene '{target_gene}' PCC: nan (zero variance or invalid values)")
 
-            # --- 新增: 计算并打印 GT 与预测（重建）的总测序深度信息 ---
-            # 对齐后按共有 spots 及共有 genes 计算总深度（sum over spots x genes）以及每 spot 的 mean/median
+            # --- 閺傛澘顤? 鐠侊紕鐣婚獮鑸靛ⅵ閸?GT 娑撳酣顣╁ù瀣剁礄闁插秴缂撻敍澶屾畱閹粯绁存惔蹇旂箒鎼达缚淇婇幁?---
+            # 鐎靛綊缍堥崥搴㈠瘻閸忚鲸婀?spots 閸欏﹤鍙￠張?genes 鐠侊紕鐣婚幀缁樼箒鎼达讣绱檚um over spots x genes閿涘浜掗崣濠冪槨 spot 閻?mean/median
             shared_spots = recon_df.index.intersection(gt_df.index if gt_path.lower().endswith(".csv") else gt_adata.obs_names)
             if len(shared_spots) > 0:
                 recon_sub = recon_df.loc[shared_spots].astype(float).replace([np.inf, -np.inf], np.nan).fillna(0)
@@ -1014,8 +1004,7 @@ def main():
                     gt_mat = gt_slice.X.toarray() if hasattr(gt_slice.X, "toarray") else gt_slice.X
                     gt_sub = pd.DataFrame(gt_mat, index=shared_spots, columns=[matched_gene])
 
-                # 若有基因列不一致，取交集以便公平比较
-                shared_genes = recon_sub.columns.intersection(gt_sub.columns)
+                # 閼汇儲婀侀崺鍝勬礈閸掓ぞ绗夋稉鈧懛杈剧礉閸欐牔姘﹂梿鍡曚簰娓氬灝鍙曢獮铏槷鏉?                shared_genes = recon_sub.columns.intersection(gt_sub.columns)
                 if len(shared_genes) == 0:
                     print("Warning: No overlapping genes found between reconstructed and ground truth when computing depths.")
                 else:

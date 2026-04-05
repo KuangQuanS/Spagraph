@@ -23,7 +23,7 @@ import matplotlib.pyplot as plt
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-EVALUATE_DIR = SCRIPT_DIR.parent
+EVALUATE_DIR = SCRIPT_DIR.parent.parent
 DATA_ROOT = EVALUATE_DIR / "data"
 REPO_ROOT = EVALUATE_DIR.parent
 DATABASE_ROOT = REPO_ROOT / "spagraph_data" / "database"

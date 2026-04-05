@@ -445,6 +445,10 @@ def plot_edges(
     edges = edges.dropna(subset=["src_x", "src_y", "dst_x", "dst_y"])
     if edges.empty:
         print(f"Skip {lr_name} ({score_col}): no edges with valid spatial coordinates")
+    edges["dst_y"] = edges["dst_spot_barcode"].map(coords["y"])
+    edges = edges.dropna(subset=["src_x", "src_y", "dst_x", "dst_y"])
+    if edges.empty:
+        print(f"Skip {lr_name} ({score_col}): no edges with valid spatial coordinates")
         return
 
     scores = edges[score_col].astype(float).to_numpy()
@@ -458,10 +462,10 @@ def plot_edges(
         norm_scores = (scores - score_min) / (score_max - score_min + 1e-12)
     else:
         norm_scores = np.zeros_like(scores, dtype=float)
-    widths = 1.0 + 1.8 * norm_scores
+    widths = 0.5 + 1.0 * norm_scores
 
     fig, ax = plt.subplots(figsize=FIG_SIZE)
-    sc.pl.spatial(adata, color=None, alpha_img=0.4, size=0.1, show=False, ax=ax)
+    sc.pl.spatial(adata, color=None, alpha_img=0.18, size=0, show=False, ax=ax)
 
     coords_plot = coords.copy()
     coords_plot[["x", "y"]] = coords_plot[["x", "y"]] * scale_factor
@@ -480,11 +484,10 @@ def plot_edges(
             ax.scatter(
                 region_coords["x"],
                 region_coords["y"],
-                s=PATHOLOGY_REGION_POINT_SIZE,
-                c=PATHOLOGY_REGION_FILL,
-                alpha=0.30,
-                edgecolors=PATHOLOGY_REGION_EDGE,
-                linewidths=0.55,
+                s=PATHOLOGY_REGION_POINT_SIZE * 0.7,
+                c="#F59E0B",
+                alpha=0.20,
+                edgecolors="none",
                 zorder=3,
             )
 
@@ -508,10 +511,9 @@ def plot_edges(
         if cell_type not in global_cell_to_marker:
             global_cell_to_marker[cell_type] = MARKERS[len(global_cell_to_marker) % len(MARKERS)]
 
-    line_color = "#2E8B57"
-    src_color = "#24C7D9"
-    dst_color = "#E048C8"
-    outline_effect = [pe.Stroke(linewidth=2.1, foreground="black"), pe.Normal()]
+    line_color = "#4B5563"  # Elegant gray for edges
+    src_color = "#0EA5E9"   # Modern cyan/blue
+    dst_color = "#EC4899"   # Modern pink
 
     valid_widths = widths[: len(edges)]
     rng = np.random.default_rng(_stable_seed(str(output_dir), lr_name))
@@ -524,53 +526,65 @@ def plot_edges(
 
         src_marker = global_cell_to_marker[row.source_cell]
         dst_marker = global_cell_to_marker[row.target_cell]
-        ax.scatter(
-            src_x_jitter,
-            src_y_jitter,
-            s=32,
-            color=src_color,
-            marker=src_marker,
-            edgecolor="black",
-            linewidth=0.35,
-            zorder=6,
-        )
-        ax.scatter(
-            dst_x_jitter,
-            dst_y_jitter,
-            s=32,
-            color=dst_color,
-            marker=dst_marker,
-            edgecolor="black",
-            linewidth=0.35,
-            zorder=6,
-        )
-
+        
+        # Draw elegant edge
         rad = 0.2 if dst_x_jitter > src_x_jitter else -0.2
         patch = FancyArrowPatch(
             (src_x_jitter, src_y_jitter),
             (dst_x_jitter, dst_y_jitter),
             connectionstyle=f"arc3,rad={rad}",
-            arrowstyle="-",
+            arrowstyle="-|>",
+            mutation_scale=5.0,
             linewidth=float(width),
             color=line_color,
-            alpha=0.72,
-            shrinkA=0.0,
-            shrinkB=0.0,
+            alpha=0.55,
+            shrinkA=3.0,
+            shrinkB=3.0,
             zorder=5,
         )
-        patch.set_path_effects(outline_effect)
         ax.add_patch(patch)
+
+        ax.scatter(
+            src_x_jitter,
+            src_y_jitter,
+            s=18,
+            color=src_color,
+            marker=src_marker,
+            edgecolor="white",
+            linewidth=0.3,
+            zorder=6,
+        )
+        ax.scatter(
+            dst_x_jitter,
+            dst_y_jitter,
+            s=18,
+            color=dst_color,
+            marker=dst_marker,
+            edgecolor="white",
+            linewidth=0.3,
+            zorder=6,
+        )
 
     if not ax.yaxis_inverted():
         ax.invert_yaxis()
+    ax.set_aspect("equal")
+
+    # ── Add a bounding box (frame) ────────────────────────────────
+    ax.set_xticks([])
+    ax.set_yticks([])
+    ax.set_xlabel("")
+    ax.set_ylabel("")
+    for spine in ax.spines.values():
+        spine.set_visible(True)
+        spine.set_color('black')
+        spine.set_linewidth(1.0)
 
     ax.set_title(
         f"{lr_name}\n({score_col})",
-        fontsize=TITLE_FONT_SIZE,
+        fontsize=TITLE_FONT_SIZE - 4,
         fontweight="bold",
-        pad=TITLE_PAD,
+        pad=10,
     )
-    ax.axis("off")
 
     celltype_elements = [
         Line2D(
@@ -586,23 +600,7 @@ def plot_edges(
         )
         for cell_type in current_cells
     ]
-    if celltype_elements:
-        cell_legend = ax.legend(
-            handles=celltype_elements,
-            loc="upper left",
-            bbox_to_anchor=(1.02, 0.98),
-            framealpha=0.92,
-            fancybox=True,
-            edgecolor="#D0D0D0",
-            fontsize=LEGEND_FONT_SIZE,
-            title="Cell Type",
-            title_fontsize=LEGEND_TITLE_FONT_SIZE,
-            labelspacing=0.35,
-            handletextpad=0.45,
-            borderpad=0.45,
-        )
-        ax.add_artist(cell_legend)
-
+    cell_legend = None
     overlay_elements = [
         Line2D([0], [0], color=line_color, linewidth=2.0, label="Interaction edge"),
         Line2D(
@@ -643,24 +641,28 @@ def plot_edges(
             )
         )
 
-    overlay_legend = ax.legend(
-        handles=overlay_elements,
-        loc="lower left",
-        bbox_to_anchor=(1.02, 0.04),
-        framealpha=0.90,
-        fancybox=True,
-        edgecolor="#D0D0D0",
-        fontsize=OVERLAY_LEGEND_FONT_SIZE,
-        labelspacing=0.30,
-        handletextpad=0.45,
-        borderpad=0.40,
+    # ── Combined Legend — anchored to FIGURE ────────────────────────────
+    all_legend_elements = celltype_elements + overlay_elements
+    fig.legend(
+        handles=all_legend_elements,
+        loc="center right",
+        frameon=False,
+        prop={"size": 9, "weight": "bold"},
+        title="Legend",
+        title_fontproperties={"size": 10, "weight": "bold"},
+        labelspacing=0.4,
+        handletextpad=0.5,
     )
-    ax.add_artist(overlay_legend)
+    # Adjust subplots to leave room on the right for fig.legend
+    plt.subplots_adjust(right=0.82)
 
     safe_name = lr_name.replace("/", "_")
     save_path = output_dir / f"{rank:02d}_{safe_name}_{score_col}.pdf"
-    plt.tight_layout(pad=0.5, rect=(0.0, 0.0, 0.82, 1.0))
-    plt.savefig(save_path, dpi=300, bbox_inches="tight")
+    png_path = output_dir / f"{rank:02d}_{safe_name}_{score_col}.png"
+    
+    # Force layout and artists
+    fig.savefig(save_path, dpi=300, bbox_inches="tight")
+    fig.savefig(png_path, dpi=300, bbox_inches="tight")
     plt.close(fig)
     gc.collect()
     print(f"Saved: {save_path}")

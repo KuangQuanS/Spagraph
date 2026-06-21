@@ -31,10 +31,7 @@ def evaluate_cell_communication(
     all_dst_barcodes: List[List[str]] = None,
     export_unified: bool = False,
     export_filtered: bool = True,
-    attention_threshold: float = 0.1,
-    lr_support_by_edge: Optional[
-        Dict[Tuple[str, str, str, str], Dict[Tuple[str, str], float]]
-    ] = None,
+    attention_threshold: float = 0.1
 ) -> None:
     """
     Evaluate cell-cell communication from trained model attention scores.
@@ -122,122 +119,6 @@ def evaluate_cell_communication(
         print(f"WARNING: missing LR mapping file: {lr_mapping_path}")
 
     # 统计每个LR对的得分（按spot聚合）
-    if lr_support_by_edge:
-        unique_edges = {}
-        for idx in range(all_edges.size(1)):
-            n_spots_sub = int(all_n_spots_sub_batch[idx].item())
-            src_local = int(all_edges[0, idx].item()) - n_spots_sub
-            dst_local = int(all_edges[1, idx].item()) - n_spots_sub
-            mapping = all_cell_node_mappings_flat[idx]
-            if src_local not in mapping or dst_local not in mapping:
-                continue
-            src_cell_id = mapping[src_local]
-            dst_cell_id = mapping[dst_local]
-            if src_cell_id >= len(all_cell_names) or dst_cell_id >= len(all_cell_names):
-                continue
-            if all_src_barcodes_flat is None or all_dst_barcodes_flat is None:
-                continue
-
-            edge_key = (
-                all_src_barcodes_flat[idx],
-                all_dst_barcodes_flat[idx],
-                all_cell_names[src_cell_id],
-                all_cell_names[dst_cell_id],
-            )
-            edge_stats = unique_edges.setdefault(
-                edge_key,
-                {
-                    "attention_sum": 0.0,
-                    "n_subgraph_occurrences": 0,
-                    "aggregate_lr_score": float(all_attrs[idx, 0].item()),
-                },
-            )
-            edge_stats["attention_sum"] += float(avg_scores[idx].item())
-            edge_stats["n_subgraph_occurrences"] += 1
-
-        edge_rows = []
-        pair_edges = {}
-        for edge_key, edge_stats in unique_edges.items():
-            support = lr_support_by_edge.get(edge_key, {})
-            if not support:
-                continue
-            edge_attention = (
-                edge_stats["attention_sum"] / edge_stats["n_subgraph_occurrences"]
-            )
-            support_names = sorted(
-                f"{ligand}_{receptor}" for ligand, receptor in support
-            )
-            edge_rows.append(
-                {
-                    "src_spot_barcode": edge_key[0],
-                    "dst_spot_barcode": edge_key[1],
-                    "source_cell": edge_key[2],
-                    "target_cell": edge_key[3],
-                    "aggregate_lr_score": edge_stats["aggregate_lr_score"],
-                    "edge_attention": edge_attention,
-                    "n_subgraph_occurrences": edge_stats["n_subgraph_occurrences"],
-                    "supporting_lr_count": len(support),
-                    "supporting_lr_pairs": ";".join(support_names),
-                }
-            )
-            for lr_pair, lr_score in support.items():
-                pair_edges.setdefault(lr_pair, []).append(
-                    {
-                        "edge_attention": edge_attention,
-                        "lr_score": lr_score,
-                        "src_spot": edge_key[0],
-                        "dst_spot": edge_key[1],
-                    }
-                )
-
-        edge_df = pd.DataFrame(edge_rows).sort_values(
-            "edge_attention", ascending=False
-        )
-        edge_path = os.path.join(output_dir, "communication_edge_statistics.csv")
-        edge_df.to_csv(edge_path, index=False)
-
-        min_ranking_edges = 10
-        pair_rows = []
-        for (ligand, receptor), records in pair_edges.items():
-            attention = np.asarray([record["edge_attention"] for record in records])
-            lr_scores = np.asarray([record["lr_score"] for record in records])
-            pair_rows.append(
-                {
-                    "lr_pair": f"{ligand}_{receptor}",
-                    "supporting_unique_edges": len(records),
-                    "associated_edge_attention_mean": float(attention.mean()),
-                    "associated_edge_attention_median": float(np.median(attention)),
-                    "associated_edge_attention_std": float(attention.std()),
-                    "associated_edge_attention_min": float(attention.min()),
-                    "associated_edge_attention_max": float(attention.max()),
-                    "total_lr_score": float(lr_scores.sum()),
-                    "n_source_spots": len({record["src_spot"] for record in records}),
-                    "n_target_spots": len({record["dst_spot"] for record in records}),
-                    "eligible_for_ranking": len(records) >= min_ranking_edges,
-                }
-            )
-
-        pair_df = pd.DataFrame(pair_rows)
-        eligible = pair_df["eligible_for_ranking"]
-        pair_df["attention_rank"] = pd.Series(pd.NA, index=pair_df.index, dtype="Int64")
-        pair_df.loc[eligible, "attention_rank"] = (
-            pair_df.loc[eligible, "associated_edge_attention_mean"]
-            .rank(method="min", ascending=False)
-            .astype("Int64")
-        )
-        pair_df = pair_df.sort_values(
-            ["eligible_for_ranking", "associated_edge_attention_mean"],
-            ascending=[False, False],
-        )
-        pair_path = os.path.join(
-            output_dir, "lr_pair_associated_edge_statistics.csv"
-        )
-        pair_df.to_csv(pair_path, index=False)
-        print(
-            "Unique edge stats:   "
-            f"{edge_path} (edges={len(edge_df)}, LR pairs={len(pair_df)}, "
-            f"ranking_min_edges={min_ranking_edges})"
-        )
     lr_spot_scores = {}  # {(center_spot, lr_id): [attention_scores]}
     # 初始化统计计数器
     processed_edges = 0
@@ -312,11 +193,6 @@ def evaluate_cell_communication(
                    f"{item['n_spots']}\n")
 
     print(f"LR stats saved:     {lr_stats_path} (unique_lr_pairs={len(lr_pair_summary)})")
-    if lr_support_by_edge:
-        print(
-            "LR stats note:      legacy representative labels; "
-            "use lr_pair_associated_edge_statistics.csv for LR ranking"
-        )
 
     top_k = 10
     print(f"\nTop {top_k} LR pairs by occurrence:")

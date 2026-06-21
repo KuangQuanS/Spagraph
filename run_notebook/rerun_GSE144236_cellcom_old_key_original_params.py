@@ -46,6 +46,7 @@ def main() -> None:
         save_lr_scores_csv=False,
         export_unified_csv=True,
         export_filtered_csv=False,
+        ablation_no_lr_identity=False,
     )
 
 

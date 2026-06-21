@@ -991,7 +991,8 @@ def main(args=None):
         all_dst_barcodes=all_dst_barcodes,
         export_unified=getattr(args, 'export_unified_csv', False),
         export_filtered=getattr(args, 'export_filtered_csv', True),
-        attention_threshold=args.attention_threshold
+        attention_threshold=args.attention_threshold,
+        lr_support_by_edge=graph_data.get("lr_support_by_edge"),
     )
     
     # 绘制损失曲线

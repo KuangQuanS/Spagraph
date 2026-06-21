@@ -1,5 +1,6 @@
 import argparse
 import glob
+import inspect
 import os
 from pathlib import Path
 
@@ -100,6 +101,12 @@ def parse_args():
                        help='最小通讯边数阈值，少于此值的spot将被过滤 (default: 1)')
     parser.add_argument('--spot_cell_expr_csv', type=str, default=None,
                        help='预计算的spot-cell全基因表达CSV文件路径，如果提供则跳过构建步骤')
+    parser.add_argument(
+        '--lr_database_csv',
+        type=str,
+        default=None,
+        help='Optional LR database CSV with ligand and receptor columns',
+    )
     parser.add_argument('--save_lr_scores_csv', type=lambda x: str(x).lower() == 'true', default=False,
                        help='Whether to save Stage 3.4 lr_scores.csv (default: False)')
     parser.add_argument('--use_hvg_for_communication', type=lambda x: str(x).lower() == 'true', default=True,
@@ -186,19 +193,25 @@ def main(args=None):
     # 1. CellChat database (for LR communication computation)
     # Use absolute path based on the project root directory
     project_root = Path(__file__).parent.parent.parent  # Go up to project root from cellcom/cellcom.py
-    cellchat_file = project_root / 'cellchat_human.csv'
+    custom_lr_database = getattr(args, "lr_database_csv", None)
+    cellchat_file = Path(custom_lr_database) if custom_lr_database else project_root / 'cellchat_human.csv'
     if not cellchat_file.exists():
         raise FileNotFoundError(
-            f"CellChat database file not found: {cellchat_file}\\n"
-            f"Expected location: {project_root}/cellchat_human.csv\\n"
-            f"Please ensure cellchat_human.csv is in the project root directory."
+            f"LR database file not found: {cellchat_file}\\n"
+            f"Provide lr_database_csv or ensure {project_root}/cellchat_human.csv exists."
         )
     lr_db = pd.read_csv(cellchat_file)
+    required_lr_columns = {"ligand", "receptor"}
+    if not required_lr_columns.issubset(lr_db.columns):
+        raise ValueError(
+            f"LR database must contain columns {sorted(required_lr_columns)}: {cellchat_file}"
+        )
     lr_pairs = []
     for _, row in lr_db.iterrows():
         lig = str(row['ligand']).strip()
         rec = str(row['receptor']).strip()
         lr_pairs.append((lig, rec))
+    print(f"LR database:        {cellchat_file}")
     print(f"LR pairs:           {len(lr_pairs)}")
 
     # 2. 加载ST数据
@@ -305,9 +318,11 @@ def main(args=None):
     sc.pp.log1p(temp_adata)
     
     n_top_genes = 2000
-    sc.pp.highly_variable_genes(temp_adata, n_top_genes=n_top_genes, flavor='seurat_v3')
-    
-    activated_genes = temp_adata.var_names[temp_adata.var['highly_variable']].tolist()
+    if temp_adata.n_vars <= n_top_genes:
+        activated_genes = temp_adata.var_names.tolist()
+    else:
+        sc.pp.highly_variable_genes(temp_adata, n_top_genes=n_top_genes, flavor='seurat_v3')
+        activated_genes = temp_adata.var_names[temp_adata.var['highly_variable']].tolist()
     print(f"HVG genes:          {len(activated_genes)} / {spot_cell_expr_df.shape[1]}")
     
     # 所有高变基因都可用（因为是从 spot_cell_expr_df 中选出来的）
@@ -435,7 +450,7 @@ def main(args=None):
     n_cells = cell_expr.shape[0]
     n_lr_pairs = len(dataset.lr_id_to_pair)
     
-    model = HeteroSTModel(
+    model_kwargs = dict(
         n_genes=len(available_activated_genes),  # 使用激活基因数量
         mlp_latent_dim=args.mlp_latent_dim,
         mlp_hidden_dims=[int(x) for x in args.mlp_hidden_dims.split(',')],
@@ -445,15 +460,18 @@ def main(args=None):
         output_dim=args.output_dim,
         n_celltypes=n_cells,
         n_lr_pairs=n_lr_pairs,
-        lr_id_emb_dim=args.lr_id_emb_dim
-    ).to(device)
+        lr_id_emb_dim=args.lr_id_emb_dim,
+    )
+    if "ablation_no_lr_identity" in inspect.signature(HeteroSTModel.__init__).parameters:
+        model_kwargs["ablation_no_lr_identity"] = getattr(args, "ablation_no_lr_identity", False)
+    model = HeteroSTModel(**model_kwargs).to(device)
     
     optimizer = torch.optim.Adam(
         model.parameters(),
         lr=args.learning_rate,
         weight_decay=args.weight_decay
     )
-    scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-6)
+    scheduler = CosineAnnealingLR(optimizer, T_max=max(1, args.epochs), eta_min=1e-6)
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Params:             {total_params:,} (trainable={trainable_params:,})")
@@ -466,13 +484,18 @@ def main(args=None):
     train_node_losses = []
     val_node_losses = []
     learning_rates = []
+    has_self_supervised_objective = (
+        (args.lambda_mask_recon > 0 and args.edge_mask_ratio > 0)
+        or (args.lambda_node_recon > 0 and args.node_mask_ratio > 0)
+    )
+    effective_train_epochs = args.epochs if has_self_supervised_objective and args.epochs > 0 else 0
     
     # ========== 阶段4：训练循环 ==========
     print(f"\n{'='*60}\nStage 3.7: Train\n{'='*60}")
 
     # 使用外层tqdm跟踪epoch进度
     # 移除position参数避免Jupyter中重复显示，添加leave=True保持最终状态
-    epoch_pbar = tqdm(range(args.epochs), desc="Training", leave=True, dynamic_ncols=True)
+    epoch_pbar = tqdm(range(effective_train_epochs), desc="Training", leave=True, dynamic_ncols=True)
     
     # 主训练早停参数
     best_val_metric = float('inf')
@@ -480,7 +503,9 @@ def main(args=None):
     early_stop_patience = args.early_stop_patience
     early_stop_min_delta = args.early_stop_min_delta
     
-    if early_stop_patience > 0:
+    if effective_train_epochs == 0:
+        print("Training:           skipped (no self-supervised masking objective enabled)")
+    elif early_stop_patience > 0:
         print(f"Early stop:         patience={early_stop_patience}, min_delta={early_stop_min_delta}")
     else:
         print("Early stop:         Disabled")
@@ -552,13 +577,13 @@ def main(args=None):
                         mask_generator=None
                     )
 
-                    mask_recon_loss = 0.0
+                    mask_recon_loss = edge_attr_cc.new_tensor(0.0)
                     if edge_mask is not None and edge_mask.any() and predicted_masked_edges is not None:
                         target_scores = edge_attr_cc[:, 0][edge_mask]
                         if target_scores.numel() > 0:
                             mask_recon_loss = torch.nn.functional.mse_loss(predicted_masked_edges, target_scores)
 
-                    node_recon_loss = 0.0
+                    node_recon_loss = edge_attr_cc.new_tensor(0.0)
                     if node_recon_pred is not None and node_mask is not None and node_mask.any():
                         node_target = torch.cat([expr_raw, cell_expr_raw], dim=0)
                         node_recon_loss = torch.nn.functional.mse_loss(
@@ -603,13 +628,13 @@ def main(args=None):
                     mask_generator=None
                 )
 
-                mask_recon_loss = 0.0
+                mask_recon_loss = edge_attr_cc.new_tensor(0.0)
                 if edge_mask is not None and edge_mask.any() and predicted_masked_edges is not None:
                     target_scores = edge_attr_cc[:, 0][edge_mask]
                     if target_scores.numel() > 0:
                         mask_recon_loss = torch.nn.functional.mse_loss(predicted_masked_edges, target_scores)
 
-                node_recon_loss = 0.0
+                node_recon_loss = edge_attr_cc.new_tensor(0.0)
                 if node_recon_pred is not None and node_mask is not None and node_mask.any():
                     node_target = torch.cat([expr_raw, cell_expr_raw], dim=0)
                     node_recon_loss = torch.nn.functional.mse_loss(
@@ -676,13 +701,13 @@ def main(args=None):
                             mask_generator=val_mask_gen
                         )
 
-                        mask_recon_loss = 0.0
+                        mask_recon_loss = edge_attr_cc.new_tensor(0.0)
                         if edge_mask is not None and edge_mask.any() and predicted_masked_edges is not None:
                             target_scores = edge_attr_cc[:, 0][edge_mask]
                             if target_scores.numel() > 0:
                                 mask_recon_loss = torch.nn.functional.mse_loss(predicted_masked_edges, target_scores)
 
-                        node_recon_loss = 0.0
+                        node_recon_loss = edge_attr_cc.new_tensor(0.0)
                         if node_recon_pred is not None and node_mask is not None and node_mask.any():
                             node_target = torch.cat([expr_raw, cell_expr_raw], dim=0)
                             node_recon_loss = torch.nn.functional.mse_loss(
@@ -726,13 +751,13 @@ def main(args=None):
                         mask_generator=val_mask_gen
                     )
 
-                    avg_batch_mask = 0.0
+                    avg_batch_mask = edge_attr_cc.new_tensor(0.0)
                     if edge_mask is not None and edge_mask.any() and predicted_masked_edges is not None:
                         target_scores = edge_attr_cc[:, 0][edge_mask]
                         if target_scores.numel() > 0:
                             avg_batch_mask = torch.nn.functional.mse_loss(predicted_masked_edges, target_scores)
 
-                    avg_batch_node = 0.0
+                    avg_batch_node = edge_attr_cc.new_tensor(0.0)
                     if node_recon_pred is not None and node_mask is not None and node_mask.any():
                         node_target = torch.cat([expr_raw, cell_expr_raw], dim=0)
                         avg_batch_node = torch.nn.functional.mse_loss(

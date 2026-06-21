@@ -261,13 +261,15 @@ class HeteroSTModel(nn.Module):
                  gat_hidden_dims: list = None,
                  gat_heads: int = 4, gat_dropout: float = 0.1,
                  output_dim: int = 64, n_celltypes: int = None,
-                 n_lr_pairs: int = 1, lr_id_emb_dim: int = 8):
+                 n_lr_pairs: int = 1, lr_id_emb_dim: int = 8,
+                 ablation_no_lr_identity: bool = False):
         super().__init__()
         
         if gat_hidden_dims is None:
             gat_hidden_dims = [256, 256, 128]
         
         self.n_genes = n_genes
+        self.ablation_no_lr_identity = ablation_no_lr_identity
         self.mlp_latent_dim = mlp_latent_dim
         self.output_dim = output_dim
         self.gat_hidden_dims = gat_hidden_dims
@@ -391,8 +393,8 @@ class HeteroSTModel(nn.Module):
         
         node_mask = None
         
-        # 2. 生成 Mask 并替换为 Token (只在训练时或强制Mask时)
-        if node_mask_ratio > 0 and self.training:
+        # 2. 生成 Mask 并替换为 Token (训练和验证时都执行，以便计算验证 loss)
+        if node_mask_ratio > 0:
              # 合并以统一计算 mask
             base_feat = torch.cat([expr_raw, cell_expr_raw], dim=0)
             n_total = base_feat.size(0)
@@ -485,6 +487,8 @@ class HeteroSTModel(nn.Module):
             lr_scores = masked_edge_attr_cc[:, 0:1]
             lr_ids = edge_attr_cc[:, 1].long().clamp(min=0, max=self.n_lr_pairs)
             lr_id_emb = self.lr_id_embedding(lr_ids)
+            if self.ablation_no_lr_identity:
+                lr_id_emb = torch.zeros_like(lr_id_emb)
             comm_edge_feat = torch.cat([lr_scores, lr_id_emb], dim=1)
 
             comm_repr, cc_attention_tuple = self.edge_attn_comm(

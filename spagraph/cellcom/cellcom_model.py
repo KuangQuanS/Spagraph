@@ -262,7 +262,7 @@ class HeteroSTModel(nn.Module):
                  gat_heads: int = 4, gat_dropout: float = 0.1,
                  output_dim: int = 64, n_celltypes: int = None,
                  n_lr_pairs: int = 1, lr_id_emb_dim: int = 8,
-                 ablation_no_lr_identity: bool = True):
+                 ablation_no_lr_identity: bool = False):
         super().__init__()
         
         if gat_hidden_dims is None:

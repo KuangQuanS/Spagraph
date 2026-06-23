@@ -60,7 +60,7 @@ def run_cellcom(
     export_unified_csv: bool = False,
     export_filtered_csv: bool = True,
     # Ablation flags
-    ablation_no_lr_identity: bool = True,
+    ablation_no_lr_identity: bool = False,
     # Legacy support
     args: Optional[Union[argparse.Namespace, Dict[str, Any]]] = None,
     **overrides: Any,

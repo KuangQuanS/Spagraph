@@ -187,9 +187,6 @@ def calculate_lr_scores(
     lr_pair_to_id: Dict[Tuple[str, str], int] = {}
     lr_id_to_pair: Dict[int, Tuple[str, str]] = {}
     lr_scores_by_spot_pair: Dict[Tuple[int, int, int, int], List[float | int]] = {}
-    lr_support_by_edge: Dict[
-        Tuple[str, str, str, str], Dict[Tuple[str, str], float]
-    ] = {}
     lr_id_counter = 1
     total_pairs = 0
     spots_with_cells = 0
@@ -265,17 +262,6 @@ def calculate_lr_scores(
                                 else:
                                     pair_data[0] += float(score)
 
-                                support_key = (
-                                    spot_i_barcode,
-                                    spot_j_barcode,
-                                    celltype_i,
-                                    celltype_j,
-                                )
-                                support_scores = lr_support_by_edge.setdefault(support_key, {})
-                                support_scores[lr_pair] = (
-                                    support_scores.get(lr_pair, 0.0) + float(score)
-                                )
-
                                 comm_event_records.append(
                                     [
                                         spot_i_barcode,
@@ -320,7 +306,6 @@ def calculate_lr_scores(
         "coords": spot_coords,
         "composition": composition,
         "knn_mask": knn_mask,
-        "lr_support_by_edge": lr_support_by_edge,
     }
     comm_by_spot_pair: Dict[Tuple[int, int], List[Tuple[int, int, float, int]]] = {}
     for (spot_i_idx, spot_j_idx, cell_i_idx, cell_j_idx), (total_score, lr_id) in lr_scores_by_spot_pair.items():

@@ -220,3 +220,6 @@ tmp
 AGENTS.d
 run_notebook/gse144240_cellchat_baseline
 run_notebook/runtime_runs
+
+# Trash folder (local cleanup)
+trash/

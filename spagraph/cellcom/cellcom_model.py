@@ -357,6 +357,7 @@ class HeteroSTModel(nn.Module):
                 cell_expr_raw: torch.Tensor,
                 edge_index_like: torch.Tensor, edge_attr_like: torch.Tensor,
                 edge_index_cc: torch.Tensor, edge_attr_cc: torch.Tensor,
+                edge_lr_ids_list=None,  # ✅ 新增：每条边的所有 lr_ids
                 return_attention: bool = False, edge_mask_ratio: float = 0.15, node_mask_ratio: float = 0.0,
                 mask_generator: torch.Generator = None) -> Tuple:
         """
@@ -485,8 +486,25 @@ class HeteroSTModel(nn.Module):
         if edge_index_cc.size(1) > 0:
             # 构造通讯边特征：未mask边用真实score，mask边score=0，保留lr_id
             lr_scores = masked_edge_attr_cc[:, 0:1]
-            lr_ids = edge_attr_cc[:, 1].long().clamp(min=0, max=self.n_lr_pairs)
-            lr_id_emb = self.lr_id_embedding(lr_ids)
+            
+            # ✅ 改：平均多个 lr_ids 的 embedding
+            if edge_lr_ids_list is not None and len(edge_lr_ids_list) > 0:
+                # 为每条边的所有 lr_ids 平均它们的 embedding
+                lr_id_embs = []
+                for edge_idx, lr_ids in enumerate(edge_lr_ids_list):
+                    if len(lr_ids) > 0:
+                        lr_id_tensors = torch.tensor(lr_ids, device=expr_raw.device, dtype=torch.long).clamp(min=0, max=self.n_lr_pairs)
+                        lr_id_emb_list = self.lr_id_embedding(lr_id_tensors)  # [n_lr_ids, emb_dim]
+                        lr_id_emb = lr_id_emb_list.mean(dim=0)  # 平均 embedding
+                    else:
+                        lr_id_emb = torch.zeros(self.lr_id_emb_dim, device=expr_raw.device)
+                    lr_id_embs.append(lr_id_emb)
+                lr_id_emb = torch.stack(lr_id_embs, dim=0)  # [n_edges, emb_dim]
+            else:
+                # 回退：没有 lr_ids_list 时，直接用 edge_attr_cc[:, 1]
+                lr_ids = edge_attr_cc[:, 1].long().clamp(min=0, max=self.n_lr_pairs)
+                lr_id_emb = self.lr_id_embedding(lr_ids)
+            
             if self.ablation_no_lr_identity:
                 lr_id_emb = torch.zeros_like(lr_id_emb)
             comm_edge_feat = torch.cat([lr_scores, lr_id_emb], dim=1)

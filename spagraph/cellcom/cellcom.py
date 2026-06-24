@@ -563,6 +563,9 @@ def main(args=None):
                         edge_attr_cc = edge_attr_cc.view(-1, 2) if edge_attr_cc.numel() > 0 else edge_attr_cc.new_zeros((0, 2))
                     edge_attr_cc = edge_attr_cc.to(device, non_blocking=pin_memory)
                     edge_attr_cc_input = edge_attr_cc[:, :2]
+                    
+                    # ✅ 新增：获取这个样本的 lr_ids 列表
+                    edge_lr_ids = batch['edge_lr_ids_list'][b] if 'edge_lr_ids_list' in batch else None
 
                     _, _, _, _, _, predicted_masked_edges, edge_mask, node_recon_pred, node_mask = model(
                         expr_raw=expr_raw,
@@ -571,6 +574,7 @@ def main(args=None):
                         edge_attr_like=edge_attr_like,
                         edge_index_cc=edge_index_cc,
                         edge_attr_cc=edge_attr_cc_input,
+                        edge_lr_ids_list=edge_lr_ids,  # ✅ 新增：传入 lr_ids 列表
                         return_attention=True,
                         edge_mask_ratio=args.edge_mask_ratio,
                         node_mask_ratio=args.node_mask_ratio,
@@ -614,6 +618,9 @@ def main(args=None):
                     edge_attr_cc = edge_attr_cc.view(-1, 2) if edge_attr_cc.numel() > 0 else edge_attr_cc.new_zeros((0, 2))
                 edge_attr_cc = edge_attr_cc.to(device, non_blocking=pin_memory)
                 edge_attr_cc_input = edge_attr_cc[:, :2]
+                
+                # ✅ 新增：获取 lr_ids 列表
+                edge_lr_ids = batch.get('edge_lr_ids_list', None)
 
                 _, _, _, _, _, predicted_masked_edges, edge_mask, node_recon_pred, node_mask = model(
                     expr_raw=expr_raw,
@@ -622,6 +629,7 @@ def main(args=None):
                     edge_attr_like=edge_attr_like,
                     edge_index_cc=edge_index_cc,
                     edge_attr_cc=edge_attr_cc_input,
+                    edge_lr_ids_list=edge_lr_ids,  # ✅ 新增：传入 lr_ids 列表
                     return_attention=True,
                     edge_mask_ratio=args.edge_mask_ratio,
                     node_mask_ratio=args.node_mask_ratio,
@@ -687,6 +695,9 @@ def main(args=None):
                             edge_attr_cc = edge_attr_cc.view(-1, 2) if edge_attr_cc.numel() > 0 else edge_attr_cc.new_zeros((0, 2))
                         edge_attr_cc = edge_attr_cc.to(device, non_blocking=pin_memory)
                         edge_attr_cc_input = edge_attr_cc[:, :2]
+                        
+                        # ✅ 新增：获取这个样本的 lr_ids 列表
+                        edge_lr_ids = batch['edge_lr_ids_list'][b] if 'edge_lr_ids_list' in batch else None
 
                         _, _, _, _, _, predicted_masked_edges, edge_mask, node_recon_pred, node_mask = model(
                             expr_raw=expr_raw,
@@ -695,6 +706,7 @@ def main(args=None):
                             edge_attr_like=edge_attr_like,
                             edge_index_cc=edge_index_cc,
                             edge_attr_cc=edge_attr_cc_input,
+                            edge_lr_ids_list=edge_lr_ids,  # ✅ 新增：传入 lr_ids 列表
                             return_attention=True,
                             edge_mask_ratio=args.edge_mask_ratio,
                             node_mask_ratio=args.node_mask_ratio,
@@ -737,6 +749,9 @@ def main(args=None):
                         edge_attr_cc = edge_attr_cc.view(-1, 2) if edge_attr_cc.numel() > 0 else edge_attr_cc.new_zeros((0, 2))
                     edge_attr_cc = edge_attr_cc.to(device, non_blocking=pin_memory)
                     edge_attr_cc_input = edge_attr_cc[:, :2]
+                    
+                    # ✅ 新增：获取 lr_ids 列表
+                    edge_lr_ids = batch.get('edge_lr_ids_list', None)
 
                     _, _, _, _, _, predicted_masked_edges, edge_mask, node_recon_pred, node_mask = model(
                         expr_raw=expr_raw,
@@ -745,6 +760,7 @@ def main(args=None):
                         edge_attr_like=edge_attr_like,
                         edge_index_cc=edge_index_cc,
                         edge_attr_cc=edge_attr_cc_input,
+                        edge_lr_ids_list=edge_lr_ids,  # ✅ 新增：传入 lr_ids 列表
                         return_attention=True,
                         edge_mask_ratio=args.edge_mask_ratio,
                         node_mask_ratio=args.node_mask_ratio,
@@ -872,6 +888,7 @@ def main(args=None):
                 # 模型前向传播
                 # ✅ 推理阶段也传入真实通信特征，收集的注意力才与LR信息一致
                 edge_attr_cc_input = edge_attr_cc[:, :2]
+                edge_lr_ids = batch['edge_lr_ids_list'][b] if 'edge_lr_ids_list' in batch else None
                 spot_repr, cell_repr, combined, spot_proj, cc_attention, _, _, node_recon_pred, node_mask = model(
                     expr_raw=expr_raw,
                     cell_expr_raw=cell_expr_raw,
@@ -879,6 +896,7 @@ def main(args=None):
                     edge_attr_like=edge_attr_like,
                     edge_index_cc=edge_index_cc,
                     edge_attr_cc=edge_attr_cc_input,
+                    edge_lr_ids_list=edge_lr_ids,  # ✅ 新增：传入 lr_ids 列表
                     return_attention=True,
                     edge_mask_ratio=0.0,
                     node_mask_ratio=0.0

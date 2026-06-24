@@ -709,17 +709,20 @@ class STHeteroSubgraphDataset:
                 spot_pair_key = (spot_i_idx, spot_j_idx, cell_i_idx, cell_j_idx)
                 pair_data = self.lr_scores_by_spot_pair.get(spot_pair_key)
                 if pair_data is None:
-                    self.lr_scores_by_spot_pair[spot_pair_key] = [comm_score, lr_id]
+                    self.lr_scores_by_spot_pair[spot_pair_key] = [comm_score, [lr_id]]
                 else:
                     pair_data[0] += comm_score
+                    # 记录所有参与的 lr_id，避免重复
+                    if lr_id not in pair_data[1]:
+                        pair_data[1].append(lr_id)
             except KeyError:
                 # 如果barcode或cell名称找不到，跳过这条记录
                 continue
         
         # 二级索引：按 spot 对分组，生成 edge 时只遍历存在通讯的 cell 对，避免 O(C^2) 穷举
         comm_by_spot_pair = {}
-        for (spot_i, spot_j, ct_i, ct_j), (total_score, lr_id) in self.lr_scores_by_spot_pair.items():
-            comm_by_spot_pair.setdefault((spot_i, spot_j), []).append((ct_i, ct_j, total_score, lr_id))
+        for (spot_i, spot_j, ct_i, ct_j), (total_score, lr_ids_list) in self.lr_scores_by_spot_pair.items():
+            comm_by_spot_pair.setdefault((spot_i, spot_j), []).append((ct_i, ct_j, total_score, lr_ids_list))
         self.comm_by_spot_pair = comm_by_spot_pair
 
         total_cell_pairs = sum(len(v) for v in self.comm_by_spot_pair.values())
@@ -844,7 +847,7 @@ class STHeteroSubgraphDataset:
         # 注意：LR通讯得分已经预计算在CSV中，直接从字典查询
 
         edge_index_cc_list = []
-        edge_attr_cc_list = []  # 现在包含两个特征：[lr_score, lr_id]
+        edge_attr_cc_list = []  # 现在包含两个特征：[lr_score, lr_ids_list]
 
         # ✅ 计算子图内所有spot的cell之间的通讯（有向边：配体细胞 -> 受体细胞）
         # 仅遍历“预计算里存在通讯”的 cell 对，避免对 cells_in_i × cells_in_j 做穷举
@@ -854,7 +857,7 @@ class STHeteroSubgraphDataset:
                 if not comm_list:
                     continue
 
-                for cell_type_i, cell_type_j, total_lr_score, lr_id in comm_list:
+                for cell_type_i, cell_type_j, total_lr_score, lr_ids_list in comm_list:
                     cell_i_node_local_idx = spot_cell_mapping.get((i_local, cell_type_i))
                     if cell_i_node_local_idx is None:
                         continue
@@ -865,16 +868,26 @@ class STHeteroSubgraphDataset:
                     cell_i_node_global_id = n_spots_sub + cell_i_node_local_idx
                     cell_j_node_global_id = n_spots_sub + cell_j_node_local_idx
                     edge_index_cc_list.append([cell_i_node_global_id, cell_j_node_global_id])
-                    edge_attr_cc_list.append([total_lr_score, lr_id])
+                    edge_attr_cc_list.append([total_lr_score, lr_ids_list])
                         
         edge_index_cc = torch.tensor(
             np.array(edge_index_cc_list).T if edge_index_cc_list else np.array([[], []]).astype(int),
             dtype=torch.long
         )
-        edge_attr_cc = torch.tensor(
-            edge_attr_cc_list if edge_attr_cc_list else [],
-            dtype=torch.float32
-        )
+        
+        # ✅ 改：因为第二列现在是列表，不能直接放入 tensor
+        # 改为：第一列是 lr_score，第二列是边的索引（0, 1, 2, ...）
+        # 然后单独返回 edge_lr_ids_list 供模型查询
+        if edge_attr_cc_list:
+            edge_attr_cc_scores = np.array([item[0] for item in edge_attr_cc_list], dtype=np.float32)
+            edge_attr_cc = torch.tensor(
+                np.column_stack([edge_attr_cc_scores, np.arange(len(edge_attr_cc_list))]),
+                dtype=torch.float32
+            )
+            edge_lr_ids_list = [item[1] for item in edge_attr_cc_list]  # 保存所有 lr_ids 列表
+        else:
+            edge_attr_cc = torch.empty((0, 2), dtype=torch.float32)
+            edge_lr_ids_list = []
         
         # 如果通讯边数量少于阈值，直接丢弃该子图样本
         if edge_index_cc.size(1) < self.min_comm_edges:
@@ -896,7 +909,8 @@ class STHeteroSubgraphDataset:
             'edge_index_like': edge_index_like,  # 相似度边 (spot-spot + spot-cell)
             'edge_attr_like': edge_attr_like,
             'edge_index_cc': edge_index_cc,  # cell-cell通讯边
-            'edge_attr_cc': edge_attr_cc,
+            'edge_attr_cc': edge_attr_cc,  # [n_edges_cc, 2] = [lr_score, edge_idx]
+            'edge_lr_ids_list': edge_lr_ids_list,  # ✅ 新增：每条边对应的所有 lr_ids
             'coords_subgraph': coords_subgraph,
             'composition_subgraph': composition_subgraph,  # [k+1, n_cell_types]
         }
@@ -922,7 +936,8 @@ def hetero_subgraph_collate_fn(batch):
     edge_index_like_list = [sample['edge_index_like'] for sample in batch]  # list of [2, E_i]
     edge_attr_like_list = [torch.cat([sample['edge_attr_like'].unsqueeze(-1), torch.zeros_like(sample['edge_attr_like'].unsqueeze(-1))], dim=-1) for sample in batch]    # list of [E_i, 2] - [weight, 0]
     edge_index_cc_list = [sample['edge_index_cc'] for sample in batch]      # list of [2, E_i]
-    edge_attr_cc_list = [sample['edge_attr_cc'] for sample in batch]        # list of [E_i, 2] - [lr_score, lr_id]
+    edge_attr_cc_list = [sample['edge_attr_cc'] for sample in batch]        # list of [E_i, 2] - [lr_score, edge_idx]
+    edge_lr_ids_list = [sample.get('edge_lr_ids_list', []) for sample in batch]  # ✅ 新增：所有 lr_ids 列表
     
     # ✅ 收集每个样本的实际 cell 节点数
     n_cells_list = [sample['n_cells'] for sample in batch]
@@ -939,7 +954,8 @@ def hetero_subgraph_collate_fn(batch):
         'edge_index_like': edge_index_like_list,  # list of [2, E_i]
         'edge_attr_like': edge_attr_like_list,    # list of [E_i]
         'edge_index_cc': edge_index_cc_list,      # list of [2, E_i]
-        'edge_attr_cc': edge_attr_cc_list,        # list of [E_i]
+        'edge_attr_cc': edge_attr_cc_list,        # list of [E_i, 2]
+        'edge_lr_ids_list': edge_lr_ids_list,     # ✅ list of list, for model to average attention
     }
     
     return batch_dict
@@ -969,6 +985,7 @@ def hetero_subgraph_collate_fn_batched(batch):
     edge_attr_like_parts = []
     edge_index_cc_parts = []
     edge_attr_cc_parts = []
+    edge_lr_ids_parts = []  # ✅ 新增：收集所有样本的 lr_ids 列表
 
     for sample, n_spots_sub, n_cells, spot_off, cell_off in zip(
         batch, n_spots_sub_list, n_cells_list, spot_offsets, cell_offsets
@@ -1002,6 +1019,9 @@ def hetero_subgraph_collate_fn_batched(batch):
                 ea_cc = ea_cc.view(-1, 2) if ea_cc.numel() > 0 else ea_cc.new_zeros((0, 2))
             if ea_cc.numel() > 0:
                 edge_attr_cc_parts.append(ea_cc)
+                # ✅ 新增：收集这个样本的 lr_ids
+                sample_lr_ids = sample.get('edge_lr_ids_list', [])
+                edge_lr_ids_parts.append(sample_lr_ids)
 
     edge_index_like = (
         torch.cat(edge_index_like_parts, dim=1)
@@ -1034,4 +1054,5 @@ def hetero_subgraph_collate_fn_batched(batch):
         'edge_attr_like': edge_attr_like,
         'edge_index_cc': edge_index_cc,
         'edge_attr_cc': edge_attr_cc,
+        'edge_lr_ids_list': edge_lr_ids_parts,  # ✅ 新增：每条边的 lr_ids 列表
     }

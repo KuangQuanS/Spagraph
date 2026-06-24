@@ -258,9 +258,12 @@ def calculate_lr_scores(
                                 pair_key = (i, j, celltype_i_idx, celltype_j_idx)
                                 pair_data = lr_scores_by_spot_pair.get(pair_key)
                                 if pair_data is None:
-                                    lr_scores_by_spot_pair[pair_key] = [float(score), lr_id]
+                                    lr_scores_by_spot_pair[pair_key] = [float(score), [lr_id]]
                                 else:
                                     pair_data[0] += float(score)
+                                    # 记录所有参与的 lr_id，避免重复
+                                    if lr_id not in pair_data[1]:
+                                        pair_data[1].append(lr_id)
 
                                 comm_event_records.append(
                                     [

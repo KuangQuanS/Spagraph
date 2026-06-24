@@ -220,3 +220,32 @@ tmp
 AGENTS.d
 run_notebook/gse144240_cellchat_baseline
 run_notebook/runtime_runs
+
+# Trash folder (local cleanup)
+trash/
+
+# ===== Remote: Only code, exclude all experiments and data =====
+# Exclude experiment notebooks and scripts
+run_notebook/
+scripts/
+docs/
+evaluate/
+
+# Exclude experiment results and outputs
+results/
+reference_sci/
+
+# Exclude runtime notebooks and ablation studies
+*.egg-info/
+.uv-cache/
+.r_libs/
+
+# Exclude all non-code project files
+*.docx
+*.doc
+*.pdf
+hg38_human_mouse.txt
+protein_coding_hg38.txt
+spagraph_manuscript_extracted.txt
+AGENTS.md
+CLAUDE.md

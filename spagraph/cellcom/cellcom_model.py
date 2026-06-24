@@ -261,13 +261,15 @@ class HeteroSTModel(nn.Module):
                  gat_hidden_dims: list = None,
                  gat_heads: int = 4, gat_dropout: float = 0.1,
                  output_dim: int = 64, n_celltypes: int = None,
-                 n_lr_pairs: int = 1, lr_id_emb_dim: int = 8):
+                 n_lr_pairs: int = 1, lr_id_emb_dim: int = 8,
+                 ablation_no_lr_identity: bool = False):
         super().__init__()
         
         if gat_hidden_dims is None:
             gat_hidden_dims = [256, 256, 128]
         
         self.n_genes = n_genes
+        self.ablation_no_lr_identity = ablation_no_lr_identity
         self.mlp_latent_dim = mlp_latent_dim
         self.output_dim = output_dim
         self.gat_hidden_dims = gat_hidden_dims
@@ -355,6 +357,7 @@ class HeteroSTModel(nn.Module):
                 cell_expr_raw: torch.Tensor,
                 edge_index_like: torch.Tensor, edge_attr_like: torch.Tensor,
                 edge_index_cc: torch.Tensor, edge_attr_cc: torch.Tensor,
+                edge_lr_ids_list=None,  # ✅ 新增：每条边的所有 lr_ids
                 return_attention: bool = False, edge_mask_ratio: float = 0.15, node_mask_ratio: float = 0.0,
                 mask_generator: torch.Generator = None) -> Tuple:
         """
@@ -391,8 +394,8 @@ class HeteroSTModel(nn.Module):
         
         node_mask = None
         
-        # 2. 生成 Mask 并替换为 Token (只在训练时或强制Mask时)
-        if node_mask_ratio > 0 and self.training:
+        # 2. 生成 Mask 并替换为 Token (训练和验证时都执行，以便计算验证 loss)
+        if node_mask_ratio > 0:
              # 合并以统一计算 mask
             base_feat = torch.cat([expr_raw, cell_expr_raw], dim=0)
             n_total = base_feat.size(0)
@@ -483,8 +486,27 @@ class HeteroSTModel(nn.Module):
         if edge_index_cc.size(1) > 0:
             # 构造通讯边特征：未mask边用真实score，mask边score=0，保留lr_id
             lr_scores = masked_edge_attr_cc[:, 0:1]
-            lr_ids = edge_attr_cc[:, 1].long().clamp(min=0, max=self.n_lr_pairs)
-            lr_id_emb = self.lr_id_embedding(lr_ids)
+            
+            # ✅ 改：平均多个 lr_ids 的 embedding
+            if edge_lr_ids_list is not None and len(edge_lr_ids_list) > 0:
+                # 为每条边的所有 lr_ids 平均它们的 embedding
+                lr_id_embs = []
+                for edge_idx, lr_ids in enumerate(edge_lr_ids_list):
+                    if len(lr_ids) > 0:
+                        lr_id_tensors = torch.tensor(lr_ids, device=expr_raw.device, dtype=torch.long).clamp(min=0, max=self.n_lr_pairs)
+                        lr_id_emb_list = self.lr_id_embedding(lr_id_tensors)  # [n_lr_ids, emb_dim]
+                        lr_id_emb = lr_id_emb_list.mean(dim=0)  # 平均 embedding
+                    else:
+                        lr_id_emb = torch.zeros(self.lr_id_emb_dim, device=expr_raw.device)
+                    lr_id_embs.append(lr_id_emb)
+                lr_id_emb = torch.stack(lr_id_embs, dim=0)  # [n_edges, emb_dim]
+            else:
+                # 回退：没有 lr_ids_list 时，直接用 edge_attr_cc[:, 1]
+                lr_ids = edge_attr_cc[:, 1].long().clamp(min=0, max=self.n_lr_pairs)
+                lr_id_emb = self.lr_id_embedding(lr_ids)
+            
+            if self.ablation_no_lr_identity:
+                lr_id_emb = torch.zeros_like(lr_id_emb)
             comm_edge_feat = torch.cat([lr_scores, lr_id_emb], dim=1)
 
             comm_repr, cc_attention_tuple = self.edge_attn_comm(

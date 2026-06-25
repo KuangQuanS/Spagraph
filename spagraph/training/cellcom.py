@@ -28,7 +28,6 @@ def run_cellcom(
     lr_score_threshold: float = 1,  # LR得分阈值（log1p 空间）
     min_comm_edges: int = 1,
     spot_cell_expr_csv: Optional[str] = None,  # 可选，优先使用deconv_dir中的动态表达
-    lr_database_csv: Optional[str] = None,
     use_hvg_for_communication: bool = False,  # 只使用高变基因计算通讯（默认启用）、
     allow_same_celltype_comm: bool = True,
     # GAT parameters
@@ -59,8 +58,6 @@ def run_cellcom(
     save_lr_scores_csv: bool = False,
     export_unified_csv: bool = False,
     export_filtered_csv: bool = True,
-    # Ablation flags
-    ablation_no_lr_identity: bool = False,
     # Legacy support
     args: Optional[Union[argparse.Namespace, Dict[str, Any]]] = None,
     **overrides: Any,
@@ -159,7 +156,6 @@ def run_cellcom(
         lr_score_threshold=lr_score_threshold,
         min_comm_edges=min_comm_edges,
         spot_cell_expr_csv=spot_cell_expr_csv,
-        lr_database_csv=lr_database_csv,
         save_lr_scores_csv=save_lr_scores_csv,
         export_unified_csv=export_unified_csv,
         export_filtered_csv=export_filtered_csv,
@@ -187,7 +183,6 @@ def run_cellcom(
         val_split=val_split,
         early_stop_patience=early_stop_patience,
         early_stop_min_delta=early_stop_min_delta,
-        ablation_no_lr_identity=ablation_no_lr_identity,
     )
     
     # Apply any additional overrides

@@ -261,7 +261,8 @@ class HeteroSTModel(nn.Module):
                  gat_hidden_dims: list = None,
                  gat_heads: int = 4, gat_dropout: float = 0.1,
                  output_dim: int = 64, n_celltypes: int = None,
-                 n_lr_pairs: int = 1, lr_id_emb_dim: int = 8):
+                 n_lr_pairs: int = 1, lr_id_emb_dim: int = 8,
+                 ablation_no_lr_identity: bool = True):
         super().__init__()
         
         if gat_hidden_dims is None:
@@ -271,6 +272,7 @@ class HeteroSTModel(nn.Module):
         self.mlp_latent_dim = mlp_latent_dim
         self.output_dim = output_dim
         self.gat_hidden_dims = gat_hidden_dims
+        self.ablation_no_lr_identity = ablation_no_lr_identity
         self.n_lr_pairs = max(1, n_lr_pairs)
         self.lr_id_emb_dim = lr_id_emb_dim
         self.node_recon_head = nn.Linear(output_dim, n_genes)
@@ -485,6 +487,8 @@ class HeteroSTModel(nn.Module):
             lr_scores = masked_edge_attr_cc[:, 0:1]
             lr_ids = edge_attr_cc[:, 1].long().clamp(min=0, max=self.n_lr_pairs)
             lr_id_emb = self.lr_id_embedding(lr_ids)
+            if self.ablation_no_lr_identity:
+                lr_id_emb = torch.zeros_like(lr_id_emb)
             comm_edge_feat = torch.cat([lr_scores, lr_id_emb], dim=1)
 
             comm_repr, cc_attention_tuple = self.edge_attn_comm(

@@ -58,6 +58,8 @@ def run_cellcom(
     save_lr_scores_csv: bool = False,
     export_unified_csv: bool = False,
     export_filtered_csv: bool = True,
+    # Ablation flags
+    ablation_no_lr_identity: bool = True,
     # Legacy support
     args: Optional[Union[argparse.Namespace, Dict[str, Any]]] = None,
     **overrides: Any,
@@ -183,6 +185,7 @@ def run_cellcom(
         val_split=val_split,
         early_stop_patience=early_stop_patience,
         early_stop_min_delta=early_stop_min_delta,
+        ablation_no_lr_identity=ablation_no_lr_identity,
     )
     
     # Apply any additional overrides

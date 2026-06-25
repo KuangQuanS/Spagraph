@@ -62,6 +62,10 @@ def _print_stage3_header(args, device: torch.device):
     print(f"  Mask Recon:       {args.lambda_mask_recon} (ratio={args.edge_mask_ratio})")
     print(f"  Node Recon:       {args.lambda_node_recon} (ratio={args.node_mask_ratio})")
     print(f"Mask Seed:          {args.mask_seed}")
+    print(
+        'Representative LR:  '
+        + ('ignored' if getattr(args, 'ablation_no_lr_identity', True) else 'used (legacy mode)')
+    )
     if getattr(args, "early_stop_patience", 0) > 0:
         print(f"Early Stop:         patience={args.early_stop_patience}, min_delta={args.early_stop_min_delta}")
     else:
@@ -131,6 +135,12 @@ def parse_args():
     parser.add_argument('--node_mask_ratio', type=float, default=0.15, help='mask节点特征比例 (默认15%%)')
     parser.add_argument('--mask_seed', type=int, default=1234, help='验证阶段mask的固定随机种子')
     parser.add_argument('--lr_id_emb_dim', type=int, default=8, help='LR id 嵌入维度，用于通讯边特征')
+    parser.add_argument(
+        '--ablation_no_lr_identity',
+        type=lambda x: str(x).lower() == 'true',
+        default=True,
+        help='Ignore the representative LR ID embedding on aggregated communication edges',
+    )
     
 
     # 训练参数
@@ -956,7 +966,8 @@ def main(args=None):
         all_dst_barcodes=all_dst_barcodes,
         export_unified=getattr(args, 'export_unified_csv', False),
         export_filtered=getattr(args, 'export_filtered_csv', True),
-        attention_threshold=args.attention_threshold
+        attention_threshold=args.attention_threshold,
+        lr_support_by_edge=graph_data.get("lr_support_by_edge"),
     )
     
     # 绘制损失曲线

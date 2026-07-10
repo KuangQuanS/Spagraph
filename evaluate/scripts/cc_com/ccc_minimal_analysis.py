@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Observed-only CCC analysis: Moran's I, cell-type specificity, and abundance-attention decoupling."""
+"""Observed-only CCC analysis: LR spatial co-expression and abundance-attention decoupling."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ import matplotlib
 import numpy as np
 import pandas as pd
 import scanpy as sc
-from scipy.stats import mannwhitneyu, spearmanr
+from scipy.stats import spearmanr
 from sklearn.neighbors import kneighbors_graph
 
 matplotlib.use("Agg")
@@ -32,6 +32,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 import spagraph
+from spagraph.analysis.figure3e_statistics import compare_lr_pair_groups
 
 
 EXPECTED_LR_COLUMNS = {
@@ -44,7 +45,7 @@ EXPECTED_LR_COLUMNS = {
     "attention_score",
 }
 
-ANALYSIS_MODE = "observed_moran_specificity_expression_decoupling"
+ANALYSIS_MODE = "observed_bivariate_moran_specificity_expression_decoupling"
 PAIR_SIGNAL = "original_lr_score_sum"
 MIN_PAIR_OCCURRENCE = 10
 OBSERVED_RUN_DIRNAME = "_observed_run"
@@ -132,7 +133,10 @@ def parse_bool(value: str) -> bool:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Observed-only CCC analysis: Moran's I, cell-type specificity, and expression-attention decoupling."
+        description=(
+            "Observed-only CCC analysis: edge spatial focality, "
+            "cell-type specificity, and expression-attention decoupling."
+        )
     )
     parser.add_argument(
         "--dataset",
@@ -381,6 +385,38 @@ def build_pair_spot_map(pair_df: pd.DataFrame, spot_index: dict[str, int]) -> np
     return values
 
 
+def edge_spatial_focality(
+    pair_df: pd.DataFrame,
+    spot_index: dict[str, int],
+    coords: np.ndarray,
+) -> float:
+    """Score whether an LR pair's candidate edges are spatially concentrated."""
+    if pair_df.empty or coords.shape[0] < 2:
+        return float("nan")
+    src_idx = pair_df["src_spot_barcode"].map(spot_index)
+    dst_idx = pair_df["dst_spot_barcode"].map(spot_index)
+    valid = src_idx.notna() & dst_idx.notna()
+    if not valid.any():
+        return float("nan")
+
+    src = coords[src_idx.loc[valid].astype(int).to_numpy()]
+    dst = coords[dst_idx.loc[valid].astype(int).to_numpy()]
+    midpoints = (src + dst) / 2.0
+    weights = pair_df.loc[valid, "attention_score"].astype(float).to_numpy()
+    weights = np.clip(weights, a_min=0.0, a_max=None)
+    if float(weights.sum()) <= 0:
+        weights = np.ones(len(midpoints), dtype=float)
+
+    centroid = np.average(midpoints, axis=0, weights=weights)
+    distances = np.linalg.norm(midpoints - centroid, axis=1)
+    weighted_dispersion = float(np.average(distances, weights=weights))
+    tissue_span = np.ptp(coords, axis=0)
+    tissue_diagonal = float(np.linalg.norm(tissue_span))
+    if tissue_diagonal <= 0:
+        return float("nan")
+    return float(np.clip(1.0 - weighted_dispersion / tissue_diagonal, 0.0, 1.0))
+
+
 def morans_i(values: np.ndarray, adjacency: np.ndarray) -> float:
     centered = values - values.mean()
     denominator = float(np.sum(centered**2))
@@ -393,6 +429,56 @@ def morans_i(values: np.ndarray, adjacency: np.ndarray) -> float:
 
     numerator = float(centered.T @ adjacency @ centered)
     return (len(values) / s0) * (numerator / denominator)
+
+
+def bivariate_morans_r(ligand_values: np.ndarray, receptor_values: np.ndarray, adjacency: np.ndarray) -> float:
+    """SpatialDM-style global bivariate Moran's R for an LR pair.
+
+    This scores whether high ligand expression at one spot is adjacent to high
+    receptor expression in neighboring spots. The adjacency rows are normalized
+    so the value is comparable across KNN graph sizes.
+    """
+    if ligand_values.shape != receptor_values.shape:
+        return float("nan")
+    if np.nanstd(ligand_values) <= 0 or np.nanstd(receptor_values) <= 0:
+        return float("nan")
+
+    row_sums = adjacency.sum(axis=1, keepdims=True)
+    row_sums[row_sums <= 0] = 1.0
+    weights = adjacency / row_sums
+
+    ligand_z = (ligand_values - np.nanmean(ligand_values)) / np.nanstd(ligand_values)
+    receptor_z = (receptor_values - np.nanmean(receptor_values)) / np.nanstd(receptor_values)
+    return float(np.nanmean(ligand_z * (weights @ receptor_z)))
+
+
+def parse_lr_pair(lr_pair: str) -> tuple[str, list[str]]:
+    ligand, receptor = str(lr_pair).split("_", 1)
+    return ligand.upper(), [part.strip().upper() for part in receptor.split("_") if part.strip()]
+
+
+def load_spot_expression(spot_cell_expr_csv: Path | None, spot_names: list[str]) -> pd.DataFrame | None:
+    if spot_cell_expr_csv is None or not spot_cell_expr_csv.exists():
+        return None
+    expr = pd.read_csv(spot_cell_expr_csv, index_col=0)
+    expr = expr.apply(pd.to_numeric, errors="coerce").fillna(0.0)
+    expr.columns = [str(column).upper() for column in expr.columns]
+    spots = expr.index.to_series().astype(str).str.rsplit("_", n=1, expand=True)[0]
+    spot_expr = expr.groupby(spots).sum()
+    spot_expr = spot_expr.reindex(spot_names).fillna(0.0)
+    totals = spot_expr.sum(axis=1).replace(0.0, np.nan)
+    spot_expr = np.log1p(spot_expr.div(totals, axis=0).fillna(0.0) * 1e4)
+    return spot_expr
+
+
+def receptor_expression(spot_expr: pd.DataFrame, receptor_genes: list[str]) -> np.ndarray | None:
+    missing = [gene for gene in receptor_genes if gene not in spot_expr.columns]
+    if missing:
+        return None
+    values = spot_expr[receptor_genes].to_numpy(dtype=float)
+    if values.ndim == 1 or values.shape[1] == 1:
+        return values.reshape(-1)
+    return np.exp(np.log(values + 1e-12).mean(axis=1))
 
 
 def compute_celltype_entropy(pair_df: pd.DataFrame) -> tuple[float, int]:
@@ -412,6 +498,8 @@ def precompute_candidate_metrics(
     pair_stats: pd.DataFrame,
     spot_index: dict[str, int],
     adjacency: np.ndarray,
+    coords: np.ndarray,
+    spot_expr: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     pair_groups = lr_df.groupby("lr_pair", sort=False)
     rows = []
@@ -419,6 +507,17 @@ def precompute_candidate_metrics(
         pair_df = pair_groups.get_group(record.lr_pair)
         values = build_pair_spot_map(pair_df, spot_index)
         entropy, ct_count = compute_celltype_entropy(pair_df)
+        bivar_r = float("nan")
+        if spot_expr is not None:
+            ligand, receptor_genes = parse_lr_pair(record.lr_pair)
+            if ligand in spot_expr.columns:
+                receptor_values = receptor_expression(spot_expr, receptor_genes)
+                if receptor_values is not None:
+                    bivar_r = bivariate_morans_r(
+                        spot_expr[ligand].to_numpy(dtype=float),
+                        receptor_values,
+                        adjacency,
+                    )
         rows.append(
             {
                 "lr_pair": record.lr_pair,
@@ -428,6 +527,8 @@ def precompute_candidate_metrics(
                 "original_lr_sum": record.original_lr_sum,
                 "pair_activity_sum": float(values.sum()),
                 "moran_i": morans_i(values, adjacency),
+                "bivariate_moran_r": bivar_r,
+                "edge_spatial_focality": edge_spatial_focality(pair_df, spot_index, coords),
                 "celltype_entropy": entropy,
                 "celltype_pair_count": ct_count,
             }
@@ -456,27 +557,14 @@ def select_top_pairs(candidate_metrics: pd.DataFrame, top_k: int, ranking_type: 
 
 
 def compare_groups(metrics_df: pd.DataFrame) -> pd.DataFrame:
-    metrics_to_compare = ["moran_i", "celltype_entropy", "celltype_pair_count"]
-    rows = []
-    for metric in metrics_to_compare:
-        attention = metrics_df.loc[metrics_df["ranking_type"] == "attention", metric].dropna()
-        frequency = metrics_df.loc[metrics_df["ranking_type"] == "frequency", metric].dropna()
-        p_value = float("nan")
-        if len(attention) and len(frequency):
-            p_value = float(mannwhitneyu(attention, frequency, alternative="two-sided").pvalue)
-        rows.append(
-            {
-                "metric": metric,
-                "attention_mean": attention.mean() if len(attention) else float("nan"),
-                "frequency_mean": frequency.mean() if len(frequency) else float("nan"),
-                "attention_median": attention.median() if len(attention) else float("nan"),
-                "frequency_median": frequency.median() if len(frequency) else float("nan"),
-                "attention_n": len(attention),
-                "frequency_n": len(frequency),
-                "mannwhitney_pvalue": p_value,
-            }
-        )
-    return pd.DataFrame(rows)
+    summary, _, _ = compare_lr_pair_groups(
+        metrics_df,
+        {
+            "edge_spatial_focality": "Edge spatial focality",
+            "celltype_pair_count": "Cell-type-pair count",
+        },
+    )
+    return summary
 
 
 def build_expression_attention_stats(
@@ -528,7 +616,7 @@ def build_expression_attention_stats(
 
 def save_metric_boxplot(metrics_df: pd.DataFrame, output_path: Path, dataset_key: str) -> None:
     panel_specs = [
-        ("moran_i", "Moran's I"),
+        ("edge_spatial_focality", "Edge Spatial Focality"),
         ("celltype_entropy", "Cell-type Entropy"),
         ("celltype_pair_count", "Cell-type Pair Count"),
     ]
@@ -536,21 +624,29 @@ def save_metric_boxplot(metrics_df: pd.DataFrame, output_path: Path, dataset_key
     if len(panel_specs) == 1:
         axes = [axes]
 
+    _, disjoint_metrics, _ = compare_lr_pair_groups(
+        metrics_df,
+        {
+            "edge_spatial_focality": "Edge spatial focality",
+            "celltype_pair_count": "Cell-type-pair count",
+        },
+    )
     for ax, (metric, label) in zip(axes, panel_specs):
         values = [
-            metrics_df.loc[metrics_df["ranking_type"] == "attention", metric].dropna().to_numpy(),
-            metrics_df.loc[metrics_df["ranking_type"] == "frequency", metric].dropna().to_numpy(),
+            disjoint_metrics.loc[disjoint_metrics["ranking_type"] == "attention", metric].dropna().to_numpy(),
+            disjoint_metrics.loc[disjoint_metrics["ranking_type"] == "frequency", metric].dropna().to_numpy(),
         ]
         ax.boxplot(values, labels=["attention", "frequency"], patch_artist=True)
         ax.set_title(f"{dataset_key}: {label}")
         ax.set_ylabel(label)
         ax.grid(axis="y", alpha=0.3)
-        if len(values[0]) and len(values[1]):
-            p_value = float(mannwhitneyu(values[0], values[1], alternative="two-sided").pvalue)
+        if metric in {"edge_spatial_focality", "celltype_pair_count"}:
+            summary = compare_groups(metrics_df).set_index("metric").loc[metric]
+            p_value = float(summary["holm_p"])
             ax.text(
                 0.5,
                 0.98,
-                f"p = {p_value:.2e}",
+                f"Holm P = {p_value:.2e}",
                 transform=ax.transAxes,
                 ha="center",
                 va="top",
@@ -640,14 +736,21 @@ def analyze_lr_table(
     lr_df = filter_known_spots(lr_df, set(spot_names))
     adjacency = build_adjacency(coords, config.n_spot_neighbors)
     spot_index = {barcode: idx for idx, barcode in enumerate(spot_names)}
+    spot_expr = load_spot_expression(config.spot_cell_expr_csv, spot_names)
 
     pair_stats = filter_candidate_pairs(summarize_pairs(lr_df), min_pair_occurrence)
-    candidate_metrics = precompute_candidate_metrics(lr_df, pair_stats, spot_index, adjacency)
+    candidate_metrics = precompute_candidate_metrics(lr_df, pair_stats, spot_index, adjacency, coords, spot_expr)
 
     top_attention = select_top_pairs(candidate_metrics, top_k=top_k, ranking_type="attention")
     top_frequency = select_top_pairs(candidate_metrics, top_k=top_k, ranking_type="frequency")
     selected_pairs = pd.concat([top_attention, top_frequency], ignore_index=True)
-    group_summary = compare_groups(selected_pairs)
+    group_summary, figure3e_pairs, overlap = compare_lr_pair_groups(
+        selected_pairs,
+        {
+            "edge_spatial_focality": "Edge spatial focality",
+            "celltype_pair_count": "Cell-type-pair count",
+        },
+    )
     expression_pair_stats, expression_summary = build_expression_attention_stats(
         candidate_metrics,
         selected_pairs,
@@ -657,6 +760,10 @@ def analyze_lr_table(
     return {
         "top_pairs": selected_pairs,
         "pair_metrics": selected_pairs.copy(),
+        "figure3e_pairs": figure3e_pairs,
+        "figure3e_overlap": pd.DataFrame(
+            {"lr_pair": overlap, "exclusion_reason": "selected by both rankings"}
+        ),
         "group_summary": group_summary,
         "expression_pair_stats": expression_pair_stats,
         "expression_summary": expression_summary,
@@ -775,6 +882,8 @@ def save_outputs(
 
     observed_results["top_pairs"].to_csv(output_dir / "observed_top_pairs.csv", index=False)
     observed_results["pair_metrics"].to_csv(output_dir / "observed_pair_metrics.csv", index=False)
+    observed_results["figure3e_pairs"].to_csv(output_dir / "figure3e_lr_pair_units.csv", index=False)
+    observed_results["figure3e_overlap"].to_csv(output_dir / "figure3e_excluded_overlap.csv", index=False)
     observed_results["group_summary"].to_csv(output_dir / "observed_group_summary.csv", index=False)
     observed_results["expression_pair_stats"].to_csv(
         output_dir / "expression_attention_pair_stats.csv",
@@ -894,7 +1003,7 @@ def run_dataset(config: DatasetConfig, args: argparse.Namespace) -> dict[str, ob
     expression_summary = observed_results["expression_summary"].copy()
     expression_summary.insert(0, "dataset", config.key)
 
-    note = "Observed-only workflow with Moran, cell-type specificity, and expression-attention decoupling."
+    note = "Observed-only workflow with edge spatial focality, cell-type specificity, and expression-attention decoupling."
     return {
         "dataset": config.key,
         "output_dir": output_dir,

@@ -5,13 +5,13 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+import sys
 
 import matplotlib
 import numpy as np
 import pandas as pd
 import scanpy as sc
 import matplotlib.patheffects as pe
-from scipy.stats import mannwhitneyu
 from scipy.stats import spearmanr
 from sklearn.neighbors import kneighbors_graph
 
@@ -22,6 +22,11 @@ import matplotlib.pyplot as plt
 SCRIPT_DIR = Path(__file__).resolve().parent
 EVALUATE_DIR = SCRIPT_DIR.parent.parent
 DATA_ROOT = EVALUATE_DIR / "data"
+REPO_ROOT = EVALUATE_DIR.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from spagraph.analysis.figure3e_statistics import compare_lr_pair_groups
 
 DEFAULT_DATASET = "GSE144236"
 DATASET_ANALYSIS_DIRS = {
@@ -35,6 +40,12 @@ DATASET_ST_H5AD = {
     "GSE144236": EVALUATE_DIR.parent / "spagraph_data" / "database" / "GSE144240" / "GSE144236_P2_ST.h5ad",
     "GSE243275": EVALUATE_DIR.parent / "spagraph_data" / "database" / "GSE243275" / "GSM7782699_ST.h5ad",
     "GSE211956_P3": EVALUATE_DIR.parent / "spagraph_data" / "database" / "GSE211956" / "GSE211956_ST_P3.h5ad",
+}
+DATASET_SPOT_CELL_EXPR = {
+    "CID44971": DATA_ROOT / "CID44971" / "CID44971_ST_spot_cell_expr.csv",
+    "GSE144236": DATA_ROOT / "GSE144236" / "Spatial_spot_cell_expr.csv",
+    "GSE243275": DATA_ROOT / "GSE243275" / "GSM7782699_ST_spot_cell_expr.csv",
+    "GSE211956_P3": DATA_ROOT / "GSE211956" / "P3" / "GSE211956_ST_P3_spot_cell_expr.csv",
 }
 
 EXPRESSION_STATS_CSV = "expression_attention_pair_stats.csv"
@@ -86,10 +97,25 @@ def parse_args() -> argparse.Namespace:
         help="Optional raw lr_communication.csv path. If provided, metrics are rebuilt from this file.",
     )
     parser.add_argument(
+        "--pair-ranking-csv",
+        type=Path,
+        default=None,
+        help=(
+            "Optional LR-pair ranking table, such as lr_pair_associated_edge_statistics.csv. "
+            "When provided with --lr-csv, attention ranking uses this table."
+        ),
+    )
+    parser.add_argument(
         "--st-h5ad",
         type=Path,
         default=None,
         help="Spatial h5ad used when --lr-csv is given.",
+    )
+    parser.add_argument(
+        "--spot-cell-expr-csv",
+        type=Path,
+        default=None,
+        help="Stage 2 spot-cell expression CSV used to compute optional LR expression spatial co-expression fields.",
     )
     parser.add_argument(
         "--output-dir",
@@ -125,7 +151,7 @@ def parse_args() -> argparse.Namespace:
         "--n-spot-neighbors",
         type=int,
         default=8,
-        help="KNN graph size for Moran's I.",
+        help="KNN graph size used for optional spatial co-expression fields.",
     )
     parser.add_argument(
         "--show-titles",
@@ -237,6 +263,30 @@ def filter_candidate_pairs(pair_stats: pd.DataFrame, min_pair_occurrence: int) -
     return filtered.reset_index(drop=True)
 
 
+def apply_pair_ranking(pair_stats: pd.DataFrame, pair_ranking_csv: Path | None) -> pd.DataFrame:
+    if pair_ranking_csv is None:
+        return pair_stats
+
+    ranking = pd.read_csv(pair_ranking_csv)
+    required = {"lr_pair", "associated_edge_attention_mean"}
+    missing = required.difference(ranking.columns)
+    if missing:
+        raise ValueError(f"{pair_ranking_csv} missing required columns: {sorted(missing)}")
+
+    cols = ["lr_pair", "associated_edge_attention_mean"]
+    if "attention_rank" in ranking.columns:
+        cols.append("attention_rank")
+    ranking = ranking[cols].drop_duplicates(subset=["lr_pair"]).copy()
+    ranking["lr_pair"] = ranking["lr_pair"].astype(str)
+
+    out = pair_stats.copy()
+    out["lr_pair"] = out["lr_pair"].astype(str)
+    out = out.merge(ranking, on="lr_pair", how="left")
+    out["attention_mean"] = out["associated_edge_attention_mean"].fillna(out["attention_mean"])
+    out["attention_sum"] = out["attention_mean"] * out["occurrence_count"]
+    return out.drop(columns=["associated_edge_attention_mean"])
+
+
 def build_pair_spot_map(pair_df: pd.DataFrame, spot_index: dict[str, int]) -> np.ndarray:
     values = np.zeros(len(spot_index), dtype=float)
     src_contrib = pair_df.groupby("src_spot_barcode")["original_lr_score"].sum()
@@ -246,6 +296,38 @@ def build_pair_spot_map(pair_df: pd.DataFrame, spot_index: dict[str, int]) -> np
     for barcode, value in dst_contrib.items():
         values[spot_index[barcode]] += float(value)
     return values
+
+
+def edge_spatial_focality(
+    pair_df: pd.DataFrame,
+    spot_index: dict[str, int],
+    coords: np.ndarray,
+) -> float:
+    """Score whether an LR pair's candidate edges are spatially concentrated."""
+    if pair_df.empty or coords.shape[0] < 2:
+        return float("nan")
+    src_idx = pair_df["src_spot_barcode"].map(spot_index)
+    dst_idx = pair_df["dst_spot_barcode"].map(spot_index)
+    valid = src_idx.notna() & dst_idx.notna()
+    if not valid.any():
+        return float("nan")
+
+    src = coords[src_idx.loc[valid].astype(int).to_numpy()]
+    dst = coords[dst_idx.loc[valid].astype(int).to_numpy()]
+    midpoints = (src + dst) / 2.0
+    weights = pair_df.loc[valid, "attention_score"].astype(float).to_numpy()
+    weights = np.clip(weights, a_min=0.0, a_max=None)
+    if float(weights.sum()) <= 0:
+        weights = np.ones(len(midpoints), dtype=float)
+
+    centroid = np.average(midpoints, axis=0, weights=weights)
+    distances = np.linalg.norm(midpoints - centroid, axis=1)
+    weighted_dispersion = float(np.average(distances, weights=weights))
+    tissue_span = np.ptp(coords, axis=0)
+    tissue_diagonal = float(np.linalg.norm(tissue_span))
+    if tissue_diagonal <= 0:
+        return float("nan")
+    return float(np.clip(1.0 - weighted_dispersion / tissue_diagonal, 0.0, 1.0))
 
 
 def morans_i(values: np.ndarray, adjacency: np.ndarray) -> float:
@@ -258,6 +340,47 @@ def morans_i(values: np.ndarray, adjacency: np.ndarray) -> float:
         return float("nan")
     numerator = float(centered.T @ adjacency @ centered)
     return (len(values) / s0) * (numerator / denominator)
+
+
+def bivariate_morans_r(ligand_values: np.ndarray, receptor_values: np.ndarray, adjacency: np.ndarray) -> float:
+    if ligand_values.shape != receptor_values.shape:
+        return float("nan")
+    if np.nanstd(ligand_values) <= 0 or np.nanstd(receptor_values) <= 0:
+        return float("nan")
+    row_sums = adjacency.sum(axis=1, keepdims=True)
+    row_sums[row_sums <= 0] = 1.0
+    weights = adjacency / row_sums
+    ligand_z = (ligand_values - np.nanmean(ligand_values)) / np.nanstd(ligand_values)
+    receptor_z = (receptor_values - np.nanmean(receptor_values)) / np.nanstd(receptor_values)
+    return float(np.nanmean(ligand_z * (weights @ receptor_z)))
+
+
+def parse_lr_pair(lr_pair: str) -> tuple[str, list[str]]:
+    ligand, receptor = str(lr_pair).split("_", 1)
+    return ligand.upper(), [part.strip().upper() for part in receptor.split("_") if part.strip()]
+
+
+def load_spot_expression(spot_cell_expr_csv: Path | None, spot_names: list[str]) -> pd.DataFrame | None:
+    if spot_cell_expr_csv is None or not spot_cell_expr_csv.exists():
+        return None
+    expr = pd.read_csv(spot_cell_expr_csv, index_col=0)
+    expr = expr.apply(pd.to_numeric, errors="coerce").fillna(0.0)
+    expr.columns = [str(column).upper() for column in expr.columns]
+    spots = expr.index.to_series().astype(str).str.rsplit("_", n=1, expand=True)[0]
+    spot_expr = expr.groupby(spots).sum()
+    spot_expr = spot_expr.reindex(spot_names).fillna(0.0)
+    totals = spot_expr.sum(axis=1).replace(0.0, np.nan)
+    return np.log1p(spot_expr.div(totals, axis=0).fillna(0.0) * 1e4)
+
+
+def receptor_expression(spot_expr: pd.DataFrame, receptor_genes: list[str]) -> np.ndarray | None:
+    missing = [gene for gene in receptor_genes if gene not in spot_expr.columns]
+    if missing:
+        return None
+    values = spot_expr[receptor_genes].to_numpy(dtype=float)
+    if values.ndim == 1 or values.shape[1] == 1:
+        return values.reshape(-1)
+    return np.exp(np.log(values + 1e-12).mean(axis=1))
 
 
 def compute_celltype_entropy(pair_df: pd.DataFrame) -> tuple[float, int]:
@@ -275,6 +398,8 @@ def precompute_candidate_metrics(
     pair_stats: pd.DataFrame,
     spot_index: dict[str, int],
     adjacency: np.ndarray,
+    coords: np.ndarray,
+    spot_expr: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     pair_groups = lr_df.groupby("lr_pair", sort=False)
     rows = []
@@ -282,6 +407,17 @@ def precompute_candidate_metrics(
         pair_df = pair_groups.get_group(record.lr_pair)
         values = build_pair_spot_map(pair_df, spot_index)
         entropy, ct_count = compute_celltype_entropy(pair_df)
+        bivar_r = float("nan")
+        if spot_expr is not None:
+            ligand, receptor_genes = parse_lr_pair(record.lr_pair)
+            if ligand in spot_expr.columns:
+                receptor_values = receptor_expression(spot_expr, receptor_genes)
+                if receptor_values is not None:
+                    bivar_r = bivariate_morans_r(
+                        spot_expr[ligand].to_numpy(dtype=float),
+                        receptor_values,
+                        adjacency,
+                    )
         rows.append(
             {
                 "lr_pair": record.lr_pair,
@@ -291,6 +427,8 @@ def precompute_candidate_metrics(
                 "original_lr_sum": record.original_lr_sum,
                 "pair_activity_sum": float(values.sum()),
                 "moran_i": morans_i(values, adjacency),
+                "bivariate_moran_r": bivar_r,
+                "edge_spatial_focality": edge_spatial_focality(pair_df, spot_index, coords),
                 "celltype_entropy": entropy,
                 "celltype_pair_count": ct_count,
             }
@@ -300,10 +438,16 @@ def precompute_candidate_metrics(
 
 def select_top_pairs(candidate_metrics: pd.DataFrame, top_k: int, ranking_type: str) -> pd.DataFrame:
     if ranking_type == "attention":
-        ranked = candidate_metrics.sort_values(
-            ["attention_mean", "occurrence_count", "attention_sum", "lr_pair"],
-            ascending=[False, False, False, True],
-        )
+        if "attention_rank" in candidate_metrics.columns and candidate_metrics["attention_rank"].notna().any():
+            ranked = candidate_metrics.sort_values(
+                ["attention_rank", "attention_mean", "occurrence_count", "lr_pair"],
+                ascending=[True, False, False, True],
+            )
+        else:
+            ranked = candidate_metrics.sort_values(
+                ["attention_mean", "occurrence_count", "attention_sum", "lr_pair"],
+                ascending=[False, False, False, True],
+            )
     elif ranking_type == "frequency":
         ranked = candidate_metrics.sort_values(
             ["occurrence_count", "attention_mean", "attention_sum", "lr_pair"],
@@ -351,6 +495,8 @@ def build_expression_attention_stats(
 def build_metrics_from_lr_csv(
     lr_csv: Path,
     st_h5ad: Path,
+    spot_cell_expr_csv: Path | None,
+    pair_ranking_csv: Path | None,
     top_k: int,
     min_pair_occurrence: int,
     n_spot_neighbors: int,
@@ -362,9 +508,11 @@ def build_metrics_from_lr_csv(
     lr_df = filter_known_spots(lr_df, set(spot_names))
     adjacency = build_adjacency(coords, n_spot_neighbors)
     spot_index = {barcode: idx for idx, barcode in enumerate(spot_names)}
+    spot_expr = load_spot_expression(spot_cell_expr_csv, spot_names)
 
-    pair_stats = filter_candidate_pairs(summarize_pairs(lr_df), min_pair_occurrence)
-    candidate_metrics = precompute_candidate_metrics(lr_df, pair_stats, spot_index, adjacency)
+    pair_stats = apply_pair_ranking(summarize_pairs(lr_df), pair_ranking_csv)
+    pair_stats = filter_candidate_pairs(pair_stats, min_pair_occurrence)
+    candidate_metrics = precompute_candidate_metrics(lr_df, pair_stats, spot_index, adjacency, coords, spot_expr)
     top_attention = select_top_pairs(candidate_metrics, top_k=top_k, ranking_type="attention")
     top_frequency = select_top_pairs(candidate_metrics, top_k=top_k, ranking_type="frequency")
     selected_pairs = pd.concat([top_attention, top_frequency], ignore_index=True)
@@ -554,13 +702,25 @@ def build_boxplot_panel(
     label: str,
     show_title: bool,
 ) -> None:
-    attention = metrics_df.loc[metrics_df["ranking_type"] == "attention", metric].dropna().to_numpy()
-    frequency = metrics_df.loc[metrics_df["ranking_type"] == "frequency", metric].dropna().to_numpy()
+    summary, disjoint_metrics, _ = compare_lr_pair_groups(
+        metrics_df,
+        {
+            "edge_spatial_focality": "Edge spatial focality",
+            "celltype_pair_count": "Cell-type-pair count",
+        },
+    )
+    comparison = summary.set_index("metric").loc[metric]
+    attention = disjoint_metrics.loc[
+        disjoint_metrics["ranking_type"] == "attention", metric
+    ].dropna().to_numpy()
+    frequency = disjoint_metrics.loc[
+        disjoint_metrics["ranking_type"] == "frequency", metric
+    ].dropna().to_numpy()
     values = [attention, frequency]
 
     box = ax.boxplot(
         values,
-        tick_labels=[f"Attn-top\n(n={len(attention)})", f"Freq-top\n(n={len(frequency)})"],
+        tick_labels=[f"Attention-only\nLR pairs (n={len(attention)})", f"Frequency-only\nLR pairs (n={len(frequency)})"],
         patch_artist=True,
         widths=0.52,
         showfliers=False,
@@ -596,13 +756,11 @@ def build_boxplot_panel(
         ax.set_title(label, pad=8, fontsize=11)
     ax.set_ylabel(label)
 
-    p_value = float("nan")
-    if len(attention) and len(frequency):
-        p_value = float(mannwhitneyu(attention, frequency, alternative="two-sided").pvalue)
+    p_value = float(comparison["holm_p"])
     ax.text(
         0.5,
         0.98,
-        format_pvalue(p_value),
+        f"Holm {format_pvalue(p_value).replace('p =', 'P =')}",
         transform=ax.transAxes,
         ha="center",
         va="top",
@@ -649,9 +807,18 @@ def export_figures(
     expression_pdf = output_dir / "expression_vs_attention_publication.pdf"
     expression_png = output_dir / "expression_vs_attention_publication.png"
     metric_specs = [
-        ("moran_i", "Moran's I", "moran_i_boxplot_publication"),
+        ("edge_spatial_focality", "Edge Spatial Focality", "edge_spatial_focality_boxplot_publication"),
         ("celltype_pair_count", "Cell-type Pair Count", "celltype_pair_count_boxplot_publication"),
     ]
+    figure3e_summary, figure3e_pairs, overlap = compare_lr_pair_groups(
+        pair_metrics_df,
+        {metric: label for metric, label, _ in metric_specs},
+    )
+    figure3e_summary.to_csv(output_dir / "figure3e_statistics.csv", index=False)
+    figure3e_pairs.to_csv(output_dir / "figure3e_lr_pair_units.csv", index=False)
+    pd.DataFrame(
+        {"lr_pair": overlap, "exclusion_reason": "selected by both rankings"}
+    ).to_csv(output_dir / "figure3e_excluded_overlap.csv", index=False)
 
     save_expression_attention_plot(
         pair_stats_df=expression_stats_df,
@@ -717,6 +884,16 @@ def resolve_st_h5ad(args: argparse.Namespace, dataset_key: str | None) -> Path:
     raise ValueError("Could not infer st_h5ad from --lr-csv. Please pass --st-h5ad explicitly.")
 
 
+def resolve_spot_cell_expr_csv(args: argparse.Namespace, dataset_key: str | None) -> Path | None:
+    if args.spot_cell_expr_csv is not None:
+        return args.spot_cell_expr_csv.resolve()
+    if dataset_key is not None:
+        candidate = DATASET_SPOT_CELL_EXPR.get(dataset_key)
+        if candidate is not None and candidate.exists():
+            return candidate
+    return None
+
+
 def main() -> None:
     args = parse_args()
     apply_publication_style()
@@ -725,6 +902,7 @@ def main() -> None:
         lr_csv = args.lr_csv.resolve()
         dataset_key = infer_dataset_from_path(lr_csv)
         st_h5ad = resolve_st_h5ad(args, dataset_key)
+        spot_cell_expr_csv = resolve_spot_cell_expr_csv(args, dataset_key)
         dataset_label = ""
         output_dir = (
             args.output_dir.resolve()
@@ -734,6 +912,8 @@ def main() -> None:
         expression_stats_df, pair_metrics_df = build_metrics_from_lr_csv(
             lr_csv=lr_csv,
             st_h5ad=st_h5ad,
+            spot_cell_expr_csv=spot_cell_expr_csv,
+            pair_ranking_csv=args.pair_ranking_csv.resolve() if args.pair_ranking_csv is not None else None,
             top_k=args.top_k,
             min_pair_occurrence=args.min_pair_occurrence,
             n_spot_neighbors=args.n_spot_neighbors,

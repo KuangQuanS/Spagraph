@@ -708,8 +708,6 @@ def run_deconv_auto_k(
         deconv_df = best_result['deconv']
         deconv_path = os.path.join(output_dir, f"{best_result['sample_name']}_cell_composition.csv")
         deconv_df.to_csv(deconv_path)
-        deconv_path = os.path.join(output_dir, f"{best_result['sample_name']}_cell_composition.csv")
-        deconv_df.to_csv(deconv_path)
         print(f"Deconvolution matrix saved to: {deconv_path}")
         
         # 保存配置文件

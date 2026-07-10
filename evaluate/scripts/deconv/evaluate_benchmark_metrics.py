@@ -170,12 +170,14 @@ def plot_gene_heatmaps(coords, gt_vec, pred_vec, target_gene: str, output_pdf: s
     print(summarize("Pred", pred_vec))
 
     # 娑?Ground truth 娑?Prediction 閸掑棗鍩嗙紒妯哄煑娑撱倕绱堕獮鎻掑櫍閻ㄥ嫬娴橀悧鍥风礄閺冪姴娼楅弽鍥叡閿?
-    # 缂佹ê鍩楅崡鏇炵炊閻ㄥ嫬搴滈崝鈺佸毐閺?    def _plot_single(vals, title, outpath, caption=None):
+    # Render each ground-truth or predicted expression map independently.
+    def _plot_single(vals, title, outpath, caption=None):
         vmax = np.percentile(vals, clip_percentile)
         vmin = np.percentile(vals, 100 - clip_percentile) if log1p else 0.0
         fig, ax = plt.subplots(1, 1, figsize=(6, 6), dpi=300)
         
-        # 鐠佸墽鐤嗛懗灞炬珯娑撹櫣娅ч懝?        bg_color = 'white'
+        # Use a white background for publication export.
+        bg_color = 'white'
         fig.patch.set_facecolor(bg_color)
         ax.set_facecolor(bg_color)
         
@@ -427,7 +429,8 @@ def save_ars_barplot(ars_df: pd.DataFrame, labels: List[str], output_csv: str):
         'Stereoscope': '#999999'
     }
     
-    # 閸斻劍鈧浇鐨熼弫鏉戞禈鐞涖劑鐝惔?    fig_height = max(6, len(labels) * 0.5)
+    # Scale figure height with the number of methods.
+    fig_height = max(6, len(labels) * 0.5)
     fig, ax = plt.subplots(figsize=(8, fig_height))
     
     # Prepare data with method names
@@ -445,7 +448,8 @@ def save_ars_barplot(ars_df: pd.DataFrame, labels: List[str], output_csv: str):
     bars = ax.barh(y_pos, ars_values, color=bar_colors, alpha=0.8, height=0.7, 
                    edgecolor='black', linewidth=0.5)
     
-    # 濞ｈ濮為弫鏉库偓鍏肩垼缁?    for i, (bar, ars_val) in enumerate(zip(bars, ars_values)):
+    # Label each method with its ARS value.
+    for i, (bar, ars_val) in enumerate(zip(bars, ars_values)):
         ax.text(ars_val + 0.01, bar.get_y() + bar.get_height()/2, 
                 f'{ars_val:.3f}', ha='left', va='center', fontsize=10, fontweight='bold')
     
@@ -571,17 +575,18 @@ def save_multi_boxplots(metrics_list: List[pd.DataFrame], labels: List[str],
     # Get colors for labels
     box_colors = [colors.get(label, '#0072B2') for label in labels]
     
-    # 娑撶儤鐦℃稉顏呭瘹閺嶅洤鍨卞铏瑰缁斿娈戝Ο顏勬倻缁犲崬鐎烽崶?    out_prefix = output_csv.rsplit('.', 1)[0]
+    # Reuse the CSV stem for the separate metric plots.
+    out_prefix = output_csv.rsplit('.', 1)[0]
     
     for metric in metric_cols:
-        # 閺€鍫曟肠鐠囥儲瀵氶弽鍥ф躬閹碘偓閺堝鏌熷▔鏇氱瑐閻ㄥ嫭鏆熼幑?        box_data = []
+        box_data = []
         for m in metrics_list:
             box_data.append(m[metric].dropna().values)
         
-        # 閸斻劍鈧浇鐨熼弫鏉戞禈鐞涖劑鐝惔锔肩窗閺嶈宓侀弫鐗堝祦闂嗗棙鏆熼柌?        fig_height = max(6, n_methods * 0.25)
+        fig_height = max(6, n_methods * 0.25)
         fig, ax = plt.subplots(figsize=(8, fig_height))
         
-        # 缂佹ê鍩楀Ο顏勬倻缁犺京鍤庨崶鎾呯礄闁插洨鏁ゆ担鐘叉灘濞嗐垻娈戦弽宄扮础閿?        bp = ax.boxplot(box_data, vert=False, tick_labels=labels, patch_artist=True,
+        bp = ax.boxplot(box_data, vert=False, tick_labels=labels, patch_artist=True,
                        whis=[5, 95], showfliers=False,
                        showmeans=True,
                        meanprops=dict(marker='D', markerfacecolor='#FF8C00', markeredgecolor='black', 
@@ -591,7 +596,7 @@ def save_multi_boxplots(metrics_list: List[pd.DataFrame], labels: List[str],
                        capprops=dict(color='black', linewidth=1.5),
                        boxprops=dict(linewidth=1.5))
         
-        # 缂佹瑦鐦℃稉顏嗩唸鐎涙劒绗傞懝?        for patch, color in zip(bp['boxes'], box_colors):
+        for patch, color in zip(bp['boxes'], box_colors):
             patch.set_facecolor(color)
             patch.set_alpha(0.8)
             patch.set_edgecolor('black')
@@ -607,7 +612,7 @@ def save_multi_boxplots(metrics_list: List[pd.DataFrame], labels: List[str],
         # 缁夊娅庢い鍫曞劥閸滃苯褰告笟褑绔熷?        ax.spines['top'].set_visible(False)
         ax.spines['right'].set_visible(False)
         
-        # 娣囨繂鐡ㄩ崡鏇犲閻ㄥ嫬娴橀悧?        metric_png = f"{out_prefix}_{metric}_boxplot.pdf"
+        metric_png = f"{out_prefix}_{metric}_boxplot.pdf"
         plt.tight_layout()
         plt.savefig(metric_png, dpi=300, bbox_inches='tight')
         plt.close(fig)
@@ -1004,7 +1009,7 @@ def main():
                     gt_mat = gt_slice.X.toarray() if hasattr(gt_slice.X, "toarray") else gt_slice.X
                     gt_sub = pd.DataFrame(gt_mat, index=shared_spots, columns=[matched_gene])
 
-                # 閼汇儲婀侀崺鍝勬礈閸掓ぞ绗夋稉鈧懛杈剧礉閸欐牔姘﹂梿鍡曚簰娓氬灝鍙曢獮铏槷鏉?                shared_genes = recon_sub.columns.intersection(gt_sub.columns)
+                shared_genes = recon_sub.columns.intersection(gt_sub.columns)
                 if len(shared_genes) == 0:
                     print("Warning: No overlapping genes found between reconstructed and ground truth when computing depths.")
                 else:

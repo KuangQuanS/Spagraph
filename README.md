@@ -69,7 +69,8 @@ spg.cellcom(
     receptor_expr_threshold=3.0,
     epochs=200,
     seed=42,
-    export_unified_csv=True,
+    n_repeats=5,
+    export_unified_csv=False,
 )
 ```
 
@@ -80,6 +81,33 @@ Stage 2 writes `*_composition.csv`, configuration and training diagnostics;
 `*_spot_cell_expr.csv` file required by Stage 3. Stage 3 writes filtered or
 unified LR communication tables and model diagnostics under its output
 directory.
+
+### Stable cell-communication ranking
+
+Stage 3 is stochastic, so LR attention and rank can vary between training
+runs. For a final analysis, `n_repeats=5` runs five independent models and
+reports an ensemble ranking instead of relying on one seed. With `seed=42`,
+the five repeat seeds are generated deterministically. For exact control and
+reproduction, specify them explicitly:
+
+```python
+result = spg.cellcom_ensemble(
+    deconv_dir=str(deconv_dir),
+    st_h5ad=st_file,
+    output_dir=str(cellcom_dir),
+    seeds=[11, 23, 42, 67, 101],
+    epochs=200,
+)
+```
+
+Each run is written to `seed_<seed>/`. The combined
+`lr_pair_ensemble_statistics.csv` contains the mean calibrated LR score,
+`score_std`, ensemble `rank`, and `rank_std`; the accompanying
+`cellcom_ensemble_manifest.json` records the seeds and calibration profile.
+Five repeats cost approximately five times as much as one Stage 3 run, so
+`n_repeats=1` remains the default for exploratory work. Keep the edge-level
+exports disabled during an ensemble unless they are needed, because enabling
+them writes a full communication table for every seed.
 
 ## Inputs and outputs
 

@@ -4,12 +4,57 @@ Provides a user-friendly API for cell-cell communication analysis.
 """
 
 import argparse
+import json
 import os
+import random
 import sys
 from pathlib import Path
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, Optional, Sequence, Union
+
+import pandas as pd
 
 from spagraph.cellcom.cellcom import main as cellcom_main, parse_args
+from spagraph.cellcom.relation_ranker import (
+    DEFAULT_CALIBRATION_PROFILE,
+    ensemble_lr_rankings,
+)
+
+
+def aggregate_cellcom_seed_outputs(
+    seed_dirs: Sequence[Union[str, Path]],
+    output_dir: Union[str, Path],
+    seeds: Sequence[int],
+) -> Dict[str, Any]:
+    """Aggregate calibrated LR rankings produced by independent Stage3 seeds."""
+    if len(seed_dirs) != len(seeds) or not seed_dirs:
+        raise ValueError("seed_dirs and seeds must be non-empty and have equal length")
+    frames = []
+    for seed_dir in seed_dirs:
+        path = Path(seed_dir) / "lr_pair_associated_edge_statistics.csv"
+        if not path.exists():
+            raise FileNotFoundError(f"Missing per-seed LR statistics: {path}")
+        frames.append(pd.read_csv(path))
+
+    output = Path(output_dir)
+    output.mkdir(parents=True, exist_ok=True)
+    ensemble = ensemble_lr_rankings(frames)
+    ensemble["calibration_profile"] = DEFAULT_CALIBRATION_PROFILE
+    ensemble_path = output / "lr_pair_ensemble_statistics.csv"
+    ensemble.to_csv(ensemble_path, index=False)
+    manifest = {
+        "seeds": [int(value) for value in seeds],
+        "n_repeats": len(seeds),
+        "calibration_profile": DEFAULT_CALIBRATION_PROFILE,
+        "per_seed_directories": [str(Path(value)) for value in seed_dirs],
+    }
+    manifest_path = output / "cellcom_ensemble_manifest.json"
+    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    return {
+        "ensemble": ensemble,
+        "ensemble_path": str(ensemble_path),
+        "manifest_path": str(manifest_path),
+        "seeds": manifest["seeds"],
+    }
 
 
 def run_cellcom(
@@ -43,6 +88,8 @@ def run_cellcom(
     node_mask_ratio: float = 0.15,
     mask_seed: int = 1234,
     lr_id_emb_dim: int = 8,
+    model_variant: str = 'legacy',
+    lambda_relation_rank: float = 0.2,
     # Training parameters
     batch_size: int = 4,
     num_workers: int = 0,
@@ -50,6 +97,8 @@ def run_cellcom(
     learning_rate: float = 1e-4,
     weight_decay: float = 1e-5,
     seed: int = 42,
+    n_repeats: int = 1,
+    seeds: Optional[Sequence[int]] = None,
     device: str = 'cuda',
     sample_rate: float = 1.0,
     val_split: float = 0.1,
@@ -63,7 +112,7 @@ def run_cellcom(
     # Legacy support
     args: Optional[Union[argparse.Namespace, Dict[str, Any]]] = None,
     **overrides: Any,
-) -> None:
+) -> Optional[Dict[str, Any]]:
     """Run Stage 3 (cell communication) analysis.
     
     Analyzes cell-cell communication based on ligand-receptor interactions
@@ -105,13 +154,16 @@ def run_cellcom(
         epochs: Number of training epochs
         learning_rate: Learning rate
         weight_decay: Weight decay
-        seed: Random seed
+        seed: Random seed for a single run or deterministic repeat-seed generation
+        n_repeats: Number of independent Stage3 runs to ensemble
+        seeds: Explicit unique seeds; when supplied, overrides generated repeat seeds
         device: Computing device ('cuda' or 'cpu')
         args: Legacy argparse.Namespace or dict (for backward compatibility)
         **overrides: Additional overrides for arguments
     
     Returns:
-        None (results are saved to output_dir)
+        Single runs retain the legacy return value. Multi-seed runs return the
+        ensemble table/path, manifest, seeds, and per-seed results.
     
     Example:
         >>> import spagraph
@@ -124,6 +176,68 @@ def run_cellcom(
         ...     batch_size=4
         ... )
     """
+    if n_repeats < 1:
+        raise ValueError("n_repeats must be at least 1")
+    if seeds is not None:
+        seed_values = [int(value) for value in seeds]
+        if not seed_values:
+            raise ValueError("seeds cannot be empty")
+        if len(set(seed_values)) != len(seed_values):
+            raise ValueError("seeds must be unique")
+        if n_repeats not in {1, len(seed_values)}:
+            raise ValueError("n_repeats must be 1 or match len(seeds)")
+    elif n_repeats > 1:
+        rng = random.Random(seed)
+        seed_values = rng.sample(range(1, 2**31 - 1), n_repeats)
+    else:
+        seed_values = [int(seed)]
+
+    if len(seed_values) > 1:
+        if args is not None:
+            raise ValueError("multi-seed execution is unavailable with legacy args; use keyword arguments")
+        if output_dir is None:
+            if deconv_dir is None:
+                raise ValueError("deconv_dir is required")
+            output_dir = str(Path(deconv_dir) / "cellcom")
+        base_kwargs = dict(
+            deconv_dir=deconv_dir, st_h5ad=st_h5ad, composition_csv=composition_csv,
+            mlp_latent_dim=mlp_latent_dim, mlp_hidden_dims=mlp_hidden_dims,
+            n_spot_neighbors=n_spot_neighbors, ligand_expr_threshold=ligand_expr_threshold,
+            receptor_expr_threshold=receptor_expr_threshold, lr_score_threshold=lr_score_threshold,
+            min_comm_edges=min_comm_edges, spot_cell_expr_csv=spot_cell_expr_csv,
+            use_hvg_for_communication=use_hvg_for_communication,
+            allow_same_celltype_comm=allow_same_celltype_comm,
+            gat_hidden_dims=gat_hidden_dims, gat_heads=gat_heads, gat_dropout=gat_dropout,
+            output_dim=output_dim, lambda_mask_recon=lambda_mask_recon,
+            lambda_node_recon=lambda_node_recon, attention_threshold=attention_threshold,
+            edge_mask_ratio=edge_mask_ratio, node_mask_ratio=node_mask_ratio,
+            mask_seed=mask_seed, lr_id_emb_dim=lr_id_emb_dim, model_variant=model_variant,
+            lambda_relation_rank=lambda_relation_rank, batch_size=batch_size,
+            num_workers=num_workers, epochs=epochs, learning_rate=learning_rate,
+            weight_decay=weight_decay, device=device, sample_rate=sample_rate,
+            val_split=val_split, early_stop_patience=early_stop_patience,
+            early_stop_min_delta=early_stop_min_delta, save_lr_scores_csv=save_lr_scores_csv,
+            export_unified_csv=export_unified_csv, export_filtered_csv=export_filtered_csv,
+            ablation_no_lr_identity=ablation_no_lr_identity,
+        )
+        base_kwargs.update(overrides)
+        seed_dirs = []
+        seed_results = []
+        for repeat_seed in seed_values:
+            seed_dir = Path(output_dir) / f"seed_{repeat_seed}"
+            seed_dirs.append(seed_dir)
+            seed_results.append(
+                run_cellcom(
+                    output_dir=str(seed_dir), seed=repeat_seed, n_repeats=1,
+                    seeds=None, **base_kwargs
+                )
+            )
+        result = aggregate_cellcom_seed_outputs(seed_dirs, output_dir, seed_values)
+        result["seed_results"] = seed_results
+        return result
+
+    seed = seed_values[0]
+
     # Legacy support: if args is provided, use it directly
     if args is not None:
         if isinstance(args, dict):
@@ -142,6 +256,8 @@ def run_cellcom(
         raise ValueError("st_h5ad is required (spatial transcriptomics h5ad file)")
     if output_dir is None:
         output_dir = str(Path(deconv_dir) / "cellcom")
+    if model_variant not in {'legacy', 'relation_ranker'}:
+        raise ValueError("model_variant must be 'legacy' or 'relation_ranker'")
     
     os.makedirs(output_dir, exist_ok=True)
     
@@ -174,6 +290,8 @@ def run_cellcom(
         node_mask_ratio=node_mask_ratio,
         mask_seed=mask_seed,
         lr_id_emb_dim=lr_id_emb_dim,
+        model_variant=model_variant,
+        lambda_relation_rank=lambda_relation_rank,
         batch_size=batch_size,
         num_workers=num_workers,
         epochs=epochs,
@@ -193,6 +311,15 @@ def run_cellcom(
         setattr(parsed_args, key, value)
     
     return cellcom_main(parsed_args)
+
+
+def run_cellcom_ensemble(
+    *,
+    seeds: Sequence[int] = (11, 23, 42, 67, 101),
+    **kwargs: Any,
+) -> Dict[str, Any]:
+    """Run public Stage3 repeatedly and return a calibrated seed ensemble."""
+    return run_cellcom(seeds=seeds, n_repeats=len(seeds), **kwargs)
 
 
 # Backward-compatible alias

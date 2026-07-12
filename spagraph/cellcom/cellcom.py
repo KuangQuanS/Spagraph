@@ -22,6 +22,7 @@ from .cellcom_graph_builder import (
 )
 from .cellcom_evaluate import evaluate_cell_communication, plot_training_loss
 from .lr_scores import calculate_lr_scores
+from .relation_ranker import within_context_ranking_loss
 
 def _scalar(x):
     """Convert tensor/number to Python float for logging/accumulation."""
@@ -135,6 +136,8 @@ def parse_args():
     parser.add_argument('--node_mask_ratio', type=float, default=0.15, help='mask节点特征比例 (默认15%%)')
     parser.add_argument('--mask_seed', type=int, default=1234, help='验证阶段mask的固定随机种子')
     parser.add_argument('--lr_id_emb_dim', type=int, default=8, help='LR id 嵌入维度，用于通讯边特征')
+    parser.add_argument('--model_variant', choices=['legacy', 'relation_ranker'], default='legacy')
+    parser.add_argument('--lambda_relation_rank', type=float, default=0.2)
     parser.add_argument(
         '--ablation_no_lr_identity',
         type=lambda x: str(x).lower() == 'true',
@@ -164,6 +167,8 @@ def main(args=None):
     # 解析参数
     if args is None:
         args = parse_args()
+    if getattr(args, 'model_variant', 'legacy') == 'relation_ranker':
+        args.ablation_no_lr_identity = False
     
     # 创建输出目录
     os.makedirs(args.output_dir, exist_ok=True)
@@ -455,7 +460,11 @@ def main(args=None):
         output_dim=args.output_dim,
         n_celltypes=n_cells,
         n_lr_pairs=n_lr_pairs,
-        lr_id_emb_dim=args.lr_id_emb_dim
+        lr_id_emb_dim=args.lr_id_emb_dim,
+        ablation_no_lr_identity=(
+            False if getattr(args, 'model_variant', 'legacy') == 'relation_ranker'
+            else getattr(args, 'ablation_no_lr_identity', True)
+        ),
     ).to(device)
     
     optimizer = torch.optim.Adam(
@@ -549,7 +558,7 @@ def main(args=None):
                     edge_attr_cc = edge_attr_cc.to(device, non_blocking=pin_memory)
                     edge_attr_cc_input = edge_attr_cc[:, :2]
 
-                    _, _, _, _, _, predicted_masked_edges, edge_mask, node_recon_pred, node_mask = model(
+                    _, _, _, _, cc_attention, predicted_masked_edges, edge_mask, node_recon_pred, node_mask = model(
                         expr_raw=expr_raw,
                         cell_expr_raw=cell_expr_raw,
                         edge_index_like=edge_index_like,
@@ -563,10 +572,17 @@ def main(args=None):
                     )
 
                     mask_recon_loss = 0.0
+                    relation_rank_loss = torch.tensor(0.0, device=device)
                     if edge_mask is not None and edge_mask.any() and predicted_masked_edges is not None:
                         target_scores = edge_attr_cc[:, 0][edge_mask]
                         if target_scores.numel() > 0:
                             mask_recon_loss = torch.nn.functional.mse_loss(predicted_masked_edges, target_scores)
+                            if getattr(args, 'model_variant', 'legacy') == 'relation_ranker':
+                                relation_rank_loss = within_context_ranking_loss(
+                                    predicted_masked_edges,
+                                    target_scores,
+                                    edge_index_cc[:, edge_mask],
+                                )
 
                     node_recon_loss = 0.0
                     if node_recon_pred is not None and node_mask is not None and node_mask.any():
@@ -578,6 +594,7 @@ def main(args=None):
                     total_loss = (
                         args.lambda_mask_recon * mask_recon_loss
                         + args.lambda_node_recon * node_recon_loss
+                        + getattr(args, 'lambda_relation_rank', 0.0) * relation_rank_loss
                     )
 
                     batch_loss += total_loss
@@ -600,7 +617,7 @@ def main(args=None):
                 edge_attr_cc = edge_attr_cc.to(device, non_blocking=pin_memory)
                 edge_attr_cc_input = edge_attr_cc[:, :2]
 
-                _, _, _, _, _, predicted_masked_edges, edge_mask, node_recon_pred, node_mask = model(
+                _, _, _, _, cc_attention, predicted_masked_edges, edge_mask, node_recon_pred, node_mask = model(
                     expr_raw=expr_raw,
                     cell_expr_raw=cell_expr_raw,
                     edge_index_like=edge_index_like,
@@ -614,10 +631,17 @@ def main(args=None):
                 )
 
                 mask_recon_loss = 0.0
+                relation_rank_loss = torch.tensor(0.0, device=device)
                 if edge_mask is not None and edge_mask.any() and predicted_masked_edges is not None:
                     target_scores = edge_attr_cc[:, 0][edge_mask]
                     if target_scores.numel() > 0:
                         mask_recon_loss = torch.nn.functional.mse_loss(predicted_masked_edges, target_scores)
+                        if getattr(args, 'model_variant', 'legacy') == 'relation_ranker':
+                            relation_rank_loss = within_context_ranking_loss(
+                                predicted_masked_edges,
+                                target_scores,
+                                edge_index_cc[:, edge_mask],
+                            )
 
                 node_recon_loss = 0.0
                 if node_recon_pred is not None and node_mask is not None and node_mask.any():
@@ -631,6 +655,7 @@ def main(args=None):
                 avg_batch_loss = (
                     args.lambda_mask_recon * mask_recon_loss
                     + args.lambda_node_recon * node_recon_loss
+                    + getattr(args, 'lambda_relation_rank', 0.0) * relation_rank_loss
                 )
 
             # 反向传播

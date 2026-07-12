@@ -18,9 +18,17 @@ from spagraph.cellcom.relation_ranker import (
     within_context_ranking_loss,
 )
 from spagraph.training.cellcom import aggregate_cellcom_seed_outputs, run_cellcom
+from spagraph.cellcom.cellcom import degree_scale_attention
 
 
 class CalibrationTests(unittest.TestCase):
+    def test_degree_scaled_attention_matches_edgewise_definition(self):
+        edge_index = torch.tensor([[0, 1, 2, 3], [2, 2, 4, 2]])
+        attention = torch.tensor([[0.5, 1.0], [1.0, 2.0], [3.0, 4.0], [2.0, 3.0]])
+        scaled = degree_scale_attention(attention, edge_index)
+        expected = attention * torch.tensor([[3.0], [3.0], [1.0], [3.0]])
+        self.assertTrue(torch.equal(scaled, expected))
+
     def test_low_support_candidate_is_penalized(self):
         frame = pd.DataFrame(
             {

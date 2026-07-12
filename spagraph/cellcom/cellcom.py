@@ -33,6 +33,23 @@ def _scalar(x):
     except Exception:
         return float(x)
 
+
+def degree_scale_attention(attention: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
+    """Scale each edge attention by its target-node in-degree without Python loops."""
+    targets = edge_index[1].to(dtype=torch.long, device=attention.device)
+    if attention.shape[0] != targets.numel():
+        raise ValueError("attention rows must match the number of communication edges")
+    if targets.numel() == 0:
+        return torch.zeros_like(attention)
+    if torch.any(targets < 0):
+        raise ValueError("target node indices must be non-negative")
+
+    degrees = torch.bincount(targets, minlength=int(targets.max().item()) + 1)
+    scale = degrees[targets].to(dtype=attention.dtype)
+    while scale.ndim < attention.ndim:
+        scale = scale.unsqueeze(-1)
+    return attention * scale
+
 def _print_stage3_header(args, device: torch.device):
     sample_name = Path(args.st_h5ad).stem if getattr(args, "st_h5ad", None) else "Unknown"
     gat_hidden_dims = [x.strip() for x in str(args.gat_hidden_dims).split(",") if x.strip()]
@@ -957,22 +974,9 @@ def main(args=None):
     # 计算degree-scaled attention（反归一化注意力得分）
     print("Post-process:        degree-scaled attention")
     for i in range(len(all_cc_attention_scores)):
-        edge_index = all_edge_index_cc[i]
-        attention = all_cc_attention_scores[i]
-        targets = edge_index[1]  # 目标节点索引
-        
-        # 计算每个目标节点的入度
-        unique_targets, counts = torch.unique(targets, return_counts=True)
-        degree_dict = {target.item(): count.item() for target, count in zip(unique_targets, counts)}
-        
-        # 计算scaled attention: attention_score * degree
-        scaled_attention = torch.zeros_like(attention)
-        for e in range(attention.shape[0]):
-            target = targets[e].item()
-            deg = degree_dict.get(target, 0)
-            scaled_attention[e] = attention[e] * deg
-        
-        all_cc_attention_scores[i] = scaled_attention
+        all_cc_attention_scores[i] = degree_scale_attention(
+            all_cc_attention_scores[i], all_edge_index_cc[i]
+        )
     
     
     evaluate_cell_communication(

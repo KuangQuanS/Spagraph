@@ -113,16 +113,8 @@ fixed simulated development split. It reduces diffuse low-probability mass and
 was frozen before validation and blind-test evaluation. Set it to `1.0` to
 recover the uncalibrated signature proportions.
 
-#### Choosing the reference grouping
-
-The original Stage 1 route discovers Leiden clusters and labels each cluster
-with its majority single-cell annotation. This is useful when annotations are
-missing or intentionally coarse, but a rare or closely related annotated type
-can be absorbed into a larger cluster and lose its own reference signature.
-
-When trusted annotations are available, keep them in `sc_adata.obs["cell_type"]`
-or `sc_adata.obs["celltype"]` and use annotation-level grouping. The optimized
-D25 configuration used for the simulated Figure 2 benchmark is:
+For the optimized Figure 2 configuration, store the reference labels in
+`sc_adata.obs["cell_type"]` or `sc_adata.obs["celltype"]` and run:
 
 ```python
 artifacts = spg.vae(sc_file=sc_file, st_file=st_file, seed=42)

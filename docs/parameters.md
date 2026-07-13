@@ -2,8 +2,8 @@
 
 This document is the corrected, public parameter record for the Spagraph
 manuscript. Values were transcribed from the GPU run configurations and the
-final scripts that produced the reported results. The original root-level
-`parameter.xlsx` is retained locally as an audit input and was not overwritten.
+final scripts that produced the reported results. The supplementary spreadsheet
+`parameter.xlsx` contains the compact table version of these settings.
 
 Source priority is: (1) generated run configuration, (2) final result-producing
 script, and (3) the manuscript-release code. The audited base revision is
@@ -53,7 +53,7 @@ dynamic cluster representation.
 | GSE211956 P3 (HGSOC) | 3 | 3 | 1 | 8 | 200 | 128 | 42 | `run_notebook/run_GSE211956.ipynb` |
 | CID44971 (PDAC) | 3 | 3 | 1 | 8 | 200 | 128 | 42 | `run_notebook/run_CID44971.ipynb` |
 | GSE243275 (DCIS) | 3 | 3 | 1 | 8 | 200 | 64 | 42 | `run_notebook/run_GSE243275.ipynb` |
-| GSE144236 (cSCC), Figure 3 analysis | 3 | 3 | 1 | 8 | 200 | 96 | 42 | `run_notebook/rerun_GSE144236_lr_associated_411367e.py` |
+| GSE144236 (cSCC), Figure 3 analysis | 3 | 3 | 1 | 8 | 200 | 96 | 42 | `run_notebook/rerun_GSE144236_lr_associated_411367e.py`; `n_repeats=5` for the final ensemble |
 | GSE280315 Visium HD CRC, P1/P2/P5 | 3 | 1 | 1 | 8 | 10 | 4 | 42 | `run_notebook/gse280315_visiumhd_crc/run_p*_128um_cellcom_smoke.py` |
 
 Expression thresholds are in CP10k space and the LR-score threshold is in the
@@ -61,7 +61,34 @@ pipeline's log1p score space. The tumour case-study runs use
 `allow_same_celltype_comm=True`, `attention_threshold=1`, and
 `ablation_no_lr_identity=True` in the final cSCC recheck.
 
-## Simulated-data auto-k record
+## Figure 2 simulated deconvolution settings
+
+The final Figure 2 and Supplementary Figure S1a results use the annotated
+reference signature mode below. Ground-truth spot compositions are excluded
+from fitting, gene selection, platform calibration, and parameter selection.
+
+| Parameter | Final value |
+|---|---|
+| Reference grouping | Supplied single-cell `cell_type` annotations |
+| Signature expression | Log-normalized |
+| Gene selection | Cell-type-specific |
+| Genes per cell type | 200 |
+| `signature_only` | `True` |
+| Platform calibration | Enabled |
+| Calibration iterations | 5 |
+| Ridge penalty | 0.0 |
+| Composition power | 1.2 |
+| Seed | 42 |
+| Evaluation cell types | Intersection shared by truth and all eight methods within each dataset |
+
+The composition power was selected on the predefined development split and
+frozen before validation and blind-test evaluation.
+
+## Historical graph-mode simulated-data auto-k record
+
+The following records describe the earlier graph-attention benchmark mode and
+are retained for provenance. They are not the settings used for the optimized
+Figure 2 results reported above.
 
 The manuscript evaluates Data1–Data32. The newer GPU configuration directory
 contains final auto-k records for 25 datasets. Data21, Data22, Data24 and Data29

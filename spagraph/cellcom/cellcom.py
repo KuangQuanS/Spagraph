@@ -32,6 +32,23 @@ def _scalar(x):
     except Exception:
         return float(x)
 
+
+def degree_scale_attention(attention: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
+    """Scale each edge attention by its target-node in-degree without Python loops."""
+    targets = edge_index[1].to(dtype=torch.long, device=attention.device)
+    if attention.shape[0] != targets.numel():
+        raise ValueError("attention rows must match the number of communication edges")
+    if targets.numel() == 0:
+        return torch.zeros_like(attention)
+    if torch.any(targets < 0):
+        raise ValueError("target node indices must be non-negative")
+
+    degrees = torch.bincount(targets, minlength=int(targets.max().item()) + 1)
+    scale = degrees[targets].to(dtype=attention.dtype)
+    while scale.ndim < attention.ndim:
+        scale = scale.unsqueeze(-1)
+    return attention * scale
+
 def _print_stage3_header(args, device: torch.device):
     sample_name = Path(args.st_h5ad).stem if getattr(args, "st_h5ad", None) else "Unknown"
     gat_hidden_dims = [x.strip() for x in str(args.gat_hidden_dims).split(",") if x.strip()]
@@ -62,10 +79,7 @@ def _print_stage3_header(args, device: torch.device):
     print(f"  Mask Recon:       {args.lambda_mask_recon} (ratio={args.edge_mask_ratio})")
     print(f"  Node Recon:       {args.lambda_node_recon} (ratio={args.node_mask_ratio})")
     print(f"Mask Seed:          {args.mask_seed}")
-    print(
-        'Representative LR:  '
-        + ('ignored' if getattr(args, 'ablation_no_lr_identity', True) else 'used (legacy mode)')
-    )
+    print('Aggregate LR ID:    excluded; candidate output head enabled')
     if getattr(args, "early_stop_patience", 0) > 0:
         print(f"Early Stop:         patience={args.early_stop_patience}, min_delta={args.early_stop_min_delta}")
     else:
@@ -134,13 +148,6 @@ def parse_args():
     parser.add_argument('--edge_mask_ratio', type=float, default=0.2, help='mask通讯边的比例 (默认20%%)')
     parser.add_argument('--node_mask_ratio', type=float, default=0.15, help='mask节点特征比例 (默认15%%)')
     parser.add_argument('--mask_seed', type=int, default=1234, help='验证阶段mask的固定随机种子')
-    parser.add_argument('--lr_id_emb_dim', type=int, default=8, help='LR id 嵌入维度，用于通讯边特征')
-    parser.add_argument(
-        '--ablation_no_lr_identity',
-        type=lambda x: str(x).lower() == 'true',
-        default=True,
-        help='Ignore the representative LR ID embedding on aggregated communication edges',
-    )
     
 
     # 训练参数
@@ -443,8 +450,6 @@ def main(args=None):
     
     n_genes = cluster_expr.shape[1]
     n_cells = cell_expr.shape[0]
-    n_lr_pairs = len(dataset.lr_id_to_pair)
-    
     model = HeteroSTModel(
         n_genes=len(available_activated_genes),  # 使用激活基因数量
         mlp_latent_dim=args.mlp_latent_dim,
@@ -454,8 +459,6 @@ def main(args=None):
         gat_dropout=args.gat_dropout,
         output_dim=args.output_dim,
         n_celltypes=n_cells,
-        n_lr_pairs=n_lr_pairs,
-        lr_id_emb_dim=args.lr_id_emb_dim
     ).to(device)
     
     optimizer = torch.optim.Adam(
@@ -547,9 +550,9 @@ def main(args=None):
                     if edge_attr_cc.dim() == 1:
                         edge_attr_cc = edge_attr_cc.view(-1, 2) if edge_attr_cc.numel() > 0 else edge_attr_cc.new_zeros((0, 2))
                     edge_attr_cc = edge_attr_cc.to(device, non_blocking=pin_memory)
-                    edge_attr_cc_input = edge_attr_cc[:, :2]
+                    edge_attr_cc_input = edge_attr_cc[:, :1]
 
-                    _, _, _, _, _, predicted_masked_edges, edge_mask, node_recon_pred, node_mask = model(
+                    _, _, _, _, cc_attention, predicted_masked_edges, edge_mask, node_recon_pred, node_mask = model(
                         expr_raw=expr_raw,
                         cell_expr_raw=cell_expr_raw,
                         edge_index_like=edge_index_like,
@@ -598,9 +601,9 @@ def main(args=None):
                 if edge_attr_cc.dim() == 1:
                     edge_attr_cc = edge_attr_cc.view(-1, 2) if edge_attr_cc.numel() > 0 else edge_attr_cc.new_zeros((0, 2))
                 edge_attr_cc = edge_attr_cc.to(device, non_blocking=pin_memory)
-                edge_attr_cc_input = edge_attr_cc[:, :2]
+                edge_attr_cc_input = edge_attr_cc[:, :1]
 
-                _, _, _, _, _, predicted_masked_edges, edge_mask, node_recon_pred, node_mask = model(
+                _, _, _, _, cc_attention, predicted_masked_edges, edge_mask, node_recon_pred, node_mask = model(
                     expr_raw=expr_raw,
                     cell_expr_raw=cell_expr_raw,
                     edge_index_like=edge_index_like,
@@ -671,7 +674,7 @@ def main(args=None):
                         if edge_attr_cc.dim() == 1:
                             edge_attr_cc = edge_attr_cc.view(-1, 2) if edge_attr_cc.numel() > 0 else edge_attr_cc.new_zeros((0, 2))
                         edge_attr_cc = edge_attr_cc.to(device, non_blocking=pin_memory)
-                        edge_attr_cc_input = edge_attr_cc[:, :2]
+                        edge_attr_cc_input = edge_attr_cc[:, :1]
 
                         _, _, _, _, _, predicted_masked_edges, edge_mask, node_recon_pred, node_mask = model(
                             expr_raw=expr_raw,
@@ -721,7 +724,7 @@ def main(args=None):
                     if edge_attr_cc.dim() == 1:
                         edge_attr_cc = edge_attr_cc.view(-1, 2) if edge_attr_cc.numel() > 0 else edge_attr_cc.new_zeros((0, 2))
                     edge_attr_cc = edge_attr_cc.to(device, non_blocking=pin_memory)
-                    edge_attr_cc_input = edge_attr_cc[:, :2]
+                    edge_attr_cc_input = edge_attr_cc[:, :1]
 
                     _, _, _, _, _, predicted_masked_edges, edge_mask, node_recon_pred, node_mask = model(
                         expr_raw=expr_raw,
@@ -856,7 +859,7 @@ def main(args=None):
                 
                 # 模型前向传播
                 # ✅ 推理阶段也传入真实通信特征，收集的注意力才与LR信息一致
-                edge_attr_cc_input = edge_attr_cc[:, :2]
+                edge_attr_cc_input = edge_attr_cc[:, :1]
                 spot_repr, cell_repr, combined, spot_proj, cc_attention, _, _, node_recon_pred, node_mask = model(
                     expr_raw=expr_raw,
                     cell_expr_raw=cell_expr_raw,
@@ -932,22 +935,9 @@ def main(args=None):
     # 计算degree-scaled attention（反归一化注意力得分）
     print("Post-process:        degree-scaled attention")
     for i in range(len(all_cc_attention_scores)):
-        edge_index = all_edge_index_cc[i]
-        attention = all_cc_attention_scores[i]
-        targets = edge_index[1]  # 目标节点索引
-        
-        # 计算每个目标节点的入度
-        unique_targets, counts = torch.unique(targets, return_counts=True)
-        degree_dict = {target.item(): count.item() for target, count in zip(unique_targets, counts)}
-        
-        # 计算scaled attention: attention_score * degree
-        scaled_attention = torch.zeros_like(attention)
-        for e in range(attention.shape[0]):
-            target = targets[e].item()
-            deg = degree_dict.get(target, 0)
-            scaled_attention[e] = attention[e] * deg
-        
-        all_cc_attention_scores[i] = scaled_attention
+        all_cc_attention_scores[i] = degree_scale_attention(
+            all_cc_attention_scores[i], all_edge_index_cc[i]
+        )
     
     
     evaluate_cell_communication(

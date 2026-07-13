@@ -260,9 +260,7 @@ class HeteroSTModel(nn.Module):
                  image_dim: int = None, fusion_dim: int = 256, 
                  gat_hidden_dims: list = None,
                  gat_heads: int = 4, gat_dropout: float = 0.1,
-                 output_dim: int = 64, n_celltypes: int = None,
-                 n_lr_pairs: int = 1, lr_id_emb_dim: int = 8,
-                 ablation_no_lr_identity: bool = True):
+                 output_dim: int = 64, n_celltypes: int = None):
         super().__init__()
         
         if gat_hidden_dims is None:
@@ -272,9 +270,6 @@ class HeteroSTModel(nn.Module):
         self.mlp_latent_dim = mlp_latent_dim
         self.output_dim = output_dim
         self.gat_hidden_dims = gat_hidden_dims
-        self.ablation_no_lr_identity = ablation_no_lr_identity
-        self.n_lr_pairs = max(1, n_lr_pairs)
-        self.lr_id_emb_dim = lr_id_emb_dim
         self.node_recon_head = nn.Linear(output_dim, n_genes)
         
         # ✅ Mask Token (既然要Mask，就用个Learnable Token，显得高级)
@@ -295,10 +290,11 @@ class HeteroSTModel(nn.Module):
         # 对于相似度边：[weight, -1]（-1表示非通讯边）
         # 对于通讯边：[lr_score, lr_id]
         self.edge_attn_spatial = EdgeAttentionNetwork(edge_dim=2, node_dim=mlp_latent_dim, hidden_dims=gat_hidden_dims, num_heads=gat_heads, dropout=gat_dropout)  # 空间相似度图
-        # 通讯边：包含 score + lr_id 嵌入
-        comm_edge_dim = 1 + lr_id_emb_dim
+        # Communication message passing uses aggregate edge strength only.
+        # Candidate LR identities are handled after the GNN, because several
+        # pairs can support the same aggregate edge.
+        comm_edge_dim = 1
         self.edge_attn_comm = EdgeAttentionNetwork(edge_dim=comm_edge_dim, node_dim=mlp_latent_dim, hidden_dims=gat_hidden_dims, num_heads=gat_heads, dropout=gat_dropout)     # 通讯图
-        self.lr_id_embedding = nn.Embedding(self.n_lr_pairs + 1, lr_id_emb_dim)  # +1 以容纳潜在的填充值
         
         # ✅ 备用投影层：当没有边时，将 MLP latent 投影到 GAT 输出维度
         self.fallback_proj = nn.Linear(mlp_latent_dim, gat_hidden_dims[-1])
@@ -366,7 +362,9 @@ class HeteroSTModel(nn.Module):
             edge_index_like: [2, n_edges_like] 相似度边 (spot-spot + spot-celltype)
             edge_attr_like: [n_edges_like, 2] 相似度边特征 [weight, -1]
             edge_index_cc: [2, n_edges_cc] celltype-celltype边
-            edge_attr_cc: [n_edges_cc, 2] cell-cell边特征 [lr_score, lr_id]
+            edge_attr_cc: [n_edges_cc, >=1] communication-edge features. Only
+                the aggregate LR score in column 0 enters the GNN; candidate
+                LR identities remain evaluation metadata.
             return_attention: 是否返回cell-cell边的注意力得分
             edge_mask_ratio: 边mask比例 (0.1-0.2)
 
@@ -483,13 +481,9 @@ class HeteroSTModel(nn.Module):
 
         # ✅ 通讯边 - 使用Edge Attention
         if edge_index_cc.size(1) > 0:
-            # 构造通讯边特征：未mask边用真实score，mask边score=0，保留lr_id
-            lr_scores = masked_edge_attr_cc[:, 0:1]
-            lr_ids = edge_attr_cc[:, 1].long().clamp(min=0, max=self.n_lr_pairs)
-            lr_id_emb = self.lr_id_embedding(lr_ids)
-            if self.ablation_no_lr_identity:
-                lr_id_emb = torch.zeros_like(lr_id_emb)
-            comm_edge_feat = torch.cat([lr_scores, lr_id_emb], dim=1)
+            # Masked edges use score=0. LR identity is deliberately excluded
+            # from aggregate message passing to avoid first-pair leakage.
+            comm_edge_feat = masked_edge_attr_cc[:, 0:1]
 
             comm_repr, cc_attention_tuple = self.edge_attn_comm(
                 comm_edge_feat, edge_index_cc, all_feat, return_attention=return_attention

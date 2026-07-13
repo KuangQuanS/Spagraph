@@ -2,8 +2,8 @@
 
 This document is the corrected, public parameter record for the Spagraph
 manuscript. Values were transcribed from the GPU run configurations and the
-final scripts that produced the reported results. The original root-level
-`parameter.xlsx` is retained locally as an audit input and was not overwritten.
+final scripts that produced the reported results. The companion
+[`parameters.xlsx`](parameters.xlsx) contains the spreadsheet release record.
 
 Source priority is: (1) generated run configuration, (2) final result-producing
 script, and (3) the manuscript-release code. The audited base revision is
@@ -58,8 +58,9 @@ dynamic cluster representation.
 
 Expression thresholds are in CP10k space and the LR-score threshold is in the
 pipeline's log1p score space. The tumour case-study runs use
-`allow_same_celltype_comm=True`, `attention_threshold=1`, and
-`ablation_no_lr_identity=True` in the final cSCC recheck.
+`allow_same_celltype_comm=True` and `attention_threshold=1`. Current Stage 3
+releases score candidate LR pairs after aggregate graph message passing and
+support repeated-seed ensembles.
 
 ## Simulated-data auto-k record
 
@@ -110,6 +111,15 @@ unless the run configuration explicitly recorded a smaller candidate set.
 Missing provenance is a limitation of the historical run archive and does not
 mean that a value of 20 should be imputed.
 
+## Current optional model settings
+
+Current releases additionally support a reference-affinity-guided Stage 2
+mode with `signature_init=True`, `signature_affinity_graph=True`, a residual
+scale of 5.0, and a soft Jensen-Shannon consistency weight of 3.0. Stage 3
+supports `n_repeats=5` for final ensemble rankings while retaining
+`n_repeats=1` as the exploratory default. These options are documented
+separately from the recorded manuscript run configurations above.
+
 ## Figure 3e statistical specification
 
 | Item | Specification |
@@ -117,7 +127,7 @@ mean that a value of 20 should be imputed.
 | Statistical unit | One LR pair |
 | Per-pair aggregation | All candidate communication edges for that LR pair |
 | Ranking groups | Top 15 by attention; top 15 by frequency |
-| Overlap handling | `TNC_SDC1` excluded from both groups |
+| Overlap handling | The single LR pair present in both top-15 lists was excluded from both groups |
 | Final sample sizes | attention-only n=14; frequency-only n=14 |
 | Tests | Two-sided Mann–Whitney U, two prespecified metrics |
 | Multiplicity | Holm adjustment across the two tests |

@@ -55,6 +55,10 @@ deconv_result = spg.deconv(
     output_dir=str(deconv_dir),
     k_celltype=[20, 25, 30, 35, 40],
     k_cells_per_cluster=15,
+    signature_init=True,
+    signature_affinity_graph=True,
+    signature_residual_scale=5.0,
+    lambda_signature_consistency=3.0,
     save_reconstructed_genes=True,
     seed=42,
 )
@@ -69,7 +73,8 @@ spg.cellcom(
     receptor_expr_threshold=3.0,
     epochs=200,
     seed=42,
-    export_unified_csv=True,
+    n_repeats=5,
+    export_unified_csv=False,
 )
 ```
 
@@ -80,6 +85,26 @@ Stage 2 writes `*_composition.csv`, configuration and training diagnostics;
 `*_spot_cell_expr.csv` file required by Stage 3. Stage 3 writes filtered or
 unified LR communication tables and model diagnostics under its output
 directory.
+
+### Reference-affinity-guided residual GAT
+
+With `signature_init=True`, Stage 2 derives a non-negative affinity matrix from
+the annotated single-cell reference and observed spot expression. The matrix
+initializes the graph and composition logits, while the GAT learns the final
+residual correction. In logit form the default update is
+`log(affinity) + 5 * tanh(GAT residual)`, with a soft consistency term rather
+than a fixed output clamp. Spot-level composition truth is not read during
+fitting or model selection. Setting `signature_init=False` retains the original
+graph-mode workflow.
+
+### Repeated cell-communication analysis
+
+Stage 3 supports `n_repeats` for stochastic stability. `n_repeats=5` trains
+five independent models and writes an ensemble LR ranking with score and rank
+variation; `n_repeats=1` remains the faster exploratory default. Candidate
+ranking combines neural attention with support, spatial specificity and
+cross-run uncertainty, while retaining the raw neural score and rank in the
+output. Explicit seeds can be supplied with `spg.cellcom_ensemble(...)`.
 
 ## Inputs and outputs
 

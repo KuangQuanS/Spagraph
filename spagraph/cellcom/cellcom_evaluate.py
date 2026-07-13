@@ -13,6 +13,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from typing import Dict, List, Tuple, Optional, Any
+from .relation_ranker import calibrate_lr_statistics
 
 
 def evaluate_cell_communication(
@@ -225,9 +226,10 @@ def evaluate_cell_communication(
             .rank(method="min", ascending=False)
             .astype("Int64")
         )
+        pair_df = calibrate_lr_statistics(pair_df)
         pair_df = pair_df.sort_values(
-            ["eligible_for_ranking", "associated_edge_attention_mean"],
-            ascending=[False, False],
+            ["eligible_for_ranking", "rank"],
+            ascending=[False, True],
         )
         pair_path = os.path.join(
             output_dir, "lr_pair_associated_edge_statistics.csv"
@@ -303,13 +305,8 @@ def evaluate_cell_communication(
 
     # 保存LR对统计结果
     lr_stats_path = os.path.join(output_dir, "lr_pair_statistics.csv")
-    with open(lr_stats_path, 'w') as f:
-        f.write("lr_pair,lr_id,occurrence_count,avg_attention_score,std_attention_score,min_attention_score,max_attention_score,n_spots\n")
-        for item in sorted(lr_pair_summary, key=lambda x: x['occurrence_count'], reverse=True):
-            f.write(f"{item['lr_pair']},{item['lr_id']},{item['occurrence_count']},"
-                   f"{item['avg_attention_score']:.6f},{item['std_attention_score']:.6f},"
-                   f"{item['min_attention_score']:.6f},{item['max_attention_score']:.6f},"
-                   f"{item['n_spots']}\n")
+    legacy_stats_df = calibrate_lr_statistics(pd.DataFrame(lr_pair_summary))
+    legacy_stats_df.to_csv(lr_stats_path, index=False)
 
     print(f"LR stats saved:     {lr_stats_path} (unique_lr_pairs={len(lr_pair_summary)})")
     if lr_support_by_edge:

@@ -4,6 +4,7 @@ import torch.nn.functional as F
 from torch_geometric.nn import GATConv
 import numpy as np
 from typing import List, Tuple, Dict, Optional
+from .deconv_initialization import boundary_aware_graph_loss, poisson_deviance_loss
 
 # ================================
 # Stage 1: VAE Models
@@ -425,7 +426,14 @@ class HeterogeneousGATDeconvolution(nn.Module):
                  dropout=0.1,k_spatial=6,k_celltype=10, celltype_prototypes=None,
                  use_dynamic_cluster_repr=False, k_cells_per_cluster=10,
                  sc_cell_expressions=None,
-                 normalize_attention=True):
+                 normalize_attention=True,
+                 signature_prior_strength: float = 0.0,
+                 signature_prior_trainable: bool = False,
+                 signature_residual_scale: float = 5.0,
+                 signature_residual_mode: str = "bounded_tanh",
+                 signature_affinity_graph: bool = True,
+                 signature_output_power: float = 1.0,
+                 zero_init_signature_residual: bool = False):
         super().__init__()
         
         self.embedding_dim = embedding_dim
@@ -440,6 +448,34 @@ class HeterogeneousGATDeconvolution(nn.Module):
         self.use_dynamic_cluster_repr = use_dynamic_cluster_repr
         self.k_cells_per_cluster = k_cells_per_cluster
         self.normalize_attention = normalize_attention
+        if signature_prior_strength < 0:
+            raise ValueError("signature_prior_strength must be non-negative")
+        if signature_residual_scale < 0:
+            raise ValueError("signature_residual_scale must be non-negative")
+        if signature_residual_mode not in {"bounded_tanh", "linear"}:
+            raise ValueError(
+                "signature_residual_mode must be 'bounded_tanh' or 'linear'"
+            )
+        if not np.isfinite(signature_output_power) or signature_output_power <= 0:
+            raise ValueError("signature_output_power must be finite and positive")
+        self.signature_residual_scale = float(signature_residual_scale)
+        self.signature_residual_mode = signature_residual_mode
+        self.signature_affinity_graph = bool(signature_affinity_graph)
+        self.signature_output_power = float(signature_output_power)
+        # Softplus keeps the learned contribution non-negative.  A very small
+        # logit represents the legacy model when no signature prior is used.
+        if signature_prior_strength == 0:
+            prior_logit = -20.0
+        else:
+            prior_logit = float(np.log(np.expm1(signature_prior_strength)))
+        self.signature_prior_log_scale = nn.Parameter(
+            torch.tensor(prior_logit), requires_grad=bool(signature_prior_trainable)
+        )
+        # A buffer (rather than a Python scalar) makes the exact prior state
+        # part of each checkpoint.  Training can anneal this multiplier so the
+        # signature estimate acts as a warm start instead of a permanent
+        # substitute for the graph model.
+        self.register_buffer("signature_prior_multiplier", torch.tensor(1.0))
         
         # 如果启用动态模式，保存单细胞全基因表达（原始count）
         # k-nearest cells索引应该在第一阶段预计算好
@@ -516,17 +552,29 @@ class HeterogeneousGATDeconvolution(nn.Module):
             nn.Linear(gat_hidden_dim, 1)
 
         )
+        if zero_init_signature_residual:
+            nn.init.zeros_(self.attention_mlp[-1].weight)
+            nn.init.zeros_(self.attention_mlp[-1].bias)
 
         # Cached spatial KNN edges (invariant across forward passes)
         self._cached_spatial_edge_index: Optional[torch.Tensor] = None
         self._cached_spatial_edge_attr: Optional[torch.Tensor] = None
         self._cached_spatial_n_spots: int = -1
+        self._cached_spatial_coords: Optional[torch.Tensor] = None
 
     def invalidate_graph_cache(self):
         """Call to force recomputation of spatial edges (e.g. after data change)."""
         self._cached_spatial_edge_index = None
         self._cached_spatial_edge_attr = None
         self._cached_spatial_n_spots = -1
+        self._cached_spatial_coords = None
+
+    def set_signature_prior_multiplier(self, value: float) -> None:
+        """Set the checkpointed multiplier applied to the signature prior."""
+        value = float(value)
+        if not np.isfinite(value) or value < 0:
+            raise ValueError("signature prior multiplier must be finite and non-negative")
+        self.signature_prior_multiplier.fill_(value)
 
     def _build_spatial_edges(self, spatial_coords: torch.Tensor,
                              spot_embeddings: torch.Tensor,
@@ -541,7 +589,9 @@ class HeterogeneousGATDeconvolution(nn.Module):
         # Return cache if spatial coords haven't changed
         if (use_spatial
                 and self._cached_spatial_edge_index is not None
-                and self._cached_spatial_n_spots == n_spots):
+                and self._cached_spatial_n_spots == n_spots
+                and self._cached_spatial_coords is not None
+                and torch.equal(self._cached_spatial_coords, spatial_coords.detach().cpu())):
             return (self._cached_spatial_edge_index.to(device),
                     self._cached_spatial_edge_attr.to(device))
 
@@ -575,6 +625,7 @@ class HeterogeneousGATDeconvolution(nn.Module):
             self._cached_spatial_edge_index = edge_index
             self._cached_spatial_edge_attr = edge_attr
             self._cached_spatial_n_spots = n_spots
+            self._cached_spatial_coords = spatial_coords.detach().cpu().clone()
 
         return edge_index, edge_attr
 
@@ -582,7 +633,8 @@ class HeterogeneousGATDeconvolution(nn.Module):
                                 spot_embeddings: torch.Tensor,
                                 spatial_coords: torch.Tensor,
                                 celltype_prototypes: torch.Tensor,
-                                use_embedding_knn: bool = False) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+                                use_embedding_knn: bool = False,
+                                celltype_affinity: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """构建异构图：Spot节点 + CellType节点
 
         注意：celltype_prototypes参数用于计算Spot-CellType边的相似度（在原始VAE embedding空间）
@@ -612,9 +664,18 @@ class HeterogeneousGATDeconvolution(nn.Module):
         if n_spots > 0 and n_cell_types > 0 and self.k_celltype > 0:
             k_neighbors = min(int(self.k_celltype), n_cell_types)
             with torch.no_grad():
-                spot_norm = F.normalize(spot_embeddings, p=2, dim=1)
-                cell_norm = F.normalize(celltype_prototypes, p=2, dim=1)
-                sim_matrix = spot_norm @ cell_norm.t()
+                if celltype_affinity is not None:
+                    if celltype_affinity.shape != (n_spots, n_cell_types):
+                        raise ValueError(
+                            "celltype_affinity shape must match spot/cell-type nodes"
+                        )
+                    sim_matrix = celltype_affinity.to(
+                        device=device, dtype=spot_embeddings.dtype
+                    )
+                else:
+                    spot_norm = F.normalize(spot_embeddings, p=2, dim=1)
+                    cell_norm = F.normalize(celltype_prototypes, p=2, dim=1)
+                    sim_matrix = spot_norm @ cell_norm.t()
 
                 top_sim, top_idx = torch.topk(sim_matrix, k=k_neighbors, dim=1, largest=True)
 
@@ -642,11 +703,22 @@ class HeterogeneousGATDeconvolution(nn.Module):
                spatial_coords: torch.Tensor,
                celltype_prototypes: torch.Tensor,
                use_embedding_knn: bool = False,
-               normalize_attention: bool = None) -> Dict[str, torch.Tensor]:
+               normalize_attention: bool = None,
+               initial_weights: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
         """Forward pass"""
         n_spots = spot_embeddings.shape[0]
         n_cell_types = celltype_prototypes.shape[0]
         device = spot_embeddings.device
+
+        if initial_weights is not None:
+            if initial_weights.shape != (n_spots, n_cell_types):
+                raise ValueError(
+                    f"initial_weights shape {tuple(initial_weights.shape)} does not match "
+                    f"expected {(n_spots, n_cell_types)}"
+                )
+            initial_weights = initial_weights.to(
+                device=device, dtype=spot_embeddings.dtype
+            )
         
         # Handle normalize_attention parameter
         if normalize_attention is None:
@@ -654,7 +726,15 @@ class HeterogeneousGATDeconvolution(nn.Module):
         
         # 1. Build heterogeneous graph
         edge_index, edge_attr, node_features = self.build_heterogeneous_graph(
-            spot_embeddings, spatial_coords, celltype_prototypes, use_embedding_knn=use_embedding_knn
+            spot_embeddings,
+            spatial_coords,
+            celltype_prototypes,
+            use_embedding_knn=use_embedding_knn,
+            celltype_affinity=(
+                initial_weights
+                if initial_weights is not None and self.signature_affinity_graph
+                else None
+            ),
         )
         
         # 2. Create sparse mask: which spot-celltype pairs are connected in the graph
@@ -698,7 +778,27 @@ class HeterogeneousGATDeconvolution(nn.Module):
         combined = torch.cat([spot_expanded, cell_expanded], dim=-1)
         
         # Compute attention scores
-        attention_scores = self.attention_mlp(combined).squeeze(-1)  # [n_spots, n_cell_types]
+        residual_logits = self.attention_mlp(combined).squeeze(-1)  # [n_spots, n_cell_types]
+        residual_component = residual_logits
+        prior_component = torch.zeros_like(residual_logits)
+        attention_scores = residual_logits
+
+        # Reference-affinity-guided residual logits. This remains fully
+        # unsupervised with respect to spot-level composition truth.
+        if initial_weights is not None:
+            prior_scale = (
+                F.softplus(self.signature_prior_log_scale)
+                * self.signature_prior_multiplier
+            )
+            if self.signature_residual_mode == "bounded_tanh":
+                residual_component = (
+                    self.signature_residual_scale * torch.tanh(residual_logits)
+                )
+            else:
+                residual_component = self.signature_residual_scale * residual_logits
+            prior_component = prior_scale * torch.log(initial_weights.clamp_min(1e-8))
+            attention_scores = prior_component + residual_component
+            sparse_mask = sparse_mask | (initial_weights > 0)
         
         # Apply sparse mask: set non-connected celltypes to -inf
         # After softmax, -inf becomes 0
@@ -709,6 +809,9 @@ class HeterogeneousGATDeconvolution(nn.Module):
         if normalize_attention:
             # Softmax normalization (only over connected celltypes)
             deconv_weights = F.softmax(attention_scores_masked, dim=1)
+            if initial_weights is not None and self.signature_output_power != 1.0:
+                deconv_weights = deconv_weights.clamp_min(0).pow(self.signature_output_power)
+                deconv_weights = deconv_weights / deconv_weights.sum(dim=1, keepdim=True).clamp_min(1e-12)
         else:
             # No normalization: use raw scores, set non-connected to 0
             deconv_weights = attention_scores_masked.clone()
@@ -727,13 +830,21 @@ class HeterogeneousGATDeconvolution(nn.Module):
             'spot_features': spot_features,
             'celltype_features': celltype_features,
             'attention_scores': attention_scores,    # Raw scores
+            'signature_residual_logits': residual_logits,
+            'signature_residual_component': residual_component,
+            'signature_prior_component': prior_component,
             'attention_scores_masked': attention_scores_masked,  # Masked scores
             'deconv_weights': deconv_weights,        # Normalized weights (sparse)
             'sparse_mask': sparse_mask,              # For debugging
             'edge_index': edge_index,
             'edge_attr': edge_attr,
             'dynamic_cluster_weights': dynamic_cluster_weights,  # [n_spots, n_cell_types, k] or None
-            'dynamic_cluster_indices': dynamic_cluster_indices   # [n_spots, n_cell_types, k] or None
+            'dynamic_cluster_indices': dynamic_cluster_indices,  # [n_spots, n_cell_types, k] or None
+            'signature_prior_scale': (
+                F.softplus(self.signature_prior_log_scale)
+                * self.signature_prior_multiplier
+            ),
+            'signature_prior_multiplier': self.signature_prior_multiplier,
         }
     
     def compute_cell_weights_from_knn(self, 
@@ -808,8 +919,20 @@ class SpatialDeconvolutionLoss(nn.Module):
                  lambda_reg=0.5, lambda_sparse=0.01,
                  lambda_proportion=1.0, sc_celltype_proportions=None, spot_total_counts=None,
                  celltype_expressions_full=None, marker_gene_indices=None,
-                 hvg_gene_indices=None, scale_basis: str = "hvg", library_size: float = 1.0):
+                 hvg_gene_indices=None, scale_basis: str = "hvg", library_size: float = 1.0,
+                 lambda_poisson: float = 0.0, lambda_spatial: float = 0.0,
+                 lambda_signature_consistency: float = 0.0,
+                 spatial_temperature: float = 1.0, heldout_gene_fraction: float = 0.0,
+                 split_seed: int = 42):
         super().__init__()
+        self.lambda_poisson = float(lambda_poisson)
+        self.lambda_spatial = float(lambda_spatial)
+        self.lambda_signature_consistency = float(lambda_signature_consistency)
+        if self.lambda_signature_consistency < 0:
+            raise ValueError("lambda_signature_consistency must be non-negative")
+        self.spatial_temperature = float(spatial_temperature)
+        if not 0.0 <= heldout_gene_fraction < 1.0:
+            raise ValueError("heldout_gene_fraction must be in [0, 1)")
         self.lambda_pearson = lambda_pearson      # Pearson损失权重
         self.lambda_mse = lambda_mse              # MSE损失权重
         self.lambda_cosine = lambda_cosine        # Cosine损失权重
@@ -838,6 +961,17 @@ class SpatialDeconvolutionLoss(nn.Module):
         if marker_gene_indices is None:
             raise ValueError("marker_gene_indices is required to extract marker genes!")
         self.register_buffer('marker_gene_indices', torch.LongTensor(marker_gene_indices))
+        marker_count = len(marker_gene_indices)
+        heldout_count = int(round(marker_count * heldout_gene_fraction))
+        if heldout_count > 0:
+            generator = np.random.default_rng(split_seed)
+            heldout_positions = np.sort(generator.choice(marker_count, heldout_count, replace=False))
+            fit_positions = np.setdiff1d(np.arange(marker_count), heldout_positions)
+        else:
+            heldout_positions = np.array([], dtype=np.int64)
+            fit_positions = np.arange(marker_count, dtype=np.int64)
+        self.register_buffer('fit_marker_positions', torch.LongTensor(fit_positions))
+        self.register_buffer('heldout_marker_positions', torch.LongTensor(heldout_positions))
         
         if hvg_gene_indices is not None and len(hvg_gene_indices) > 0:
             self.register_buffer('hvg_gene_indices', torch.LongTensor(hvg_gene_indices))
@@ -915,7 +1049,8 @@ class SpatialDeconvolutionLoss(nn.Module):
                knn_cell_indices: torch.Tensor = None,
                sc_cell_embeddings: torch.Tensor = None,
                sc_cell_expressions: torch.Tensor = None,
-               gat_model: nn.Module = None) -> Dict[str, torch.Tensor]:
+               gat_model: nn.Module = None,
+               reference_weights: torch.Tensor = None) -> Dict[str, torch.Tensor]:
         """
         计算总损失
         
@@ -1001,7 +1136,7 @@ class SpatialDeconvolutionLoss(nn.Module):
             reconstructed_spot_full = mixed_expr_full * scale * self.library_size  # ✅ 乘以 library_size
         
         # 提取 marker 基因: 只在 marker 基因上计算 loss
-        reconstructed_spot_marker = reconstructed_spot_full[:, self.marker_gene_indices]  # [batch_size, n_marker_genes]
+        reconstructed_spot_marker_all = reconstructed_spot_full[:, self.marker_gene_indices]
         
         # ============ 1. Pearson Correlation Loss ============
         # 计算Pearson相关系数(基于基因表达的相关性)
@@ -1022,8 +1157,19 @@ class SpatialDeconvolutionLoss(nn.Module):
             scale = target_sum / (mat.sum(dim=1, keepdim=True) + 1e-8)
             return mat * scale
 
-        reconstructed_log = torch.log1p(reconstructed_spot_marker)
-        true_log = torch.log1p(normalize_total(true_spot_expression, 1e4))
+        reconstructed_log_all = torch.log1p(reconstructed_spot_marker_all)
+        true_log_all = torch.log1p(normalize_total(true_spot_expression, 1e4))
+        reconstructed_log = reconstructed_log_all[:, self.fit_marker_positions]
+        true_log = true_log_all[:, self.fit_marker_positions]
+        reconstructed_spot_marker = reconstructed_spot_marker_all[:, self.fit_marker_positions]
+        true_spot_marker = true_spot_expression[:, self.fit_marker_positions]
+        if self.heldout_marker_positions.numel() > 0:
+            heldout_loss = F.mse_loss(
+                reconstructed_log_all[:, self.heldout_marker_positions],
+                true_log_all[:, self.heldout_marker_positions],
+            )
+        else:
+            heldout_loss = reconstructed_log.new_zeros(())
 
         pearson_corr = pearson_correlation(reconstructed_log, true_log)
         L_pearson = 1.0 - pearson_corr.mean()  # 1 - 相关系数,越小越好
@@ -1036,6 +1182,7 @@ class SpatialDeconvolutionLoss(nn.Module):
         # Cosine相似度在 log-normalized 空间计算（避免高表达基因主导）
         cos_sim_rec = F.cosine_similarity(reconstructed_log, true_log, dim=-1)
         L_cosine = 1.0 - cos_sim_rec.mean()
+        poisson_loss = poisson_deviance_loss(reconstructed_spot_marker, true_spot_marker)
         
         # ============ 4. Weight Regularization Loss ============
         # 确保权重和为1(softmax已保证,但作为额外约束)
@@ -1066,6 +1213,19 @@ class SpatialDeconvolutionLoss(nn.Module):
                 gene_cosine_loss = 1.0 - gene_cos.mean()
 
         proportion_loss = torch.tensor(0.0, device=attention_weights.device)
+        spatial_loss = torch.tensor(0.0, device=attention_weights.device)
+        signature_consistency_loss = torch.tensor(
+            0.0, device=attention_weights.device
+        )
+        if self.lambda_spatial > 0 and edge_index is not None and edge_index.numel() > 0:
+            n_spots = attention_weights.shape[0]
+            spot_edge_mask = (edge_index[0] < n_spots) & (edge_index[1] < n_spots)
+            spatial_loss = boundary_aware_graph_loss(
+                attention_weights,
+                edge_index[:, spot_edge_mask],
+                true_log,
+                temperature=self.spatial_temperature,
+            )
         
         if self.sc_celltype_proportions is not None:
             # 计算ST数据中预测的全局细胞类型比例
@@ -1083,6 +1243,24 @@ class SpatialDeconvolutionLoss(nn.Module):
                 )
             )
 
+        # Reference-affinity guidance is a soft proximal term rather than a
+        # hard residual clamp. The GAT keeps its configured logit range, but
+        # must earn large departures by improving expression reconstruction.
+        if reference_weights is not None:
+            if reference_weights.shape != attention_weights.shape:
+                raise ValueError(
+                    "reference_weights and attention_weights must have matching shapes"
+                )
+            predicted = attention_weights.clamp_min(1e-8)
+            predicted = predicted / predicted.sum(dim=1, keepdim=True).clamp_min(1e-8)
+            reference = reference_weights.clamp_min(1e-8)
+            reference = reference / reference.sum(dim=1, keepdim=True).clamp_min(1e-8)
+            midpoint = 0.5 * (predicted + reference)
+            signature_consistency_loss = 0.5 * (
+                torch.sum(predicted * torch.log(predicted / midpoint), dim=1)
+                + torch.sum(reference * torch.log(reference / midpoint), dim=1)
+            ).mean()
+
         # ============ 总损失 ============
         total_loss = (self.lambda_pearson * L_pearson +
                      self.lambda_mse * L_mse +
@@ -1091,7 +1269,10 @@ class SpatialDeconvolutionLoss(nn.Module):
                      self.lambda_gene_cosine * gene_cosine_loss +
                      self.lambda_reg * weight_sum_loss +
                      self.lambda_sparse * sparsity_loss +
-                     self.lambda_proportion * proportion_loss)
+                     self.lambda_proportion * proportion_loss +
+                     self.lambda_poisson * poisson_loss +
+                     self.lambda_spatial * spatial_loss +
+                     self.lambda_signature_consistency * signature_consistency_loss)
 
         return {
             'total_loss': total_loss,
@@ -1102,7 +1283,11 @@ class SpatialDeconvolutionLoss(nn.Module):
             'gene_cosine_loss': gene_cosine_loss,
             'weight_reg': weight_sum_loss,
             'sparsity_loss': sparsity_loss,
-            'proportion_loss': proportion_loss
+            'proportion_loss': proportion_loss,
+            'poisson_loss': poisson_loss,
+            'spatial_loss': spatial_loss,
+            'signature_consistency_loss': signature_consistency_loss,
+            'heldout_loss': heldout_loss,
         }
 
 

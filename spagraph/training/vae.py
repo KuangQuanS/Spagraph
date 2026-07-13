@@ -37,6 +37,7 @@ def train_vae(
     precomputed_marker_file: Optional[str] = None,
     aggregation_method: str = 'mean',
     marker_selection_method: str = 'variance',
+    celltype_key: Optional[str] = None,
     device: Optional[str] = None,
     print_every: int = 50,
     seed: int = 42
@@ -66,7 +67,10 @@ def train_vae(
         pretrained_path: Path to pretrained VAE model checkpoint
         precomputed_marker_file: Path to precomputed marker genes file
         aggregation_method: Cluster aggregation method ('mean', 'median', 'weighted')
-        marker_selection_method: Marker gene selection method ('l1', 'variance', 'correlation')
+        marker_selection_method: Marker gene selection method ('l1', 'variance',
+            'correlation', or 'celltype_specific')
+        celltype_key: Optional ``scRNA.obs`` annotation column used by
+            ``celltype_specific`` selection and annotation-guided Stage 2.
         device: Computing device ('cuda', 'cpu', or None for auto-select)
         print_every: Print loss every N epochs
         seed: Random seed for reproducibility (default: 42)
@@ -104,6 +108,7 @@ def train_vae(
         sc_file=sc_file,
         st_file=st_file,
         output_dir=output_dir or "./tmp_stage1",  # 临时目录（不会写入）
+        celltype_key=celltype_key,
         device=device,
         save_to_disk=save_to_disk,
         seed=seed
@@ -137,7 +142,7 @@ def train_vae(
         results=results,
         output_dir=output_dir,
         st_file=st_file,
-        celltype_key=None
+        celltype_key=celltype_key
     )
     
     # 保存超参数到 txt 文件
@@ -167,6 +172,7 @@ def train_vae(
             f.write(f"  Resolution:    {resolution}\n")
             f.write(f"  Top N/Type:    {top_n_per_type}\n")
             f.write(f"  Marker Method: {marker_selection_method}\n")
+            f.write(f"  Cell Type Key: {celltype_key or 'auto'}\n")
             f.write(f"  Aggregation:   {aggregation_method}\n\n")
             f.write(f"Model Architecture:\n")
             f.write(f"  Dual Decoder:  {use_dual_decoder}\n")

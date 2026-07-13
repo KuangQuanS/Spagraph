@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional, Dict, Any
 import numpy as np
+import pandas as pd
 import scanpy as sc
 import torch
 
@@ -74,6 +75,9 @@ class Stage1Artifacts:
     n_genes: Optional[int] = None
     raw_results: Optional[Dict[str, Any]] = None  # 保留原始结果，兼容旧逻辑
     
+    sc_cell_marker_expressions: Optional[Any] = None
+    sc_celltype_labels: Optional[Any] = None
+
     def is_memory_mode(self) -> bool:
         """判断是否为纯内存模式（不依赖文件）"""
         return self.vae_encoder is not None or self.vae_state_dict is not None
@@ -111,7 +115,9 @@ class Stage1Artifacts:
             # 动态cluster数据
             sc_cell_embeddings=results.get('sc_cell_embeddings'),
             sc_cell_expressions_raw=results.get('sc_cell_expressions_raw'),
-            sc_cell_labels=results.get('sc_cell_labels')
+            sc_cell_labels=results.get('sc_cell_labels'),
+            sc_cell_marker_expressions=results.get('sc_cell_marker_expressions'),
+            sc_celltype_labels=results.get('sc_celltype_labels')
         )
 
 
@@ -141,6 +147,11 @@ def run_deconv(
     lambda_reg: float = 0.1,
     lambda_sparse: float = 0,
     lambda_proportion: float = 0.01,
+    lambda_poisson: float = 0.0,
+    lambda_spatial: float = 0.0,
+    lambda_signature_consistency: float = 3.0,
+    spatial_temperature: float = 1.0,
+    heldout_gene_fraction: float = 0.0,
     # Output options
     save_reconstructed_genes: bool = False,  # 是否保存重构的全基因表达
     save_all_trials: bool = False,  # 网格搜索时是否保存所有k_celltype的deconv矩阵（命名为xxx_k15.csv等）
@@ -149,7 +160,26 @@ def run_deconv(
     k_cells_per_cluster: int = 10,  # 每个cluster使用多少个最近细胞
     precompute_knn: bool = True,  # 是否在训练前预计算k-nearest cells（推荐True）
     # Other
-    weight_threshold: float = 0.001,
+    full_graph_training: bool = True,
+    restore_best_state: bool = True,
+    signature_init: bool = False,
+    signature_ridge: float = 1e-4,
+    signature_prior_strength: float = 1.0,
+    signature_prior_trainable: bool = False,
+    signature_residual_scale: float = 5.0,
+    signature_residual_mode: str = 'bounded_tanh',
+    signature_affinity_graph: bool = True,
+    signature_prior_final_multiplier: float = 1.0,
+    signature_prior_anneal_epochs: int = 0,
+    zero_init_signature_residual: Optional[bool] = None,
+    signature_platform_calibration: bool = False,
+    signature_calibration_iterations: int = 5,
+    reference_grouping: str = 'leiden',
+    reference_signature_mode: str = 'pseudobulk',
+    signature_gene_selection: str = 'stage1_markers',
+    signature_genes_per_celltype: int = 100,
+    signature_composition_power: float = 1.2,
+    weight_threshold: Optional[float] = None,
     scale_basis: str = 'all',
     use_ols_scaling: bool = False,  # 是否使用 OLS 最小二乘缩放（纯数学方法，非模型参数）
     library_size: float = 1.0,  # 手动文库因子，在 scale 基础上再乘此值（默认 1.0）
@@ -197,9 +227,28 @@ def run_deconv(
         use_dynamic_cluster_repr: 是否启用动态 cluster（用 k 个最近细胞代替平均）
         k_cells_per_cluster: 每个 cluster 使用多少个最近细胞（被 k_celltype 覆盖）
         precompute_knn: 是否预计算 k-nearest cells（推荐 True）
+
+        # Signature-guided residual GAT
+        signature_init: Initialize spot compositions from reference signatures.
+        signature_prior_strength: Scale of the signature log-prior.
+        signature_prior_trainable: Whether the prior scale is learned.
+        signature_residual_scale: Bound on the GAT residual logit magnitude.
+        signature_residual_mode: ``bounded_tanh`` for a bounded correction or
+            ``linear`` for a fully expressive residual head.
+        signature_affinity_graph: Use the signature-derived spot/cell-type
+            affinity matrix to select heterogeneous graph edges.
+        lambda_signature_consistency: Soft Jensen-Shannon consistency between
+            the GAT output and the reference-derived affinity distribution.
+        signature_prior_final_multiplier: Remaining fraction of the signature
+            prior after warm-start annealing.
+        signature_prior_anneal_epochs: Number of epochs over which the prior
+            multiplier moves from 1 to its final value.
+        zero_init_signature_residual: Start the residual head at the signature estimate.
         
         # 其他
-        weight_threshold: deconv 权重阈值（小于此值的权重置零）
+        weight_threshold: Composition cutoff. ``None`` preserves all
+            signature-supported components when ``signature_init=True`` and
+            otherwise uses the legacy cutoff of 0.001.
         scale_basis: 缩放基准（'all', 'hvg', 'marker', 'none', 'fixed_10'）
         use_ols_scaling: 是否使用 OLS 最小二乘缩放（True=OLS，False=sum-based，纯数学方法）
         library_size: 手动文库因子，在 scale 基础上再乘此值（默认 1.0，>1 放大，<1 缩小）
@@ -235,6 +284,71 @@ def run_deconv(
         >>> print(f"Best k: {results['best_k']}")
     """
     # 参数检查
+    if isinstance(k_celltype, (list, tuple)) and len(k_celltype) == 0:
+        raise ValueError("k_celltype candidate list cannot be empty")
+    if signature_ridge < 0:
+        raise ValueError("signature_ridge must be non-negative")
+    if signature_prior_strength < 0:
+        raise ValueError("signature_prior_strength must be non-negative")
+    if signature_residual_scale < 0:
+        raise ValueError("signature_residual_scale must be non-negative")
+    if (
+        not np.isfinite(lambda_signature_consistency)
+        or lambda_signature_consistency < 0
+    ):
+        raise ValueError(
+            "lambda_signature_consistency must be finite and non-negative"
+        )
+    if signature_residual_mode not in {'bounded_tanh', 'linear'}:
+        raise ValueError(
+            "signature_residual_mode must be 'bounded_tanh' or 'linear'"
+        )
+    if (
+        not np.isfinite(signature_prior_final_multiplier)
+        or signature_prior_final_multiplier < 0
+    ):
+        raise ValueError(
+            "signature_prior_final_multiplier must be finite and non-negative"
+        )
+    if (
+        not isinstance(signature_prior_anneal_epochs, (int, np.integer))
+        or signature_prior_anneal_epochs < 0
+    ):
+        raise ValueError("signature_prior_anneal_epochs must be a non-negative integer")
+    if signature_calibration_iterations < 0:
+        raise ValueError("signature_calibration_iterations must be non-negative")
+    if zero_init_signature_residual is None:
+        zero_init_signature_residual = bool(signature_init)
+    if reference_grouping not in {'leiden', 'celltype'}:
+        raise ValueError("reference_grouping must be 'leiden' or 'celltype'")
+    if reference_signature_mode not in {'pseudobulk', 'cell_normalized', 'log_normalized'}:
+        raise ValueError(
+            "reference_signature_mode must be pseudobulk, cell_normalized, or log_normalized"
+        )
+    if signature_gene_selection not in {'stage1_markers', 'celltype_specific', 'all_shared'}:
+        raise ValueError(
+            "signature_gene_selection must be stage1_markers, celltype_specific, or all_shared"
+        )
+    if signature_genes_per_celltype < 1:
+        raise ValueError("signature_genes_per_celltype must be at least 1")
+    if not np.isfinite(signature_composition_power) or signature_composition_power <= 0:
+        raise ValueError("signature_composition_power must be finite and positive")
+    if signature_gene_selection != 'stage1_markers' and reference_grouping != 'celltype':
+        raise ValueError(
+            "celltype-specific or all-shared signature genes require reference_grouping='celltype'"
+        )
+    if not 0.0 <= heldout_gene_fraction < 1.0:
+        raise ValueError("heldout_gene_fraction must be in [0, 1)")
+    if weight_threshold is None:
+        # Small reference-supported components are meaningful in mixtures with
+        # many cell types. Preserve the signature support by default, while
+        # retaining the legacy cutoff for de-novo GAT mode.
+        weight_threshold = 0.0 if signature_init else 0.001
+    elif not np.isfinite(weight_threshold) or weight_threshold < 0:
+        raise ValueError("weight_threshold must be finite and non-negative")
+    else:
+        weight_threshold = float(weight_threshold)
+
     if st_file is None:
         st_file = vae.st_file
     if st_file is None:
@@ -274,6 +388,9 @@ def run_deconv(
         print(f"  Reg:              {lambda_reg}")
         print(f"  Sparse:           {lambda_sparse}")
         print(f"  Proportion:       {lambda_proportion}")
+        if signature_init:
+            print(f"  Signature JS:     {lambda_signature_consistency}")
+            print(f"Residual/Affinity:  +/-{signature_residual_scale:g} / {signature_affinity_graph}")
         print(f"Dynamic Cluster:    {use_dynamic_cluster_repr}")
         if use_dynamic_cluster_repr:
             print(f"  K Cells/Cluster:  {k_cells_per_cluster}")
@@ -311,11 +428,35 @@ def run_deconv(
             lambda_reg=lambda_reg,
             lambda_sparse=lambda_sparse,
             lambda_proportion=lambda_proportion,
+            lambda_poisson=lambda_poisson,
+            lambda_spatial=lambda_spatial,
+            lambda_signature_consistency=lambda_signature_consistency,
+            spatial_temperature=spatial_temperature,
+            heldout_gene_fraction=heldout_gene_fraction,
             save_reconstructed_genes=save_reconstructed_genes,
             save_all_trials=save_all_trials,
             use_dynamic_cluster_repr=use_dynamic_cluster_repr,
             k_cells_per_cluster=k_cells_per_cluster,
             precompute_knn=precompute_knn,
+            full_graph_training=full_graph_training,
+            restore_best_state=restore_best_state,
+            signature_init=signature_init,
+            signature_ridge=signature_ridge,
+            signature_prior_strength=signature_prior_strength,
+            signature_prior_trainable=signature_prior_trainable,
+            signature_residual_scale=signature_residual_scale,
+            signature_residual_mode=signature_residual_mode,
+            signature_affinity_graph=signature_affinity_graph,
+            signature_prior_final_multiplier=signature_prior_final_multiplier,
+            signature_prior_anneal_epochs=signature_prior_anneal_epochs,
+            zero_init_signature_residual=zero_init_signature_residual,
+            signature_platform_calibration=signature_platform_calibration,
+            signature_calibration_iterations=signature_calibration_iterations,
+            reference_grouping=reference_grouping,
+            reference_signature_mode=reference_signature_mode,
+            signature_gene_selection=signature_gene_selection,
+            signature_genes_per_celltype=signature_genes_per_celltype,
+            signature_composition_power=signature_composition_power,
             weight_threshold=weight_threshold,
             scale_basis=scale_basis,
             use_ols_scaling=use_ols_scaling,  # ✅ 传递 OLS 参数到网格搜索
@@ -360,6 +501,38 @@ def run_deconv(
     
     # 加载 VAE 编码器
     trainer.load_vae_encoder()
+
+    if reference_grouping == 'celltype':
+        from spagraph.models.deconv_initialization import aggregate_reference_by_labels
+
+        labels = getattr(vae, 'sc_celltype_labels', None)
+        marker_expr = getattr(vae, 'sc_cell_marker_expressions', None)
+        embeddings = getattr(vae, 'sc_cell_embeddings', None)
+        raw_expr = getattr(vae, 'sc_cell_expressions_raw', None)
+        if labels is None or marker_expr is None or embeddings is None or raw_expr is None:
+            raise ValueError(
+                "reference_grouping='celltype' requires aligned SC annotation, "
+                "marker expression, embeddings, and raw expression from Stage 1"
+            )
+        grouped = aggregate_reference_by_labels(labels, embeddings, marker_expr, raw_expr)
+        annotation_encoder = grouped['encoder']
+        encoded_labels = grouped['encoded_labels']
+
+        trainer.label_encoder = annotation_encoder
+        trainer.celltype_prototypes = torch.as_tensor(
+            grouped['prototypes'], dtype=torch.float32, device=trainer.device
+        )
+        trainer.celltype_expressions = torch.as_tensor(
+            grouped['marker_signatures'], dtype=torch.float32, device=trainer.device
+        )
+        trainer.celltype_expressions_full = list(grouped['raw_signatures'])
+        trainer.signature_cell_normalized_full = grouped['cell_normalized_signatures']
+        trainer.signature_log_normalized_full = grouped['log_normalized_signatures']
+        trainer.cluster_to_celltype = {
+            str(name): str(name) for name in annotation_encoder.classes_
+        }
+        # Dynamic nearest-cell lookup must use the same reference grouping.
+        vae.sc_cell_labels = encoded_labels
     
     if trainer.sc_clusters is None:
         raise ValueError("Stage 1 missing cluster info!")
@@ -386,11 +559,13 @@ def run_deconv(
     if 'spatial' in st_adata.obsm:
         spatial_coords = st_adata.obsm['spatial']
         trainer.use_embedding_knn = False
+        graph_source = 'spatial_coordinates'
     else:
         if not _silent_header:  # 网格搜索时不重复打印
             print("⚠️ No spatial coords, using embedding-based KNN")
         spatial_coords = np.zeros((st_adata.n_obs, 2))
         trainer.use_embedding_knn = True
+        graph_source = 'vae_embedding_knn'
     
     # 提取 marker genes
     st_X_raw = st_adata[:, trainer.genes].X
@@ -435,7 +610,6 @@ def run_deconv(
             
             # 导入预计算工具
             from ..utils.knn_utils import precompute_knn_cells_torch
-            import torch
             
             # 计算ST embeddings（用于找最近细胞）
             st_data_tensor = torch.FloatTensor(st_X_embed).to(trainer.device)
@@ -461,6 +635,94 @@ def run_deconv(
                 print(f"✓ 预计算完成: {knn_cell_indices.shape}")
     
     # 构建 GAT 模型
+    # Reference affinities use only the observed reference and spot expression;
+    # simulated composition truth is never available to the model.
+    initial_weights = None
+    signature_selected_genes = None
+    if signature_init:
+        from spagraph.models.deconv_initialization import (
+            compute_platform_calibrated_initialization,
+            compute_signature_initialization,
+            select_celltype_specific_genes,
+        )
+
+        if signature_gene_selection == 'stage1_markers' and reference_signature_mode == 'log_normalized':
+            signatures_marker = np.asarray(
+                trainer.celltype_expressions.detach().cpu(), dtype=np.float64
+            )
+            signature_fit_spots = st_X_embed
+            signature_selected_genes = list(trainer.genes)
+        elif signature_gene_selection != 'stage1_markers':
+            shared_genes = [gene for gene in trainer.all_genes if gene in st_adata.var_names]
+            if not shared_genes:
+                raise ValueError("no shared genes are available for signature initialization")
+            sc_shared_indices = np.asarray(
+                [trainer.all_genes.index(gene) for gene in shared_genes], dtype=np.int64
+            )
+            st_shared = st_adata[:, shared_genes].X
+            st_shared = st_shared.toarray() if hasattr(st_shared, 'toarray') else np.asarray(st_shared)
+            selection_signatures = np.asarray(
+                trainer.signature_cell_normalized_full[:, sc_shared_indices], dtype=np.float64
+            )
+            if signature_gene_selection == 'celltype_specific':
+                selected = select_celltype_specific_genes(
+                    selection_signatures,
+                    top_per_celltype=signature_genes_per_celltype,
+                )
+            else:
+                selected = np.arange(len(shared_genes), dtype=np.int64)
+            signature_selected_genes = [shared_genes[index] for index in selected]
+            if reference_signature_mode == 'log_normalized':
+                signatures_marker = np.asarray(
+                    trainer.signature_log_normalized_full[:, sc_shared_indices[selected]],
+                    dtype=np.float64,
+                )
+                spot_totals = np.maximum(st_shared.sum(axis=1, keepdims=True), 1e-12)
+                signature_fit_spots = np.log1p(st_shared[:, selected] / spot_totals * 1e4)
+            elif reference_signature_mode == 'cell_normalized':
+                signatures_marker = selection_signatures[:, selected]
+                signature_fit_spots = st_shared[:, selected]
+            else:
+                signatures_full = np.vstack([
+                    np.asarray(expr, dtype=np.float64)
+                    for expr in trainer.celltype_expressions_full
+                ])
+                signatures_marker = signatures_full[:, sc_shared_indices[selected]]
+                signature_fit_spots = st_shared[:, selected]
+        else:
+            if reference_signature_mode == 'cell_normalized':
+                signatures_full = np.asarray(
+                    getattr(trainer, 'signature_cell_normalized_full'), dtype=np.float64
+                )
+            else:
+                signatures_full = np.vstack([
+                    np.asarray(expr, dtype=np.float64)
+                    for expr in trainer.celltype_expressions_full
+                ])
+            marker_indices = [trainer.all_genes.index(g) for g in trainer.genes]
+            signatures_marker = signatures_full[:, marker_indices]
+            signature_fit_spots = st_X_raw
+            signature_selected_genes = list(trainer.genes)
+        signature_gene_factors = None
+        if signature_platform_calibration:
+            initial_weights, signature_gene_factors = compute_platform_calibrated_initialization(
+                spot_expression=signature_fit_spots,
+                celltype_signatures=signatures_marker,
+                ridge=signature_ridge,
+                iterations=signature_calibration_iterations,
+            )
+        else:
+            initial_weights = compute_signature_initialization(
+                spot_expression=signature_fit_spots,
+                celltype_signatures=signatures_marker,
+                ridge=signature_ridge,
+            )
+        if not _silent_header:
+            print(
+                f"Signature initialization: shape={initial_weights.shape}, "
+                f"ridge={signature_ridge:g}, prior_strength={signature_prior_strength:g}"
+            )
+
     trainer.build_gat_model(
         n_cell_types=n_clusters,
         gat_hidden_dim=gat_hidden_dim,
@@ -479,7 +741,21 @@ def run_deconv(
         # 动态cluster参数
         use_dynamic_cluster_repr=use_dynamic_cluster_repr,
         k_cells_per_cluster=k_cells_per_cluster,
-        sc_cell_expressions=vae.sc_cell_expressions_raw if use_dynamic_cluster_repr else None
+        sc_cell_expressions=vae.sc_cell_expressions_raw if use_dynamic_cluster_repr else None,
+        signature_prior_strength=(signature_prior_strength if signature_init else 0.0),
+        signature_prior_trainable=signature_prior_trainable,
+        signature_residual_scale=signature_residual_scale,
+        signature_residual_mode=signature_residual_mode,
+        signature_affinity_graph=signature_affinity_graph,
+        signature_prior_final_multiplier=signature_prior_final_multiplier,
+        signature_prior_anneal_epochs=signature_prior_anneal_epochs,
+        signature_output_power=(signature_composition_power if signature_init else 1.0),
+        zero_init_signature_residual=zero_init_signature_residual,
+        lambda_poisson=lambda_poisson,
+        lambda_spatial=lambda_spatial,
+        lambda_signature_consistency=lambda_signature_consistency,
+        spatial_temperature=spatial_temperature,
+        heldout_gene_fraction=heldout_gene_fraction,
     )
     
     # 训练
@@ -495,7 +771,10 @@ def run_deconv(
         print_every=print_every,
         # 动态cluster参数
         knn_cell_indices=vae.knn_cell_indices if use_dynamic_cluster_repr and precompute_knn else None,
-        sc_cell_embeddings=vae.sc_cell_embeddings if use_dynamic_cluster_repr else None
+        sc_cell_embeddings=vae.sc_cell_embeddings if use_dynamic_cluster_repr else None,
+        initial_weights=initial_weights,
+        full_graph_training=full_graph_training,
+        restore_best_state=restore_best_state,
     )
     
     # 保存超参数到 txt 文件
@@ -529,6 +808,18 @@ def run_deconv(
             f.write(f"  Layers:        {gat_layers}\n")
             f.write(f"  Heads:         {gat_heads}\n")
             f.write(f"  Dropout:       {dropout}\n\n")
+            f.write(f"Signature-guided Residual:\n")
+            f.write(f"  Enabled:         {signature_init}\n")
+            f.write(f"  Prior Strength:  {signature_prior_strength}\n")
+            f.write(f"  Prior Trainable: {signature_prior_trainable}\n")
+            f.write(f"  Residual Scale:  {signature_residual_scale}\n")
+            f.write(f"  Residual Mode:   {signature_residual_mode}\n")
+            f.write(f"  Affinity Graph:  {signature_affinity_graph}\n")
+            f.write(f"  Final Prior Multiplier: {signature_prior_final_multiplier}\n")
+            f.write(f"  Prior Anneal Epochs:    {signature_prior_anneal_epochs}\n")
+            f.write(f"  Zero Init:       {zero_init_signature_residual}\n")
+            f.write(f"  Output Power:    {signature_composition_power}\n")
+            f.write(f"  Held-out Genes:  {heldout_gene_fraction}\n\n")
             f.write(f"Loss Weights:\n")
             f.write(f"  Pearson:       {lambda_pearson}\n")
             f.write(f"  MSE:           {lambda_mse}\n")
@@ -537,7 +828,8 @@ def run_deconv(
             f.write(f"  Gene Cosine:   {lambda_gene_cosine}\n")
             f.write(f"  Reg:           {lambda_reg}\n")
             f.write(f"  Sparse:        {lambda_sparse}\n")
-            f.write(f"  Proportion:    {lambda_proportion}\n\n")
+            f.write(f"  Proportion:    {lambda_proportion}\n")
+            f.write(f"  Signature JS:  {lambda_signature_consistency}\n\n")
             f.write(f"Dynamic Cluster Representation:\n")
             f.write(f"  Enabled:       {use_dynamic_cluster_repr}\n")
             if use_dynamic_cluster_repr:
@@ -569,6 +861,20 @@ def run_deconv(
         'sample_name': sample_name,
         'n_clusters': n_clusters,
         'best_pearson': results.get('best_pearson'),
+        'best_epoch': results.get('best_epoch'),
+        'best_total_loss': results.get('best_total_loss'),
+        'graph_source': graph_source,
+        'reference_grouping': reference_grouping,
+        'reference_signature_mode': reference_signature_mode,
+        'signature_gene_selection': signature_gene_selection,
+        'signature_selected_genes': signature_selected_genes,
+        'signature_refinement_mean_abs': results.get('signature_refinement_mean_abs'),
+        'signature_refinement_max_abs': results.get('signature_refinement_max_abs'),
+        'signature_residual_logit_rms': results.get('signature_residual_logit_rms'),
+        'signature_prior_logit_rms': results.get('signature_prior_logit_rms'),
+        'signature_neural_logit_fraction': results.get('signature_neural_logit_fraction'),
+        'signature_effective_prior_scale': results.get('signature_effective_prior_scale'),
+        'signature_prior_multiplier': results.get('signature_prior_multiplier'),
         'deconv_weights_raw': results.get('deconv_weights_raw'),  # 未合并的 cluster-level 权重
         'metrics': {
             'pearson': results.get('best_pearson'),
@@ -614,6 +920,11 @@ def run_deconv_auto_k(
     """
 
     # 简化输出
+    if not k_celltype_range:
+        raise ValueError("k_celltype_range must contain at least one candidate")
+    if any(not isinstance(k, (int, np.integer)) or int(k) <= 0 for k in k_celltype_range):
+        raise ValueError("all k_celltype candidates must be positive integers")
+
     print(f"\nGrid search: k_celltype = {k_celltype_range}")
     
     best_k = None

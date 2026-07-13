@@ -18,6 +18,7 @@ import math
 import argparse
 import warnings
 import umap
+from scipy import sparse
 warnings.filterwarnings('ignore')
 
 # Import model and utilities from deconv_model (which now includes vae_utils)
@@ -50,6 +51,7 @@ class coEncoder:
                  sc_file=None,
                  st_file=None,
                  output_dir="./stage1_results",
+                 celltype_key=None,
                  device=None,
                  save_to_disk=True,
                  seed=42):
@@ -60,6 +62,9 @@ class coEncoder:
             sc_file: Path to single-cell h5ad file
             st_file: Path to spatial transcriptomics h5ad file
             output_dir: Output directory path (if save_to_disk=False, only used for temp files)
+            celltype_key: Optional ``scRNA.obs`` column containing reference
+                cell-type annotations. If omitted, ``cell_type`` and then
+                ``celltype`` are detected for backward compatibility.
             device: Computing device (cuda/cpu, None for auto)
             save_to_disk: Whether to save models and data to disk. If False, only returns in-memory objects
             seed: Random seed for reproducibility
@@ -76,6 +81,7 @@ class coEncoder:
         self.sc_file = sc_file
         self.st_file = st_file
         self.output_dir = output_dir
+        self.requested_celltype_key = celltype_key
         self.save_to_disk = save_to_disk
         self.seed = seed
         
@@ -91,6 +97,24 @@ class coEncoder:
         self.vae = None
         self.label_encoder = None
         self.marker_genes = None
+
+    def _resolve_celltype_key(self, adata: ad.AnnData, required: bool = False) -> Optional[str]:
+        """Return the configured reference-annotation column, if available."""
+        if self.requested_celltype_key is not None:
+            if self.requested_celltype_key not in adata.obs.columns:
+                raise ValueError(
+                    f"celltype_key={self.requested_celltype_key!r} is not present in scRNA.obs"
+                )
+            return self.requested_celltype_key
+        for candidate in ('cell_type', 'celltype'):
+            if candidate in adata.obs.columns:
+                return candidate
+        if required:
+            raise ValueError(
+                "cell-type annotations are required; pass celltype_key or add "
+                "scRNA.obs['cell_type'] / scRNA.obs['celltype']"
+            )
+        return None
         
     def load_data(self) -> Tuple[ad.AnnData, ad.AnnData]:
         """Load SC and ST data from specified files"""
@@ -135,7 +159,9 @@ class coEncoder:
             precomputed_marker_file: Path to precomputed marker genes file.
                                    If provided, will load marker genes directly from this file
                                    instead of computing them from scratch.
-            marker_selection_method: Method for marker gene selection ('l1', 'variance', 'correlation')
+            marker_selection_method: Marker selection method. In addition to
+                Leiden-based methods, ``celltype_specific`` builds a balanced
+                marker union from supplied single-cell annotations.
         """
 
         # Step 0: Compute auto_library_size first (using raw counts)
@@ -202,6 +228,56 @@ class coEncoder:
             sc.tl.leiden(sc_adata_clustered, resolution=resolution)
             sc_clusters = sc_adata_clustered.obs['leiden'].copy()
             print(f"   Number of clusters: {len(sc_clusters.unique())}")
+        elif marker_selection_method == 'celltype_specific':
+            celltype_col = self._resolve_celltype_key(sc_adata, required=True)
+            annotations = sc_adata.obs[celltype_col]
+            if annotations.isna().any():
+                raise ValueError("cell-type annotations cannot contain missing values")
+            labels = annotations.astype(str).to_numpy()
+            encoded = LabelEncoder().fit_transform(labels)
+            expression = sc_adata.X
+            totals = np.asarray(expression.sum(axis=1)).ravel()
+            inverse = np.zeros_like(totals, dtype=np.float64)
+            inverse[totals > 0] = 1.0 / totals[totals > 0]
+            if sparse.issparse(expression):
+                normalized = sparse.diags(inverse) @ expression
+            else:
+                normalized = np.asarray(expression, dtype=np.float64) * inverse[:, None]
+            signatures = np.vstack([
+                np.asarray(normalized[encoded == group].mean(axis=0)).ravel()
+                for group in np.unique(encoded)
+            ])
+            from .deconv_initialization import select_celltype_specific_genes
+
+            selected = select_celltype_specific_genes(
+                signatures, top_per_celltype=top_n_per_type
+            )
+            self.marker_genes = [str(sc_adata.var_names[index]) for index in selected]
+
+            # The selected genes guide VAE integration, while Leiden labels are
+            # retained for backward-compatible Stage 1 artifacts. Stage 2 can
+            # independently aggregate the reference by supplied annotations.
+            clustered = sc_adata.copy()
+            sc.pp.normalize_total(clustered, target_sum=1e4)
+            sc.pp.log1p(clustered)
+            sc.pp.highly_variable_genes(
+                clustered,
+                n_top_genes=min(2000, clustered.n_vars),
+                flavor='seurat',
+            )
+            hvg = clustered[:, clustered.var['highly_variable']].copy()
+            sc.pp.scale(hvg, max_value=10)
+            n_comps = max(2, min(40, hvg.n_obs - 1, hvg.n_vars - 1))
+            sc.tl.pca(hvg, n_comps=n_comps, svd_solver='arpack')
+            sc.pp.neighbors(hvg, n_neighbors=min(10, hvg.n_obs - 1), n_pcs=n_comps)
+            sc.tl.leiden(hvg, resolution=resolution)
+            sc_adata_clustered = sc_adata.copy()
+            sc_adata_clustered.obs['leiden'] = hvg.obs['leiden'].copy()
+            sc_clusters = sc_adata_clustered.obs['leiden'].copy()
+            print(
+                f"Selected {len(self.marker_genes)} balanced annotation-specific genes "
+                f"from {len(np.unique(labels))} cell types"
+            )
         else:
             # Auto-cluster using Leiden
             cluster_save_path = f"{self.output_dir}/marker_genes.txt" if (self.save_to_disk and self.output_dir) else None
@@ -226,6 +302,16 @@ class coEncoder:
         # 2. Process SC data (extract marker genes then normalize + log1p)
         # ✅ First filter to match sc_clusters.index (some cells may be filtered during clustering)
         sc_adata_count = sc_adata[sc_clusters.index].copy()
+
+        # Preserve supplied SC reference annotations aligned to all in-memory
+        # artifacts. This is reference information, not spot-composition truth.
+        celltype_col = self._resolve_celltype_key(sc_adata_count)
+        if celltype_col is not None:
+            sc_celltype_labels = sc_adata_count.obs[celltype_col].astype(str).to_numpy()
+            self.celltype_key = celltype_col
+        else:
+            sc_celltype_labels = None
+            self.celltype_key = None
         
         # Extract raw counts for all genes (for later scaling and expression reconstruction)
         sc_all_genes_raw = sc_adata_count.X.toarray() if hasattr(sc_adata_count.X, 'toarray') else sc_adata_count.X
@@ -297,11 +383,11 @@ class coEncoder:
         
         # 5. Split data for training (with test set for early stopping)
         sc_train, sc_test, y_train, y_test = train_test_split(
-            sc_X_final, sc_y, test_size=0.05, stratify=sc_y, random_state=42
+            sc_X_final, sc_y, test_size=0.05, stratify=sc_y, random_state=self.seed
         )
         
         st_train, st_test = train_test_split(
-            st_X_final, test_size=0.05, random_state=42
+            st_X_final, test_size=0.05, random_state=self.seed
         )
         
         # 6. Combine train and test sets
@@ -339,7 +425,20 @@ class coEncoder:
                 for gene in self.genes:
                     f.write(f"{gene}\n")
 
-        return train_X, test_X, train_modality, test_modality, y_train, y_test, sc_X_final, sc_all_genes_raw, sc_all_labels
+        return (
+            train_X,
+            test_X,
+            train_modality,
+            test_modality,
+            train_labels,
+            test_labels,
+            y_train,
+            y_test,
+            sc_X_final,
+            sc_all_genes_raw,
+            sc_all_labels,
+            sc_celltype_labels,
+        )
     
     def build_vae(self, input_dim: int, hidden_dims=[512, 256], latent_dim=128, dropout=0.2, loss_type='mse', use_dual_decoder=False):
         """Build VAE model
@@ -488,7 +587,9 @@ class coEncoder:
                 - 'mean': Simple average (fast, basic)
                 - 'median': Median aggregation (robust to outliers)
                 - 'weighted': Weighted average with UMI, representativeness, and marker activity (recommended)
-            marker_selection_method: Method for marker gene selection ('l1', 'variance', 'correlation')
+            marker_selection_method: Method for marker gene selection ('l1',
+                'variance', 'correlation', or annotation-balanced
+                'celltype_specific')
             print_every: Print loss every N epochs (default: 50)
         """
         print(f"\n{'='*60}")
@@ -511,7 +612,20 @@ class coEncoder:
         sc_adata, st_adata = self.load_data()
         
         # 2. Prepare data based on marker genes (with test split for early stopping)
-        train_X, test_X, train_modality, test_modality, y_train, y_test, sc_X_final, sc_all_genes_raw, sc_all_labels = self.prepare_marker_gene_data(
+        (
+            train_X,
+            test_X,
+            train_modality,
+            test_modality,
+            train_labels,
+            test_labels,
+            y_train,
+            y_test,
+            sc_X_final,
+            sc_all_genes_raw,
+            sc_all_labels,
+            sc_celltype_labels,
+        ) = self.prepare_marker_gene_data(
             sc_adata, st_adata, top_n_per_type=top_n_per_type, resolution=resolution, 
             precomputed_marker_file=precomputed_marker_file, marker_selection_method=marker_selection_method
         )
@@ -561,6 +675,7 @@ class coEncoder:
         self.sc_X_final = sc_X_final  # ALL SC marker gene data (log1p normalized)
         self.sc_all_genes_raw = sc_all_genes_raw  # ALL SC raw counts for all genes [n_cells, n_all_genes]
         self.sc_all_labels = sc_all_labels  # ALL SC cluster labels
+        self.sc_celltype_labels = sc_celltype_labels
         
         # Use trained VAE to compute embeddings for ALL SC cells
         self.vae.eval()
@@ -607,11 +722,7 @@ class coEncoder:
         cluster_to_celltype = {}
         
         # Check for celltype column (prioritize 'cell_type', then 'celltype')
-        celltype_col = None
-        if 'cell_type' in self.sc_adata_clustered.obs.columns:
-            celltype_col = 'cell_type'
-        elif 'celltype' in self.sc_adata_clustered.obs.columns:
-            celltype_col = 'celltype'
+        celltype_col = self._resolve_celltype_key(self.sc_adata_clustered)
         
         if celltype_col is not None:
             for cluster_id in sorted(self.sc_adata_clustered.obs['leiden'].unique()):
@@ -691,6 +802,9 @@ class coEncoder:
             'sc_cell_embeddings': self.sc_cell_embeddings,  # [n_sc_cells, latent_dim]
             'sc_cell_expressions_raw': self.sc_cell_expressions_raw,  # [n_sc_cells, n_all_genes] raw counts for all genes
             'sc_cell_labels': self.sc_cell_labels,  # [n_sc_cells] cluster labels
+            'sc_cell_marker_expressions': self.sc_X_final,
+            'sc_celltype_labels': self.sc_celltype_labels,
+            'celltype_key': getattr(self, 'celltype_key', None),
         }
 
 def main():
@@ -704,6 +818,8 @@ def main():
                        help='Path to spatial transcriptomics h5ad file')
     parser.add_argument('--output_dir', type=str, default="./stage1_results",
                        help='Output directory path')
+    parser.add_argument('--celltype_key', type=str, default=None,
+                       help='Optional scRNA.obs column with reference cell-type annotations')
     
     # Clustering arguments
     parser.add_argument('--resolution', type=float, default=4,
@@ -742,9 +858,10 @@ def main():
                        help='Cluster aggregation method: mean (simple average), median (robust to outliers), '
                             'weighted (UMI+representativeness+marker activity, recommended)')
     parser.add_argument('--marker_selection_method', type=str, default='variance', 
-                       choices=['l1', 'variance', 'correlation'],
+                       choices=['l1', 'variance', 'correlation', 'celltype_specific'],
                        help='Method for marker gene selection: l1 (L1-regularized logistic regression), '
-                            'variance (variance threshold), correlation (correlation-based filtering)')
+                            'variance (variance threshold), correlation (correlation-based filtering), '
+                            'or celltype_specific (balanced annotation markers)')
     
     # Device argument
     parser.add_argument('--device', type=str, default=None,
@@ -758,6 +875,7 @@ def main():
         sc_file=args.sc_file,
         st_file=args.st_file,
         output_dir=args.output_dir,
+        celltype_key=args.celltype_key,
         device=args.device
     )
     

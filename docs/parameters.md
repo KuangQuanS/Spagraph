@@ -84,59 +84,6 @@ from fitting, gene selection, platform calibration, and parameter selection.
 The composition power was selected on the predefined development split and
 frozen before validation and blind-test evaluation.
 
-## Historical graph-mode simulated-data auto-k record
-
-The following records describe the earlier graph-attention benchmark mode and
-are retained for provenance. They are not the settings used for the optimized
-Figure 2 results reported above.
-
-The manuscript evaluates Data1–Data32. The newer GPU configuration directory
-contains final auto-k records for 25 datasets. Data21, Data22, Data24 and Data29
-were recovered from contemporaneous legacy `stage2_config.txt` files. No run
-configuration containing `k_celltype` survives for Data27, Data28 or Data32;
-these are marked **not recorded**, rather than being assigned the incorrect
-single common value from the draft spreadsheet.
-
-| Dataset | Recorded Leiden resolution | Final `k_celltype` | Provenance | Source revision |
-|---|---:|---:|---|---|
-| Data1 | 2 | 35 | final GPU config | base 1265737 + release record |
-| Data2 | 4.0 | 40 | final GPU config | base 1265737 + release record |
-| Data3 | 4.0 | 40 | final GPU config | base 1265737 + release record |
-| Data4 | 4.0 | 35 | final GPU config | base 1265737 + release record |
-| Data5 | 4.0 | 40 | final GPU config | base 1265737 + release record |
-| Data6 | 4.0 | 40 | final GPU config | base 1265737 + release record |
-| Data7 | 4.0 | 40 | final GPU config | base 1265737 + release record |
-| Data8 | 4.0 | 30 | final GPU config | base 1265737 + release record |
-| Data9 | 4.0 | 40 | final GPU config | base 1265737 + release record |
-| Data10 | 4.0 | 40 | final GPU config | base 1265737 + release record |
-| Data11 | 4.0 | 40 | final GPU config | base 1265737 + release record |
-| Data12 | 4.0 | 35 | final GPU config | base 1265737 + release record |
-| Data13 | 4.0 | 35 | final GPU config | base 1265737 + release record |
-| Data14 | 4.0 | 25 | final GPU config | base 1265737 + release record |
-| Data15 | 4.0 | 30 | final GPU config | base 1265737 + release record |
-| Data16 | 4.0 | 35 | final GPU config | base 1265737 + release record |
-| Data17 | 2 | 40 | final GPU config | base 1265737 + release record |
-| Data18 | 4.0 | 40 | final GPU config | base 1265737 + release record |
-| Data19 | 4.0 | 35 | final GPU config | base 1265737 + release record |
-| Data20 | 4.0 | 40 | final GPU config | base 1265737 + release record |
-| Data21 | not recorded | 20 | legacy GPU config | base 1265737 + release record |
-| Data22 | not recorded | 30 | legacy GPU config | base 1265737 + release record |
-| Data23 | 4.0 | 30 | final GPU config | base 1265737 + release record |
-| Data24 | not recorded | 20 | legacy GPU config | base 1265737 + release record |
-| Data25 | 4.0 | 40 | final GPU config | base 1265737 + release record |
-| Data26 | 4.0 | 30 | final GPU config | base 1265737 + release record |
-| Data27 | not recorded | not recorded | result files only; config absent | base 1265737 + release record |
-| Data28 | not recorded | not recorded | result files only; config absent | base 1265737 + release record |
-| Data29 | not recorded | 20 | legacy GPU config | base 1265737 + release record |
-| Data30 | 4.0 | 40 | final GPU config | base 1265737 + release record |
-| Data31 | 4.0 | 20 | final GPU config | base 1265737 + release record |
-| Data32 | not recorded | not recorded | result files only; config absent | base 1265737 + release record |
-
-All recorded final-config searches used candidates 20, 25, 30, 35 and 40
-unless the run configuration explicitly recorded a smaller candidate set.
-Missing provenance is a limitation of the historical run archive and does not
-mean that a value of 20 should be imputed.
-
 ## Figure 3e statistical specification
 
 | Item | Specification |

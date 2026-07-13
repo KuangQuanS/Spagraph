@@ -113,6 +113,46 @@ fixed simulated development split. It reduces diffuse low-probability mass and
 was frozen before validation and blind-test evaluation. Set it to `1.0` to
 recover the uncalibrated signature proportions.
 
+#### Choosing the reference grouping
+
+The original Stage 1 route discovers Leiden clusters and labels each cluster
+with its majority single-cell annotation. This is useful when annotations are
+missing or intentionally coarse, but a rare or closely related annotated type
+can be absorbed into a larger cluster and lose its own reference signature.
+
+When trusted annotations are available, keep them in `sc_adata.obs["cell_type"]`
+or `sc_adata.obs["celltype"]` and use annotation-level grouping. The optimized
+D25 configuration used for the simulated Figure 2 benchmark is:
+
+```python
+artifacts = spg.vae(sc_file=sc_file, st_file=st_file, seed=42)
+
+result = spg.deconv(
+    vae=artifacts,
+    st_file=st_file,
+    output_dir=str(deconv_dir),
+    signature_init=True,
+    signature_only=True,
+    reference_grouping="celltype",
+    reference_signature_mode="log_normalized",
+    signature_gene_selection="celltype_specific",
+    signature_genes_per_celltype=200,
+    signature_platform_calibration=True,
+    signature_calibration_iterations=5,
+    signature_ridge=0.0,
+    signature_composition_power=1.2,
+    use_dynamic_cluster_repr=False,
+    seed=42,
+)
+```
+
+This uses only the supplied single-cell annotations and observed scRNA/ST
+expression. Spot-level composition truth is not read by the model. Use the
+default `reference_grouping="leiden"` when no reliable annotation is available.
+For a custom annotation column name, pass `celltype_key="your_column"` to
+`spg.signature_deconv()`; the full Stage 1 route currently auto-detects only
+`cell_type` and `celltype`.
+
 ### Stable cell-communication ranking
 
 Stage 3 is stochastic, so LR attention and rank can vary between training

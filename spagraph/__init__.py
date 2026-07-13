@@ -4,12 +4,14 @@ from .__version__ import __version__, __author__, __email__, __description__
 from .training import (
     train_vae, run_deconv, run_deconv_auto_k, run_cellcom,
     run_cellcom_ensemble, Stage1Artifacts,
+    run_signature_deconv,
 )
 
 # High-level aliases
 vae = train_vae
 deconv = run_deconv
 deconv_auto_k = run_deconv_auto_k
+signature_deconv = run_signature_deconv
 cellcom = run_cellcom
 cellcom_ensemble = run_cellcom_ensemble
 
@@ -22,6 +24,8 @@ __all__ = [
     'run_deconv_auto_k',
     'deconv_auto_k',
     'Stage1Artifacts',
+    'run_signature_deconv',
+    'signature_deconv',
     'run_cellcom',
     'cellcom',
     'run_cellcom_ensemble',

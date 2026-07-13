@@ -837,7 +837,7 @@ def main():
         out_prefix = args.output_csv.rsplit('.', 1)[0]
         # Method1 metrics to main csv
         metrics_df = compute_metrics(true_comp.values, pred_dfs[0].values, list(expected_cols))
-        # metrics_df.to_csv(args.output_csv, index=False)
+        metrics_df.to_csv(args.output_csv, index=False)
         metrics_list.append(metrics_df)
         
         # Only print detailed metrics if single method (no comparison)

@@ -226,6 +226,20 @@ class coEncoder:
         # 2. Process SC data (extract marker genes then normalize + log1p)
         # ✅ First filter to match sc_clusters.index (some cells may be filtered during clustering)
         sc_adata_count = sc_adata[sc_clusters.index].copy()
+
+        # Preserve supplied SC reference annotations aligned to all in-memory
+        # artifacts. This is reference information, not spot-composition truth.
+        celltype_col = None
+        for candidate in ('cell_type', 'celltype'):
+            if candidate in sc_adata_count.obs.columns:
+                celltype_col = candidate
+                break
+        if celltype_col is not None:
+            sc_celltype_labels = sc_adata_count.obs[celltype_col].astype(str).to_numpy()
+            self.celltype_key = celltype_col
+        else:
+            sc_celltype_labels = None
+            self.celltype_key = None
         
         # Extract raw counts for all genes (for later scaling and expression reconstruction)
         sc_all_genes_raw = sc_adata_count.X.toarray() if hasattr(sc_adata_count.X, 'toarray') else sc_adata_count.X
@@ -339,7 +353,20 @@ class coEncoder:
                 for gene in self.genes:
                     f.write(f"{gene}\n")
 
-        return train_X, test_X, train_modality, test_modality, y_train, y_test, sc_X_final, sc_all_genes_raw, sc_all_labels
+        return (
+            train_X,
+            test_X,
+            train_modality,
+            test_modality,
+            train_labels,
+            test_labels,
+            y_train,
+            y_test,
+            sc_X_final,
+            sc_all_genes_raw,
+            sc_all_labels,
+            sc_celltype_labels,
+        )
     
     def build_vae(self, input_dim: int, hidden_dims=[512, 256], latent_dim=128, dropout=0.2, loss_type='mse', use_dual_decoder=False):
         """Build VAE model
@@ -511,7 +538,20 @@ class coEncoder:
         sc_adata, st_adata = self.load_data()
         
         # 2. Prepare data based on marker genes (with test split for early stopping)
-        train_X, test_X, train_modality, test_modality, y_train, y_test, sc_X_final, sc_all_genes_raw, sc_all_labels = self.prepare_marker_gene_data(
+        (
+            train_X,
+            test_X,
+            train_modality,
+            test_modality,
+            train_labels,
+            test_labels,
+            y_train,
+            y_test,
+            sc_X_final,
+            sc_all_genes_raw,
+            sc_all_labels,
+            sc_celltype_labels,
+        ) = self.prepare_marker_gene_data(
             sc_adata, st_adata, top_n_per_type=top_n_per_type, resolution=resolution, 
             precomputed_marker_file=precomputed_marker_file, marker_selection_method=marker_selection_method
         )
@@ -561,6 +601,7 @@ class coEncoder:
         self.sc_X_final = sc_X_final  # ALL SC marker gene data (log1p normalized)
         self.sc_all_genes_raw = sc_all_genes_raw  # ALL SC raw counts for all genes [n_cells, n_all_genes]
         self.sc_all_labels = sc_all_labels  # ALL SC cluster labels
+        self.sc_celltype_labels = sc_celltype_labels
         
         # Use trained VAE to compute embeddings for ALL SC cells
         self.vae.eval()
@@ -691,6 +732,9 @@ class coEncoder:
             'sc_cell_embeddings': self.sc_cell_embeddings,  # [n_sc_cells, latent_dim]
             'sc_cell_expressions_raw': self.sc_cell_expressions_raw,  # [n_sc_cells, n_all_genes] raw counts for all genes
             'sc_cell_labels': self.sc_cell_labels,  # [n_sc_cells] cluster labels
+            'sc_cell_marker_expressions': self.sc_X_final,
+            'sc_celltype_labels': self.sc_celltype_labels,
+            'celltype_key': getattr(self, 'celltype_key', None),
         }
 
 def main():

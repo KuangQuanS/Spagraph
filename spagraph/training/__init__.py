@@ -8,6 +8,7 @@ Stages:
 
 from .vae import train_vae, train_integration
 from .deconv import run_deconv, run_deconv_auto_k, deconvolve_spots, Stage1Artifacts
+from .signature_deconv import run_signature_deconv
 from .cellcom import run_cellcom, run_cellcom_ensemble
 
 __all__ = [
@@ -17,6 +18,7 @@ __all__ = [
     'run_deconv_auto_k',
     'deconvolve_spots',
     'Stage1Artifacts',
+    'run_signature_deconv',
     'run_cellcom',
     'run_cellcom_ensemble',
 ]

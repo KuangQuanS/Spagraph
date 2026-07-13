@@ -82,6 +82,37 @@ Stage 2 writes `*_composition.csv`, configuration and training diagnostics;
 unified LR communication tables and model diagnostics under its output
 directory.
 
+### Fast annotation-guided deconvolution
+
+When the single-cell reference already has trusted `cell_type` or `celltype`
+annotations, a deterministic signature-only route can skip VAE training,
+Leiden clustering, and graph construction:
+
+```python
+result = spg.signature_deconv(
+    sc_file=sc_file,
+    st_file=st_file,
+    output_dir=str(deconv_dir),
+    celltype_key="cell_type",       # auto-detected when omitted
+    genes_per_celltype=200,
+    platform_calibration=True,
+    composition_power=1.2,
+)
+```
+
+This route builds balanced cell-type-specific signatures, corrects generic
+scRNA/ST platform effects without using composition truth, and returns a
+non-negative spot composition whose rows sum to one. It is useful for rapid
+annotated-reference analysis and repeated benchmarking. It writes the same
+`*_composition.csv` shape as Stage 2, but it does not reconstruct
+`*_spot_cell_expr.csv`; use the full Stage 1/2 pipeline with
+`save_reconstructed_genes=True` before Stage 3 communication analysis.
+
+`composition_power=1.2` is a deterministic simplex calibration selected on the
+fixed simulated development split. It reduces diffuse low-probability mass and
+was frozen before validation and blind-test evaluation. Set it to `1.0` to
+recover the uncalibrated signature proportions.
+
 ### Stable cell-communication ranking
 
 Stage 3 is stochastic, so LR attention and rank can vary between training

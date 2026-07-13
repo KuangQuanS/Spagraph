@@ -21,6 +21,7 @@ warnings.filterwarnings('ignore')
 
 # Import unified model definitions
 from .deconv_model import VAE, HeterogeneousGATDeconvolution, SpatialDeconvolutionLoss
+from .deconv_initialization import compute_signature_initialization
 
 class SpatialDataset(Dataset):
     """Spatial transcriptomics dataset
@@ -96,6 +97,9 @@ class GATDeconvolution:
         self.cluster_to_celltype = None  # Mapping from cluster index to celltype name
         self.celltype_key = None  # Track which celltype column was used
         self.use_embedding_knn = False  # If True, build spot KNN with embeddings when spatial coords missing
+        self.initial_weights = None
+        self.restore_best_state = True
+        self.full_graph_training = True
         
         # Graph construction parameters
         self.k_spatial = 20
@@ -288,7 +292,12 @@ class GATDeconvolution:
                        loss_lambda_reg=0.5, loss_lambda_sparse=0.01,
                        loss_lambda_proportion=1.0, spot_total_counts=None,
                        use_dynamic_cluster_repr=False, k_cells_per_cluster=10, 
-                       sc_cell_expressions=None):
+                       sc_cell_expressions=None,
+                       signature_prior_strength: float = 0.0,
+                       lambda_poisson: float = 0.0,
+                       lambda_spatial: float = 0.0,
+                       spatial_temperature: float = 1.0,
+                       heldout_gene_fraction: float = 0.0):
         """Build GAT deconvolution model
         
         Args:
@@ -317,7 +326,8 @@ class GATDeconvolution:
             # Dynamic cluster parameters
             use_dynamic_cluster_repr=use_dynamic_cluster_repr,
             k_cells_per_cluster=k_cells_per_cluster,
-            sc_cell_expressions=sc_cell_expressions  # [n_cells, n_all_genes] full genes
+            sc_cell_expressions=sc_cell_expressions,  # [n_cells, n_all_genes] full genes
+            signature_prior_strength=signature_prior_strength,
         ).to(self.device)
         
         # Compute cluster proportions in single-cell data
@@ -368,7 +378,12 @@ class GATDeconvolution:
             marker_gene_indices=marker_gene_indices,
             hvg_gene_indices=hvg_gene_indices,
             scale_basis=getattr(self, "scale_basis", "hvg"),
-            library_size=self.library_size  # Pass library_size to loss function
+            library_size=self.library_size,
+            lambda_poisson=lambda_poisson,
+            lambda_spatial=lambda_spatial,
+            spatial_temperature=spatial_temperature,
+            heldout_gene_fraction=heldout_gene_fraction,
+            split_seed=self.seed,
         ).to(self.device)  # Move loss function to device
         
     def train_epoch_batched(self, 
@@ -386,7 +401,10 @@ class GATDeconvolution:
             'gene_cosine_loss': 0.0,
             'weight_reg': 0.0,
             'sparsity_loss': 0.0,
-            'proportion_loss': 0.0
+            'proportion_loss': 0.0,
+            'poisson_loss': 0.0,
+            'spatial_loss': 0.0,
+            'heldout_loss': 0.0,
         }
         
         num_batches = len(dataloader)
@@ -424,7 +442,15 @@ class GATDeconvolution:
                 spot_embeddings=spot_embeddings,
                 spatial_coords=batch_spatial_coords,
                 celltype_prototypes=self.celltype_prototypes,
-                use_embedding_knn=self.use_embedding_knn
+                use_embedding_knn=self.use_embedding_knn,
+                initial_weights=(
+                    torch.as_tensor(
+                        self.initial_weights[np.asarray(batch_indices)],
+                        dtype=torch.float32,
+                        device=self.device,
+                    )
+                    if self.initial_weights is not None else None
+                ),
             )
             
             # Compute loss (using raw count data)
@@ -470,7 +496,10 @@ class GATDeconvolution:
                                batch_size: int = 512,
                                print_every: int = 50,
                                knn_cell_indices=None,
-                               sc_cell_embeddings=None):
+                               sc_cell_embeddings=None,
+                               initial_weights=None,
+                               full_graph_training: bool = True,
+                               restore_best_state: bool = True):
         """Train GAT deconvolution model
         
         Args:
@@ -486,6 +515,9 @@ class GATDeconvolution:
         # Save dynamic cluster data
         self.knn_cell_indices = knn_cell_indices
         self.sc_cell_embeddings = sc_cell_embeddings
+        self.initial_weights = initial_weights
+        self.full_graph_training = bool(full_graph_training)
+        self.restore_best_state = bool(restore_best_state)
         
         # Pre-convert to GPU tensor to avoid repeated conversion per batch
         if self.sc_cell_embeddings is not None:
@@ -500,10 +532,11 @@ class GATDeconvolution:
         dataset = SpatialDataset(st_data_normalized, st_data_raw, spatial_coords, spot_ids)
         
         # DataLoader configuration (num_workers=0 for Windows/Jupyter compatibility)
+        effective_batch_size = len(dataset) if self.full_graph_training else batch_size
         dataloader = DataLoader(
             dataset, 
-            batch_size=batch_size, 
-            shuffle=True, 
+            batch_size=effective_batch_size,
+            shuffle=not self.full_graph_training,
             drop_last=False,
             num_workers=0,  # Use 0 for Windows and Jupyter notebook compatibility (single-process)
             pin_memory=True if torch.cuda.is_available() else False  # Only use pin_memory with CUDA
@@ -537,6 +570,10 @@ class GATDeconvolution:
         patience_counter = 0
         patience = 20  # Early stopping patience
         min_delta = 0.001  # Absolute improvement threshold (Pearson/Cosine needs to decrease by at least this much)
+        best_monitor = float('inf')
+        best_state = None
+        best_epoch = 0
+        selected_metrics = None
         
         for epoch in range(n_epochs):
             # Train one epoch
@@ -566,24 +603,41 @@ class GATDeconvolution:
             current_gene_pearson = epoch_losses.get('gene_pearson_loss', 0.0)
             current_gene_cosine = epoch_losses.get('gene_cosine_loss', 0.0)
             
-            # Absolute improvement: best - current > min_delta (loss decreased beyond threshold)
-            pearson_improvement = best_pearson - current_pearson
-            cosine_improvement = best_cosine - current_cosine
-            
-            # Reset counter if either Pearson or Cosine shows significant improvement
-            if pearson_improvement > min_delta or cosine_improvement > min_delta:
-                if current_pearson < best_pearson:
-                    best_pearson = current_pearson
-                if current_mse < best_mse:
-                    best_mse = current_mse
-                if current_cosine < best_cosine:
-                    best_cosine = current_cosine
-                if current_gene_pearson < best_gene_pearson:
-                    best_gene_pearson = current_gene_pearson
-                if current_gene_cosine < best_gene_cosine:
-                    best_gene_cosine = current_gene_cosine
+            if current_pearson < best_pearson:
+                best_pearson = current_pearson
+            if current_mse < best_mse:
+                best_mse = current_mse
+            if current_cosine < best_cosine:
+                best_cosine = current_cosine
+            if current_gene_pearson < best_gene_pearson:
+                best_gene_pearson = current_gene_pearson
+            if current_gene_cosine < best_gene_cosine:
+                best_gene_cosine = current_gene_cosine
+
+            # The exported model must correspond to the selected epoch.  The
+            # legacy implementation recorded best losses but evaluated the
+            # final state, which made auto-k scores and outputs inconsistent.
+            monitor_loss = (
+                epoch_losses['heldout_loss']
+                if self.loss_fn.heldout_marker_positions.numel() > 0
+                else avg_total_loss
+            )
+            if best_monitor - monitor_loss > min_delta or best_state is None:
+                best_monitor = monitor_loss
+                best_epoch = epoch + 1
+                selected_metrics = {
+                    'pearson': current_pearson,
+                    'mse': current_mse,
+                    'cosine': current_cosine,
+                    'gene_pearson': current_gene_pearson,
+                    'gene_cosine': current_gene_cosine,
+                }
+                if self.restore_best_state:
+                    best_state = {
+                        key: value.detach().cpu().clone()
+                        for key, value in self.gat_model.state_dict().items()
+                    }
                 patience_counter = 0
-                # Don't save model weight files
             else:
                 patience_counter += 1
             
@@ -599,6 +653,15 @@ class GATDeconvolution:
                     if best_pearson != float('inf') and best_mse != float('inf') and best_cosine != float('inf'):
                         print(f"  Best: Pearson={best_pearson:.4f}, MSE={best_mse:.4f}, Cosine={best_cosine:.4f}")
                 break
+
+        if self.restore_best_state and best_state is not None:
+            self.gat_model.load_state_dict(best_state)
+        if selected_metrics is not None:
+            best_pearson = selected_metrics['pearson']
+            best_mse = selected_metrics['mse']
+            best_cosine = selected_metrics['cosine']
+            best_gene_pearson = selected_metrics['gene_pearson']
+            best_gene_cosine = selected_metrics['gene_cosine']
         
         # Plot training curves (only if output_dir exists)
         if self.output_dir:
@@ -628,6 +691,8 @@ class GATDeconvolution:
             'best_gene_cosine': best_gene_cosine,
             'train_losses': train_losses,
             'sample_name': sample_name,
+            'best_epoch': best_epoch,
+            'best_total_loss': best_monitor,
             **(eval_outputs or {})
         }
     
@@ -666,7 +731,11 @@ class GATDeconvolution:
                 spatial_coords=spatial_coords,
                 celltype_prototypes=self.celltype_prototypes,
                 use_embedding_knn=self.use_embedding_knn,
-                normalize_attention=normalize_attention
+                normalize_attention=normalize_attention,
+                initial_weights=(
+                    torch.as_tensor(self.initial_weights, dtype=torch.float32, device=self.device)
+                    if self.initial_weights is not None else None
+                ),
             )
             
             # Get prediction results

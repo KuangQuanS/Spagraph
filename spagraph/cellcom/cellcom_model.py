@@ -4,6 +4,84 @@ import numpy as np
 from typing import Tuple, Optional
 import math
 
+
+def sample_relation_negatives(
+    edge_index: torch.Tensor,
+    edge_attr: torch.Tensor,
+    edge_batch: Optional[torch.Tensor] = None,
+    generator: Optional[torch.Generator] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build direction-reversal and within-graph receiver-swap negatives.
+
+    Returns corrupted edges, inherited edge features, and the positive-edge
+    index paired with each corruption. Existing directed edges and self loops
+    are removed so that observed relations are not mislabeled as negatives.
+    """
+    n_edges = int(edge_index.size(1))
+    if n_edges == 0:
+        return (
+            edge_index.new_empty((2, 0)),
+            edge_attr.new_empty((0, edge_attr.size(-1))),
+            edge_index.new_empty((0,)),
+        )
+
+    if edge_batch is None:
+        edge_batch = edge_index.new_zeros(n_edges)
+    else:
+        edge_batch = edge_batch.to(device=edge_index.device, dtype=torch.long)
+    if edge_batch.numel() != n_edges:
+        raise ValueError("edge_batch must have one entry per communication edge")
+
+    src, dst = edge_index
+    candidate_edges = [torch.stack([dst, src], dim=0)]
+    candidate_attrs = [edge_attr]
+    positive_indices = [torch.arange(n_edges, device=edge_index.device)]
+
+    swapped_parts = []
+    swapped_attr_parts = []
+    swapped_positive_parts = []
+    for graph_id in torch.unique(edge_batch, sorted=True):
+        indices = torch.nonzero(edge_batch == graph_id, as_tuple=False).flatten()
+        if indices.numel() < 2:
+            continue
+        permutation = torch.randperm(
+            indices.numel(), device=edge_index.device, generator=generator
+        )
+        swapped_parts.append(
+            torch.stack([src[indices], dst[indices[permutation]]], dim=0)
+        )
+        swapped_attr_parts.append(edge_attr[indices])
+        swapped_positive_parts.append(indices)
+
+    if swapped_parts:
+        candidate_edges.append(torch.cat(swapped_parts, dim=1))
+        candidate_attrs.append(torch.cat(swapped_attr_parts, dim=0))
+        positive_indices.append(torch.cat(swapped_positive_parts, dim=0))
+
+    negative_edges = torch.cat(candidate_edges, dim=1)
+    negative_attrs = torch.cat(candidate_attrs, dim=0)
+    paired_positive = torch.cat(positive_indices, dim=0)
+
+    n_nodes = max(int(edge_index.max().item()) + 1, 1)
+    positive_hash = src * n_nodes + dst
+    negative_hash = negative_edges[0] * n_nodes + negative_edges[1]
+    valid = negative_edges[0].ne(negative_edges[1])
+    valid &= ~torch.isin(negative_hash, positive_hash)
+    return negative_edges[:, valid], negative_attrs[valid], paired_positive[valid]
+
+
+def pairwise_relation_ranking_loss(
+    positive_logits: torch.Tensor,
+    negative_logits: torch.Tensor,
+    margin: float = 0.1,
+) -> torch.Tensor:
+    """Smooth pairwise loss requiring observed relations to outrank controls."""
+    if positive_logits.numel() == 0:
+        return positive_logits.sum() * 0.0
+    return torch.nn.functional.softplus(
+        float(margin) - (positive_logits - negative_logits)
+    ).mean()
+
 class EdgeAttentionLayer(nn.Module):
     """基于边特征的注意力层 - 简化版Edge Attention"""
 
@@ -87,8 +165,9 @@ class EdgeAttentionLayer(nn.Module):
         edge_strength_logits = self.edge_strength_predictor(strength_input).squeeze(-1)  # [n_edges]
 
         # 2. 计算注意力权重用于节点聚合（结合边特征和节点特征实现动态注意力）
-        attention_input = torch.cat([edge_attr, src_feat, dst_feat], dim=-1)  # [n_edges, edge_dim + 2*node_dim]
-        attention_logits = self.attention_predictor(attention_input)  # [n_edges, num_heads]
+        attention_logits = self.score_attention_logits(
+            edge_attr, edge_index, node_feat
+        )  # [n_edges, num_heads]
         # 使用edge-wise softmax进行归一化（对每个目标节点的所有入边）
         attention_weights = self._edge_softmax(attention_logits, edge_index[1])  # [n_edges, num_heads]
 
@@ -135,6 +214,20 @@ class EdgeAttentionLayer(nn.Module):
         else:
             return out, None
     
+    def score_attention_logits(
+        self,
+        edge_attr: torch.Tensor,
+        edge_index: torch.Tensor,
+        node_feat: torch.Tensor,
+    ) -> torch.Tensor:
+        """Score arbitrary directed relations with the shared attention head."""
+        if edge_index.size(1) == 0:
+            return edge_attr.new_empty((0, self.num_heads))
+        src_feat = node_feat[edge_index[0]]
+        dst_feat = node_feat[edge_index[1]]
+        attention_input = torch.cat([edge_attr, src_feat, dst_feat], dim=-1)
+        return self.attention_predictor(attention_input)
+
     def _edge_softmax(self, logits: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
         """
         对每个目标节点的所有入边做softmax归一化 (优化版本)
@@ -181,7 +274,10 @@ class EdgeAttentionNetwork(nn.Module):
         self.activation = nn.ReLU()
 
     def forward(self, edge_attr: torch.Tensor, edge_index: torch.Tensor,
-                node_feat: torch.Tensor, return_attention: bool = False) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+                node_feat: torch.Tensor, return_attention: bool = False,
+                relation_negative_edge_index: Optional[torch.Tensor] = None,
+                relation_negative_edge_attr: Optional[torch.Tensor] = None,
+                return_relation_scores: bool = False):
         """
         Args:
             edge_attr: [n_edges, edge_dim]
@@ -195,17 +291,36 @@ class EdgeAttentionNetwork(nn.Module):
         """
         x = node_feat
         attn_scores = None
+        relation_scores = None
 
         for i, layer in enumerate(self.layers):
-            if i == len(self.layers) - 1 and return_attention:
+            if i == len(self.layers) - 1:
+                if return_relation_scores:
+                    positive_logits = layer.score_attention_logits(
+                        edge_attr, edge_index, x
+                    ).mean(dim=-1)
+                    if relation_negative_edge_index is not None:
+                        negative_logits = layer.score_attention_logits(
+                            relation_negative_edge_attr,
+                            relation_negative_edge_index,
+                            x,
+                        ).mean(dim=-1)
+                    else:
+                        negative_logits = positive_logits.new_empty((0,))
+                    relation_scores = (positive_logits, negative_logits)
                 # 最后一层返回注意力得分 (可能是元组)
-                x, attn_scores = layer(edge_attr, edge_index, x, return_attention=True)
+                x, attn_scores = layer(
+                    edge_attr, edge_index, x, return_attention=return_attention
+                )
             else:
                 x, _ = layer(edge_attr, edge_index, x, return_attention=False)
             if i < len(self.layers) - 1:
                 x = self.activation(x)
 
-        return x, attn_scores if return_attention else None
+        result = (x, attn_scores if return_attention else None)
+        if return_relation_scores:
+            return result + (relation_scores,)
+        return result
 class MLPEncoder(nn.Module):
     """MLP编码器 - 替代VAE的简单多层感知机"""
     
@@ -354,7 +469,11 @@ class HeteroSTModel(nn.Module):
                 edge_index_like: torch.Tensor, edge_attr_like: torch.Tensor,
                 edge_index_cc: torch.Tensor, edge_attr_cc: torch.Tensor,
                 return_attention: bool = False, edge_mask_ratio: float = 0.15, node_mask_ratio: float = 0.0,
-                mask_generator: torch.Generator = None) -> Tuple:
+                mask_generator: torch.Generator = None,
+                return_relation_loss: bool = False,
+                relation_edge_batch: Optional[torch.Tensor] = None,
+                relation_rank_margin: float = 0.1,
+                relation_generator: Optional[torch.Generator] = None) -> Tuple:
         """
         Args:
             expr_raw: [k+1, n_genes] 原始Spot基因表达量
@@ -485,9 +604,35 @@ class HeteroSTModel(nn.Module):
             # from aggregate message passing to avoid first-pair leakage.
             comm_edge_feat = masked_edge_attr_cc[:, 0:1]
 
-            comm_repr, cc_attention_tuple = self.edge_attn_comm(
-                comm_edge_feat, edge_index_cc, all_feat, return_attention=return_attention
+            relation_negative_edges = None
+            relation_negative_attrs = None
+            relation_positive_indices = None
+            if return_relation_loss:
+                (
+                    relation_negative_edges,
+                    relation_negative_attrs,
+                    relation_positive_indices,
+                ) = sample_relation_negatives(
+                    edge_index_cc,
+                    edge_attr_cc,
+                    edge_batch=relation_edge_batch,
+                    generator=relation_generator,
+                )
+
+            comm_outputs = self.edge_attn_comm(
+                comm_edge_feat,
+                edge_index_cc,
+                all_feat,
+                return_attention=return_attention,
+                relation_negative_edge_index=relation_negative_edges,
+                relation_negative_edge_attr=relation_negative_attrs,
+                return_relation_scores=return_relation_loss,
             )
+            if return_relation_loss:
+                comm_repr, cc_attention_tuple, relation_scores = comm_outputs
+            else:
+                comm_repr, cc_attention_tuple = comm_outputs
+                relation_scores = None
 
             # cc_attention_tuple: (attn_avg, edge_strength_logits) or None
             if cc_attention_tuple is not None:
@@ -510,9 +655,20 @@ class HeteroSTModel(nn.Module):
             else:
                 attn_avg, edge_strength_logits = None, None
                 cc_attention = None
+
+            if relation_scores is not None and relation_positive_indices.numel() > 0:
+                positive_logits, negative_logits = relation_scores
+                relation_rank_loss = pairwise_relation_ranking_loss(
+                    positive_logits[relation_positive_indices],
+                    negative_logits,
+                    margin=relation_rank_margin,
+                )
+            else:
+                relation_rank_loss = all_feat.sum() * 0.0
         else:
             comm_repr = self.fallback_proj(all_feat)
             cc_attention = None
+            relation_rank_loss = all_feat.sum() * 0.0
 
         # ✅ 去掉双头预测：边存在性判别 + 边强度回归
         # exist_logits = None
@@ -551,10 +707,14 @@ class HeteroSTModel(nn.Module):
         spot_proj = self.projection_head(spot_repr_out)  # [n_spots, output_dim]
 
         # ✅ 返回结果（去掉exist_logits和rate_pred）
-        if return_attention:
-            return spot_repr_out, cell_repr_out, combined, spot_proj, cc_attention, predicted_masked_edges, edge_mask, node_recon_pred, node_mask
-        else:
-            return spot_repr_out, cell_repr_out, combined, spot_proj, None, predicted_masked_edges, edge_mask, node_recon_pred, node_mask
+        output_attention = cc_attention if return_attention else None
+        outputs = (
+            spot_repr_out, cell_repr_out, combined, spot_proj, output_attention,
+            predicted_masked_edges, edge_mask, node_recon_pred, node_mask,
+        )
+        if return_relation_loss:
+            return outputs + (relation_rank_loss,)
+        return outputs
 
 
 # ==================== 辅助方法 ====================

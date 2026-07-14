@@ -969,10 +969,11 @@ def hetero_subgraph_collate_fn_batched(batch):
     edge_attr_like_parts = []
     edge_index_cc_parts = []
     edge_attr_cc_parts = []
+    cc_edge_batch_parts = []
 
-    for sample, n_spots_sub, n_cells, spot_off, cell_off in zip(
+    for graph_id, (sample, n_spots_sub, n_cells, spot_off, cell_off) in enumerate(zip(
         batch, n_spots_sub_list, n_cells_list, spot_offsets, cell_offsets
-    ):
+    )):
         # ---- like edges (spot-spot + spot-cell) ----
         ei_like = sample['edge_index_like']
         if ei_like.numel() > 0:
@@ -996,6 +997,9 @@ def hetero_subgraph_collate_fn_batched(batch):
             src = (ei_cc[0] - n_spots_sub) + total_spots + cell_off
             dst = (ei_cc[1] - n_spots_sub) + total_spots + cell_off
             edge_index_cc_parts.append(torch.stack([src, dst], dim=0))
+            cc_edge_batch_parts.append(
+                torch.full((ei_cc.size(1),), graph_id, dtype=torch.long)
+            )
 
             ea_cc = sample['edge_attr_cc']
             if ea_cc.dim() == 1:
@@ -1023,6 +1027,11 @@ def hetero_subgraph_collate_fn_batched(batch):
         if edge_attr_cc_parts
         else torch.empty((0, 2), dtype=torch.float32)
     )
+    cc_edge_batch = (
+        torch.cat(cc_edge_batch_parts, dim=0)
+        if cc_edge_batch_parts
+        else torch.empty((0,), dtype=torch.long)
+    )
 
     return {
         'batch_size': batch_size,
@@ -1034,4 +1043,5 @@ def hetero_subgraph_collate_fn_batched(batch):
         'edge_attr_like': edge_attr_like,
         'edge_index_cc': edge_index_cc,
         'edge_attr_cc': edge_attr_cc,
+        'cc_edge_batch': cc_edge_batch,
     }

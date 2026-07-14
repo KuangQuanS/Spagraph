@@ -18,10 +18,84 @@ from spagraph.cellcom.relation_ranker import (
 )
 from spagraph.training.cellcom import aggregate_cellcom_seed_outputs, run_cellcom
 from spagraph.cellcom.cellcom import degree_scale_attention
-from spagraph.cellcom.cellcom_model import HeteroSTModel
+from spagraph.cellcom.cellcom_model import (
+    HeteroSTModel,
+    pairwise_relation_ranking_loss,
+    sample_relation_negatives,
+)
 
 
 class CalibrationTests(unittest.TestCase):
+    def test_public_api_rejects_negative_relation_loss_weight(self):
+        with self.assertRaisesRegex(ValueError, "lambda_relation_rank"):
+            run_cellcom(
+                deconv_dir="unused",
+                st_h5ad="unused",
+                lambda_relation_rank=-0.1,
+                device="cpu",
+            )
+
+    def test_relation_negatives_stay_within_disjoint_graphs(self):
+        edge_index = torch.tensor([[0, 2, 3], [1, 1, 4]])
+        edge_attr = torch.tensor([[1.0], [2.0], [3.0]])
+        edge_batch = torch.tensor([0, 0, 1])
+        negatives, negative_attr, positive_indices = sample_relation_negatives(
+            edge_index,
+            edge_attr,
+            edge_batch=edge_batch,
+            generator=torch.Generator().manual_seed(7),
+        )
+        self.assertEqual(negatives.shape[1], negative_attr.shape[0])
+        self.assertEqual(negatives.shape[1], positive_indices.shape[0])
+        positive_pairs = set(map(tuple, edge_index.t().tolist()))
+        for src, dst in negatives.t().tolist():
+            self.assertNotIn((src, dst), positive_pairs)
+            self.assertTrue(({src, dst} <= {0, 1, 2}) or ({src, dst} <= {3, 4}))
+
+    def test_relation_ranking_loss_rewards_positive_margin(self):
+        weak = pairwise_relation_ranking_loss(
+            torch.tensor([0.0, 0.0]), torch.tensor([0.0, 0.0])
+        )
+        strong = pairwise_relation_ranking_loss(
+            torch.tensor([2.0, 2.0]), torch.tensor([0.0, 0.0])
+        )
+        self.assertLess(float(strong), float(weak))
+
+    def test_relation_loss_backpropagates_into_attention_head(self):
+        model = HeteroSTModel(
+            n_genes=3,
+            n_celltypes=2,
+            mlp_latent_dim=4,
+            mlp_hidden_dims=[4],
+            gat_hidden_dims=[4],
+            gat_heads=1,
+            gat_dropout=0.0,
+            output_dim=4,
+        )
+        model.train()
+        outputs = model(
+            expr_raw=torch.rand(2, 3),
+            cell_expr_raw=torch.rand(4, 3),
+            edge_index_like=torch.empty((2, 0), dtype=torch.long),
+            edge_attr_like=torch.empty((0, 2)),
+            edge_index_cc=torch.tensor([[2, 4], [3, 5]]),
+            edge_attr_cc=torch.tensor([[1.0], [2.0]]),
+            return_attention=False,
+            edge_mask_ratio=0.0,
+            node_mask_ratio=0.0,
+            return_relation_loss=True,
+            relation_rank_margin=0.1,
+            relation_generator=torch.Generator().manual_seed(11),
+        )
+        self.assertEqual(len(outputs), 10)
+        self.assertIsNone(outputs[4])
+        relation_loss = outputs[-1]
+        self.assertTrue(torch.isfinite(relation_loss))
+        relation_loss.backward()
+        final_attention = model.edge_attn_comm.layers[-1].attention_predictor[-1]
+        self.assertIsNotNone(final_attention.weight.grad)
+        self.assertGreater(float(final_attention.weight.grad.abs().sum()), 0.0)
+
     def test_aggregate_gnn_excludes_representative_lr_identity(self):
         model = HeteroSTModel(
             n_genes=3,
@@ -183,6 +257,7 @@ class CalibrationTests(unittest.TestCase):
         ) as mocked:
             result = run_cellcom(
                 deconv_dir="unused", st_h5ad="unused", output_dir=tmp,
+                lr_database_csv="custom_lr.csv",
                 seeds=[11, 23], n_repeats=2, device="cpu", epochs=1,
             )
             self.assertEqual(mocked.call_count, 2)
@@ -192,6 +267,7 @@ class CalibrationTests(unittest.TestCase):
             first_args = mocked.call_args_list[0].args[0]
             self.assertFalse(hasattr(first_args, "use_representative_lr_identity"))
             self.assertFalse(hasattr(first_args, "ablation_no_lr_identity"))
+            self.assertEqual(first_args.lr_database_csv, "custom_lr.csv")
 
 if __name__ == "__main__":
     unittest.main()

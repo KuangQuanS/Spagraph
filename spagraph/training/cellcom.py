@@ -65,6 +65,7 @@ def run_cellcom(
     st_h5ad: Optional[str] = None,
     output_dir: Optional[str] = None,
     composition_csv: Optional[str] = None,
+    lr_database_csv: Optional[str] = None,
     # MLP parameters
     mlp_latent_dim: int = 64,
     mlp_hidden_dims: str = '256,128',
@@ -86,6 +87,8 @@ def run_cellcom(
     output_dim: int = 128,
     lambda_mask_recon: float = 1.0,
     lambda_node_recon: float = 0.5,
+    lambda_relation_rank: float = 0.0,
+    relation_rank_margin: float = 0.1,
     attention_threshold: float = 1.0,
     edge_mask_ratio: float = 0.2,
     node_mask_ratio: float = 0.15,
@@ -128,6 +131,7 @@ def run_cellcom(
             - *_cluster_composition.csv (deconv 结果)
         st_h5ad: Spatial transcriptomics h5ad file path
         output_dir: Output directory for results
+        lr_database_csv: Optional ligand-receptor database CSV
         mlp_latent_dim: MLP latent dimension
         mlp_hidden_dims: MLP hidden dimensions (comma-separated)
         n_spot_neighbors: Number of spot neighbors
@@ -143,6 +147,8 @@ def run_cellcom(
         output_dim: Output dimension
         lambda_mask_recon: Mask reconstruction loss weight
         lambda_node_recon: Node reconstruction loss weight
+        lambda_relation_rank: Directed-relation ranking loss weight; 0 disables it
+        relation_rank_margin: Margin between observed and corrupted relation logits
         attention_threshold: Attention score threshold for edge filtering
         edge_mask_ratio: Edge mask ratio
         node_mask_ratio: Node mask ratio
@@ -175,6 +181,10 @@ def run_cellcom(
     """
     if n_repeats < 1:
         raise ValueError("n_repeats must be at least 1")
+    if lambda_relation_rank < 0:
+        raise ValueError("lambda_relation_rank must be non-negative")
+    if relation_rank_margin < 0:
+        raise ValueError("relation_rank_margin must be non-negative")
     if seeds is not None:
         seed_values = [int(value) for value in seeds]
         if not seed_values:
@@ -198,6 +208,7 @@ def run_cellcom(
             output_dir = str(Path(deconv_dir) / "cellcom")
         base_kwargs = dict(
             deconv_dir=deconv_dir, st_h5ad=st_h5ad, composition_csv=composition_csv,
+            lr_database_csv=lr_database_csv,
             mlp_latent_dim=mlp_latent_dim, mlp_hidden_dims=mlp_hidden_dims,
             n_spot_neighbors=n_spot_neighbors, ligand_expr_threshold=ligand_expr_threshold,
             receptor_expr_threshold=receptor_expr_threshold, lr_score_threshold=lr_score_threshold,
@@ -206,7 +217,10 @@ def run_cellcom(
             allow_same_celltype_comm=allow_same_celltype_comm,
             gat_hidden_dims=gat_hidden_dims, gat_heads=gat_heads, gat_dropout=gat_dropout,
             output_dim=output_dim, lambda_mask_recon=lambda_mask_recon,
-            lambda_node_recon=lambda_node_recon, attention_threshold=attention_threshold,
+            lambda_node_recon=lambda_node_recon,
+            lambda_relation_rank=lambda_relation_rank,
+            relation_rank_margin=relation_rank_margin,
+            attention_threshold=attention_threshold,
             edge_mask_ratio=edge_mask_ratio, node_mask_ratio=node_mask_ratio,
             mask_seed=mask_seed, batch_size=batch_size,
             num_workers=num_workers, epochs=epochs, learning_rate=learning_rate,
@@ -259,6 +273,7 @@ def run_cellcom(
         st_h5ad=st_h5ad,
         output_dir=output_dir,
         composition_csv=composition_csv,
+        lr_database_csv=lr_database_csv,
         mlp_latent_dim=mlp_latent_dim,
         mlp_hidden_dims=mlp_hidden_dims,
         n_spot_neighbors=n_spot_neighbors,
@@ -278,6 +293,8 @@ def run_cellcom(
         output_dim=output_dim,
         lambda_mask_recon=lambda_mask_recon,
         lambda_node_recon=lambda_node_recon,
+        lambda_relation_rank=lambda_relation_rank,
+        relation_rank_margin=relation_rank_margin,
         attention_threshold=attention_threshold,
         edge_mask_ratio=edge_mask_ratio,
         node_mask_ratio=node_mask_ratio,

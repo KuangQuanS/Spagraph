@@ -37,6 +37,8 @@ class SyntheticV2Config:
     device: str = "cuda"
     run_model: bool = True
     ablation_no_lr_identity: bool = False
+    lambda_relation_rank: float = 0.0
+    relation_rank_margin: float = 0.1
 
 
 def _grid(grid_side: int, rng: np.random.Generator) -> np.ndarray:
@@ -586,6 +588,8 @@ def run_synthetic_v2(config: SyntheticV2Config) -> pd.DataFrame:
         ablation_no_lr_identity=config.ablation_no_lr_identity,
         device=config.device,
         seed=config.seed,
+        lambda_relation_rank=config.lambda_relation_rank,
+        relation_rank_margin=config.relation_rank_margin,
     )
     return evaluate_synthetic_v2(output)
 
@@ -599,6 +603,8 @@ def main() -> None:
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--generate-only", action="store_true")
     parser.add_argument("--ablation-no-lr-identity", action="store_true")
+    parser.add_argument("--lambda-relation-rank", type=float, default=0.0)
+    parser.add_argument("--relation-rank-margin", type=float, default=0.1)
     args = parser.parse_args()
     config = SyntheticV2Config(
         output=args.output,
@@ -608,6 +614,8 @@ def main() -> None:
         device=args.device,
         run_model=not args.generate_only,
         ablation_no_lr_identity=args.ablation_no_lr_identity,
+        lambda_relation_rank=args.lambda_relation_rank,
+        relation_rank_margin=args.relation_rank_margin,
     )
     result = run_synthetic_v2(config)
     columns = [

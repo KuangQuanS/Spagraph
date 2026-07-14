@@ -33,6 +33,16 @@ def _scalar(x):
         return float(x)
 
 
+def _unpack_cellcom_outputs(outputs):
+    """Keep legacy nine-item model outputs compatible with optional rank loss."""
+    if len(outputs) == 10:
+        return outputs
+    if len(outputs) != 9:
+        raise ValueError(f"Unexpected HeteroSTModel output length: {len(outputs)}")
+    zero = outputs[0].sum() * 0.0
+    return outputs + (zero,)
+
+
 def degree_scale_attention(attention: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
     """Scale each edge attention by its target-node in-degree without Python loops."""
     targets = edge_index[1].to(dtype=torch.long, device=attention.device)
@@ -78,6 +88,11 @@ def _print_stage3_header(args, device: torch.device):
     print("Loss Weights:")
     print(f"  Mask Recon:       {args.lambda_mask_recon} (ratio={args.edge_mask_ratio})")
     print(f"  Node Recon:       {args.lambda_node_recon} (ratio={args.node_mask_ratio})")
+    print(
+        "  Relation Rank:    "
+        f"{getattr(args, 'lambda_relation_rank', 0.0)} "
+        f"(margin={getattr(args, 'relation_rank_margin', 0.1)})"
+    )
     print(f"Mask Seed:          {args.mask_seed}")
     print('Aggregate LR ID:    excluded; candidate output head enabled')
     if getattr(args, "early_stop_patience", 0) > 0:
@@ -90,6 +105,10 @@ def _print_stage3_header(args, device: torch.device):
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Heterogeneous ST Communication Model Training')
+    parser.add_argument(
+        '--lr_database_csv', type=str, default=None,
+        help='Optional ligand-receptor database CSV with ligand/receptor columns',
+    )
     parser.add_argument('--deconv_dir', type=str, required=True, 
                        help='Stage1+Stage2 输出目录（包含 final_vae.pth, final_vae_cluster_data.npz 等）')
     parser.add_argument('--st_h5ad', type=str, required=True, help='空间转录组h5ad文件路径')
@@ -139,6 +158,14 @@ def parse_args():
     
     parser.add_argument('--lambda_mask_recon', type=float, default=1.0, help='mask边重构损失的权重 (default: 1.0)')
     parser.add_argument('--lambda_node_recon', type=float, default=0.5, help='节点特征重构损失的权重 (default: 0.5)')
+    parser.add_argument(
+        '--lambda_relation_rank', type=float, default=0.0,
+        help='Weight for self-supervised directed-relation ranking loss (default: 0, disabled)',
+    )
+    parser.add_argument(
+        '--relation_rank_margin', type=float, default=0.1,
+        help='Margin for observed-vs-corrupted communication relation ranking',
+    )
     parser.add_argument('--attention_threshold', type=float, default=1,
                        help='注意力得分阈值，用于过滤边 (default: 0)')
     parser.add_argument('--export_unified_csv', type=lambda x: str(x).lower() == 'true', default=False,
@@ -203,7 +230,12 @@ def main(args=None):
     # 1. CellChat database (for LR communication computation)
     # Use absolute path based on the project root directory
     project_root = Path(__file__).parent.parent.parent  # Go up to project root from cellcom/cellcom.py
-    cellchat_file = project_root / 'cellchat_human.csv'
+    configured_lr_database = getattr(args, 'lr_database_csv', None)
+    cellchat_file = (
+        Path(configured_lr_database)
+        if configured_lr_database
+        else project_root / 'cellchat_human.csv'
+    )
     if not cellchat_file.exists():
         raise FileNotFoundError(
             f"CellChat database file not found: {cellchat_file}\\n"
@@ -478,6 +510,8 @@ def main(args=None):
     val_mask_losses = []
     train_node_losses = []
     val_node_losses = []
+    train_relation_rank_losses = []
+    val_relation_rank_losses = []
     learning_rates = []
     
     # ========== 阶段4：训练循环 ==========
@@ -492,6 +526,10 @@ def main(args=None):
     patience_counter = 0
     early_stop_patience = args.early_stop_patience
     early_stop_min_delta = args.early_stop_min_delta
+    lambda_relation_rank = float(getattr(args, 'lambda_relation_rank', 0.0))
+    relation_rank_margin = float(getattr(args, 'relation_rank_margin', 0.1))
+    if lambda_relation_rank < 0 or relation_rank_margin < 0:
+        raise ValueError("relation ranking weight and margin must be non-negative")
     
     if early_stop_patience > 0:
         print(f"Early stop:         patience={early_stop_patience}, min_delta={early_stop_min_delta}")
@@ -520,6 +558,7 @@ def main(args=None):
         total_train_loss = 0.0
         total_train_mask = 0.0
         total_train_node = 0.0
+        total_train_relation_rank = 0.0
         processed_train_batches = 0
         
         for batch_idx, batch in enumerate(train_dataloader, 1):
@@ -539,6 +578,7 @@ def main(args=None):
                 batch_loss = 0.0
                 batch_mask = 0.0
                 batch_node = 0.0
+                batch_relation_rank = 0.0
 
                 for b in range(batch_size):
                     expr_raw = batch['expr_raw'][b].to(device, non_blocking=pin_memory)
@@ -552,7 +592,7 @@ def main(args=None):
                     edge_attr_cc = edge_attr_cc.to(device, non_blocking=pin_memory)
                     edge_attr_cc_input = edge_attr_cc[:, :1]
 
-                    _, _, _, _, cc_attention, predicted_masked_edges, edge_mask, node_recon_pred, node_mask = model(
+                    model_outputs = model(
                         expr_raw=expr_raw,
                         cell_expr_raw=cell_expr_raw,
                         edge_index_like=edge_index_like,
@@ -562,8 +602,14 @@ def main(args=None):
                         return_attention=True,
                         edge_mask_ratio=args.edge_mask_ratio,
                         node_mask_ratio=args.node_mask_ratio,
-                        mask_generator=None
+                        mask_generator=None,
+                        return_relation_loss=lambda_relation_rank > 0,
+                        relation_rank_margin=relation_rank_margin,
                     )
+                    (
+                        _, _, _, _, cc_attention, predicted_masked_edges,
+                        edge_mask, node_recon_pred, node_mask, relation_rank_loss,
+                    ) = _unpack_cellcom_outputs(model_outputs)
 
                     mask_recon_loss = 0.0
                     if edge_mask is not None and edge_mask.any() and predicted_masked_edges is not None:
@@ -581,15 +627,18 @@ def main(args=None):
                     total_loss = (
                         args.lambda_mask_recon * mask_recon_loss
                         + args.lambda_node_recon * node_recon_loss
+                        + lambda_relation_rank * relation_rank_loss
                     )
 
                     batch_loss += total_loss
                     batch_mask += mask_recon_loss
                     batch_node += node_recon_loss
+                    batch_relation_rank += relation_rank_loss
 
                 avg_batch_loss = batch_loss / batch_size
                 avg_batch_mask = batch_mask / batch_size
                 avg_batch_node = batch_node / batch_size
+                avg_batch_relation_rank = batch_relation_rank / batch_size
             else:
                 # 真正 batch 化（disjoint-union 大图），只前向/反向一次
                 expr_raw = batch['expr_raw'].to(device, non_blocking=pin_memory)
@@ -603,7 +652,7 @@ def main(args=None):
                 edge_attr_cc = edge_attr_cc.to(device, non_blocking=pin_memory)
                 edge_attr_cc_input = edge_attr_cc[:, :1]
 
-                _, _, _, _, cc_attention, predicted_masked_edges, edge_mask, node_recon_pred, node_mask = model(
+                model_outputs = model(
                     expr_raw=expr_raw,
                     cell_expr_raw=cell_expr_raw,
                     edge_index_like=edge_index_like,
@@ -613,8 +662,17 @@ def main(args=None):
                     return_attention=True,
                     edge_mask_ratio=args.edge_mask_ratio,
                     node_mask_ratio=args.node_mask_ratio,
-                    mask_generator=None
+                    mask_generator=None,
+                    return_relation_loss=lambda_relation_rank > 0,
+                    relation_edge_batch=batch['cc_edge_batch'].to(
+                        device, non_blocking=pin_memory
+                    ),
+                    relation_rank_margin=relation_rank_margin,
                 )
+                (
+                    _, _, _, _, cc_attention, predicted_masked_edges,
+                    edge_mask, node_recon_pred, node_mask, relation_rank_loss,
+                ) = _unpack_cellcom_outputs(model_outputs)
 
                 mask_recon_loss = 0.0
                 if edge_mask is not None and edge_mask.any() and predicted_masked_edges is not None:
@@ -634,7 +692,9 @@ def main(args=None):
                 avg_batch_loss = (
                     args.lambda_mask_recon * mask_recon_loss
                     + args.lambda_node_recon * node_recon_loss
+                    + lambda_relation_rank * relation_rank_loss
                 )
+                avg_batch_relation_rank = relation_rank_loss
 
             # 反向传播
             optimizer.zero_grad()
@@ -645,6 +705,7 @@ def main(args=None):
             total_train_loss += _scalar(avg_batch_loss)
             total_train_mask += _scalar(avg_batch_mask)
             total_train_node += _scalar(avg_batch_node)
+            total_train_relation_rank += _scalar(avg_batch_relation_rank)
             processed_train_batches += 1
         
         # ========== 验证阶段 ==========
@@ -652,6 +713,7 @@ def main(args=None):
         total_val_loss = 0.0
         total_val_mask = 0.0
         total_val_node = 0.0
+        total_val_relation_rank = 0.0
         processed_val_batches = 0
         
         with torch.no_grad():
@@ -663,6 +725,7 @@ def main(args=None):
                     batch_loss = 0.0
                     batch_mask = 0.0
                     batch_node = 0.0
+                    batch_relation_rank = 0.0
 
                     for b in range(batch_size):
                         expr_raw = batch['expr_raw'][b].to(device, non_blocking=pin_memory)
@@ -676,7 +739,7 @@ def main(args=None):
                         edge_attr_cc = edge_attr_cc.to(device, non_blocking=pin_memory)
                         edge_attr_cc_input = edge_attr_cc[:, :1]
 
-                        _, _, _, _, _, predicted_masked_edges, edge_mask, node_recon_pred, node_mask = model(
+                        model_outputs = model(
                             expr_raw=expr_raw,
                             cell_expr_raw=cell_expr_raw,
                             edge_index_like=edge_index_like,
@@ -686,8 +749,16 @@ def main(args=None):
                             return_attention=True,
                             edge_mask_ratio=args.edge_mask_ratio,
                             node_mask_ratio=args.node_mask_ratio,
-                            mask_generator=val_mask_gen
+                            mask_generator=val_mask_gen,
+                            return_relation_loss=lambda_relation_rank > 0,
+                            relation_rank_margin=relation_rank_margin,
+                            relation_generator=val_mask_gen,
                         )
+                        (
+                            _, _, _, _, _, predicted_masked_edges,
+                            edge_mask, node_recon_pred, node_mask,
+                            relation_rank_loss,
+                        ) = _unpack_cellcom_outputs(model_outputs)
 
                         mask_recon_loss = 0.0
                         if edge_mask is not None and edge_mask.any() and predicted_masked_edges is not None:
@@ -705,15 +776,18 @@ def main(args=None):
                         val_loss = (
                             args.lambda_mask_recon * mask_recon_loss
                             + args.lambda_node_recon * node_recon_loss
+                            + lambda_relation_rank * relation_rank_loss
                         )
 
                         batch_loss += val_loss
                         batch_mask += mask_recon_loss
                         batch_node += node_recon_loss
+                        batch_relation_rank += relation_rank_loss
 
                     avg_batch_loss = batch_loss / batch_size
                     avg_batch_mask = batch_mask / batch_size
                     avg_batch_node = batch_node / batch_size
+                    avg_batch_relation_rank = batch_relation_rank / batch_size
                 else:
                     expr_raw = batch['expr_raw'].to(device, non_blocking=pin_memory)
                     cell_expr_raw = batch['cell_expr_raw'].to(device, non_blocking=pin_memory)
@@ -726,7 +800,7 @@ def main(args=None):
                     edge_attr_cc = edge_attr_cc.to(device, non_blocking=pin_memory)
                     edge_attr_cc_input = edge_attr_cc[:, :1]
 
-                    _, _, _, _, _, predicted_masked_edges, edge_mask, node_recon_pred, node_mask = model(
+                    model_outputs = model(
                         expr_raw=expr_raw,
                         cell_expr_raw=cell_expr_raw,
                         edge_index_like=edge_index_like,
@@ -736,8 +810,19 @@ def main(args=None):
                         return_attention=True,
                         edge_mask_ratio=args.edge_mask_ratio,
                         node_mask_ratio=args.node_mask_ratio,
-                        mask_generator=val_mask_gen
+                        mask_generator=val_mask_gen,
+                        return_relation_loss=lambda_relation_rank > 0,
+                        relation_edge_batch=batch['cc_edge_batch'].to(
+                            device, non_blocking=pin_memory
+                        ),
+                        relation_rank_margin=relation_rank_margin,
+                        relation_generator=val_mask_gen,
                     )
+                    (
+                        _, _, _, _, _, predicted_masked_edges,
+                        edge_mask, node_recon_pred, node_mask,
+                        relation_rank_loss,
+                    ) = _unpack_cellcom_outputs(model_outputs)
 
                     avg_batch_mask = 0.0
                     if edge_mask is not None and edge_mask.any() and predicted_masked_edges is not None:
@@ -755,11 +840,14 @@ def main(args=None):
                     avg_batch_loss = (
                         args.lambda_mask_recon * avg_batch_mask
                         + args.lambda_node_recon * avg_batch_node
+                        + lambda_relation_rank * relation_rank_loss
                     )
+                    avg_batch_relation_rank = relation_rank_loss
 
                 total_val_loss += _scalar(avg_batch_loss)
                 total_val_mask += _scalar(avg_batch_mask)
                 total_val_node += _scalar(avg_batch_node)
+                total_val_relation_rank += _scalar(avg_batch_relation_rank)
                 processed_val_batches += 1
         
         # 计算epoch平均损失
@@ -769,6 +857,8 @@ def main(args=None):
         avg_val_mask = total_val_mask / processed_val_batches if processed_val_batches > 0 else 0
         avg_train_node = total_train_node / processed_train_batches if processed_train_batches > 0 else 0
         avg_val_node = total_val_node / processed_val_batches if processed_val_batches > 0 else 0
+        avg_train_relation_rank = total_train_relation_rank / processed_train_batches if processed_train_batches > 0 else 0
+        avg_val_relation_rank = total_val_relation_rank / processed_val_batches if processed_val_batches > 0 else 0
         
         train_losses.append(avg_train_loss)
         val_losses.append(avg_val_loss)
@@ -776,6 +866,8 @@ def main(args=None):
         val_mask_losses.append(avg_val_mask)
         train_node_losses.append(avg_train_node)
         val_node_losses.append(avg_val_node)
+        train_relation_rank_losses.append(avg_train_relation_rank)
+        val_relation_rank_losses.append(avg_val_relation_rank)
         learning_rates.append(float(optimizer.param_groups[0]['lr']))
         
         # 每个epoch结束时更新学习率调度器
@@ -815,6 +907,8 @@ def main(args=None):
             "val_mask_loss": val_mask_losses,
             "train_node_loss": train_node_losses,
             "val_node_loss": val_node_losses,
+            "train_relation_rank_loss": train_relation_rank_losses,
+            "val_relation_rank_loss": val_relation_rank_losses,
             "learning_rate": learning_rates,
         }
     )

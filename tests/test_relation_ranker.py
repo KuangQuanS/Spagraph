@@ -127,6 +127,41 @@ class CalibrationTests(unittest.TestCase):
         self.assertGreater(ranked.loc["B_R", "calibrated_score"], ranked.loc["A_R", "calibrated_score"])
         self.assertEqual(int(ranked.loc["B_R", "rank"]), 1)
 
+    def test_ineligible_candidate_is_excluded_from_formal_ranks(self):
+        frame = pd.DataFrame(
+            {
+                "lr_pair": ["LOW_SUPPORT", "ELIGIBLE_A", "ELIGIBLE_B"],
+                "supporting_unique_edges": [1, 20, 15],
+                "associated_edge_attention_mean": [10.0, 0.9, 0.8],
+                "associated_edge_attention_std": [0.0, 0.1, 0.1],
+                "n_source_spots": [1, 5, 5],
+                "n_target_spots": [1, 5, 5],
+                "eligible_for_ranking": [False, True, True],
+            }
+        )
+        ranked = calibrate_lr_statistics(frame).set_index("lr_pair")
+        self.assertTrue(pd.isna(ranked.loc["LOW_SUPPORT", "rank"]))
+        self.assertTrue(pd.isna(ranked.loc["LOW_SUPPORT", "raw_attention_rank"]))
+        self.assertEqual(int(ranked.loc["ELIGIBLE_A", "rank"]), 1)
+        self.assertEqual(int(ranked.loc["ELIGIBLE_A", "raw_attention_rank"]), 1)
+
+    def test_ensemble_requires_candidate_eligibility_in_every_seed(self):
+        base = pd.DataFrame(
+            {
+                "lr_pair": ["UNSTABLE", "STABLE"],
+                "occurrence_count": [20, 20],
+                "avg_attention_score": [2.0, 1.0],
+                "std_attention_score": [0.1, 0.1],
+                "eligible_for_ranking": [True, True],
+            }
+        )
+        second = base.copy()
+        second.loc[second["lr_pair"] == "UNSTABLE", "eligible_for_ranking"] = False
+        result = ensemble_lr_rankings([base, second]).set_index("lr_pair")
+        self.assertTrue(pd.isna(result.loc["UNSTABLE", "rank"]))
+        self.assertFalse(bool(result.loc["UNSTABLE", "eligible_for_ranking"]))
+        self.assertEqual(int(result.loc["STABLE", "rank"]), 1)
+
     def test_pair_names_do_not_receive_hardcoded_scores(self):
         frame = pd.DataFrame(
             {

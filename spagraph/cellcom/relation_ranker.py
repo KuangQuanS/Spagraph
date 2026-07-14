@@ -78,6 +78,24 @@ def _percentile(values: pd.Series) -> pd.Series:
     return values.rank(method="average", pct=True).astype(float)
 
 
+def _eligible_for_ranking(frame: pd.DataFrame) -> pd.Series:
+    """Return a strict boolean mask for candidates allowed in formal ranks."""
+    if "eligible_for_ranking" not in frame.columns:
+        return pd.Series(True, index=frame.index, dtype=bool)
+
+    values = frame["eligible_for_ranking"]
+    if pd.api.types.is_bool_dtype(values.dtype):
+        return values.fillna(False).astype(bool)
+    if pd.api.types.is_numeric_dtype(values.dtype):
+        return pd.to_numeric(values, errors="coerce").fillna(0).ne(0)
+    return (
+        values.astype("string")
+        .str.strip()
+        .str.lower()
+        .isin({"true", "1", "yes", "y"})
+    )
+
+
 def calibrate_lr_statistics(
     statistics: pd.DataFrame,
     weights: Optional[CalibrationWeights] = None,
@@ -147,14 +165,27 @@ def calibrate_lr_statistics(
     frame["confidence_percentile"] = confidence_feature.astype(float)
     frame["uncertainty_percentile"] = uncertainty_feature.astype(float)
     frame["calibrated_score"] = calibrated.astype(float)
-    frame["raw_attention_rank"] = mean.rank(method="min", ascending=False).astype(int)
-    frame["rank"] = frame["calibrated_score"].rank(method="min", ascending=False).astype(int)
+    eligible = _eligible_for_ranking(frame)
+    frame["eligible_for_ranking"] = eligible
+    frame["raw_attention_rank"] = pd.Series(pd.NA, index=frame.index, dtype="Int64")
+    frame["rank"] = pd.Series(pd.NA, index=frame.index, dtype="Int64")
+    frame.loc[eligible, "raw_attention_rank"] = (
+        mean.loc[eligible].rank(method="min", ascending=False).astype("Int64")
+    )
+    frame.loc[eligible, "rank"] = (
+        frame.loc[eligible, "calibrated_score"]
+        .rank(method="min", ascending=False)
+        .astype("Int64")
+    )
     frame["score_std"] = std.astype(float)
     frame["rank_std"] = np.nan
     frame["spatial_specificity"] = spatial_specificity.astype(float)
     frame["null_pvalue"] = np.nan
     frame["calibration_profile"] = calibration_profile
-    return frame.sort_values(["rank", "lr_pair"]).reset_index(drop=True)
+    return frame.sort_values(
+        ["eligible_for_ranking", "rank", "lr_pair"],
+        ascending=[False, True, True],
+    ).reset_index(drop=True)
 
 
 def ensemble_lr_rankings(frames: Sequence[pd.DataFrame]) -> pd.DataFrame:
@@ -173,6 +204,7 @@ def ensemble_lr_rankings(frames: Sequence[pd.DataFrame]) -> pd.DataFrame:
             frame if required.issubset(frame.columns)
             else calibrate_lr_statistics(frame)
         )
+        eligible = _eligible_for_ranking(calibrated)
         normalized.append(
             calibrated[
                 [
@@ -182,7 +214,10 @@ def ensemble_lr_rankings(frames: Sequence[pd.DataFrame]) -> pd.DataFrame:
                     "neural_attention_score",
                     "raw_attention_rank",
                 ]
-            ].assign(seed_index=seed_index)
+            ].assign(
+                seed_index=seed_index,
+                eligible_for_ranking=eligible.to_numpy(),
+            )
         )
     merged = pd.concat(normalized, ignore_index=True)
     result = merged.groupby("lr_pair", as_index=False).agg(
@@ -195,9 +230,25 @@ def ensemble_lr_rankings(frames: Sequence[pd.DataFrame]) -> pd.DataFrame:
         raw_attention_rank=("raw_attention_rank", "mean"),
         raw_attention_rank_std=("raw_attention_rank", "std"),
         n_seeds=("seed_index", "nunique"),
+        n_eligible_seeds=("eligible_for_ranking", "sum"),
     )
-    result["rank"] = result["calibrated_score"].rank(method="min", ascending=False).astype(int)
-    result["raw_attention_rank"] = result["neural_attention_score"].rank(
-        method="min", ascending=False
-    ).astype(int)
-    return result.sort_values(["rank", "lr_pair"]).reset_index(drop=True)
+    eligible = result["n_eligible_seeds"].eq(result["n_seeds"])
+    result["eligible_for_ranking"] = eligible
+    result["rank"] = pd.Series(pd.NA, index=result.index, dtype="Int64")
+    result["raw_attention_rank"] = pd.Series(
+        pd.NA, index=result.index, dtype="Int64"
+    )
+    result.loc[eligible, "rank"] = (
+        result.loc[eligible, "calibrated_score"]
+        .rank(method="min", ascending=False)
+        .astype("Int64")
+    )
+    result.loc[eligible, "raw_attention_rank"] = (
+        result.loc[eligible, "neural_attention_score"]
+        .rank(method="min", ascending=False)
+        .astype("Int64")
+    )
+    return result.sort_values(
+        ["eligible_for_ranking", "rank", "lr_pair"],
+        ascending=[False, True, True],
+    ).reset_index(drop=True)

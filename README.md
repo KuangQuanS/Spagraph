@@ -118,41 +118,6 @@ output. Explicit seeds can be supplied with `spg.cellcom_ensemble(...)`.
   not versioned. Dataset paths are supplied as command-line arguments in the
   reproduction entry points.
 
-## Manuscript datasets and reproduction
-
-The manuscript evaluates 32 simulated mixtures, STARmap, seqFISH+, four tumour
-case studies (HGSOC, PDAC, DCIS and cSCC), semisynthetic and fully synthetic LR
-benchmarks, and a Visium HD colorectal cancer case study. Dataset-specific
-entry points are under [`run_notebook/`](run_notebook/); evaluation and figure
-code is under [`evaluate/scripts/`](evaluate/scripts/); reusable benchmark
-logic is under [`spagraph/analysis/`](spagraph/analysis/). A curated script map
-and explicit scope exclusions are provided in
-[`docs/reproduction.md`](docs/reproduction.md).
-
-The exact run parameters, their provenance and all recorded simulated-data
-auto-k values are available in:
-
-- [`docs/parameters.md`](docs/parameters.md) — reviewable parameter tables and
-  provenance notes.
-- [`docs/parameters.xlsx`](docs/parameters.xlsx) — the same release record in
-  spreadsheet form.
-
-Figure 3e uses one LR pair as the statistical unit. An LR pair selected by both
-top-15 lists is excluded from both groups before the two-sided Mann-Whitney U
-tests; the two prespecified P values are Holm-adjusted. The implementation and
-tests are in
-[`spagraph/analysis/figure3e_statistics.py`](spagraph/analysis/figure3e_statistics.py)
-and [`tests/test_figure3e_statistics.py`](tests/test_figure3e_statistics.py).
-
-## Reproducibility notes
-
-- The package seed is 42 unless a manuscript entry point records another seed.
-- Paths in public scripts are repository-relative or passed as CLI arguments;
-  raw data are not redistributed.
-- Stage 3 requires Stage 2 to be run with `save_reconstructed_genes=True`.
-- The manuscript environment is a reproducibility snapshot, not a claim that
-  every pinned package combination is required for basic library use.
-
 ## License
 
 Spagraph is released under the [MIT License](LICENSE).

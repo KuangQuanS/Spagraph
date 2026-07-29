@@ -22,6 +22,17 @@ if str(_current_dir) not in sys.path:
 from spagraph.models.stage2 import GATDeconvolution
 
 
+def _resolve_lambda_mse(
+    lambda_mse: Optional[float], signature_init: bool
+) -> float:
+    """Keep legacy graph mode unchanged while balancing residual-GAT fitting."""
+    if lambda_mse is None:
+        return 0.01 if signature_init else 0.0
+    if not np.isfinite(lambda_mse) or lambda_mse < 0:
+        raise ValueError("lambda_mse must be finite and non-negative")
+    return float(lambda_mse)
+
+
 @dataclass
 class Stage1Artifacts:
     """轻量封装：保存第一阶段的关键产物，便于直接跑第二阶段。
@@ -140,7 +151,7 @@ def run_deconv(
     dropout: float = 0.1,
     # Loss weights
     lambda_pearson: float = 1,
-    lambda_mse: float = 0,
+    lambda_mse: Optional[float] = None,
     lambda_cosine: float = 5.0,
     lambda_gene_pearson: float = 0,   # disabled: gene-level metrics are batch-dependent, used for monitoring only
     lambda_gene_cosine: float = 0,    # disabled: gene-level metrics are batch-dependent, used for monitoring only
@@ -286,6 +297,7 @@ def run_deconv(
     # 参数检查
     if isinstance(k_celltype, (list, tuple)) and len(k_celltype) == 0:
         raise ValueError("k_celltype candidate list cannot be empty")
+    lambda_mse = _resolve_lambda_mse(lambda_mse, signature_init)
     if signature_ridge < 0:
         raise ValueError("signature_ridge must be non-negative")
     if signature_prior_strength < 0:

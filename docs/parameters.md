@@ -115,10 +115,12 @@ mean that a value of 20 should be imputed.
 
 Current releases additionally support a reference-affinity-guided Stage 2
 mode with `signature_init=True`, `signature_affinity_graph=True`, a residual
-scale of 5.0, and a soft Jensen-Shannon consistency weight of 3.0. Stage 3
-supports `n_repeats=5` for final ensemble rankings while retaining
-`n_repeats=1` as the exploratory default. These options are documented
-separately from the recorded manuscript run configurations above.
+scale of 5.0, a spot-level MSE reconstruction weight of 0.01, and a soft
+Jensen-Shannon consistency weight of 3.0. The MSE term remains disabled by
+default in legacy graph mode. Stage 3 supports `n_repeats=5` for final ensemble
+rankings while retaining `n_repeats=1` as the exploratory default. These
+options are documented separately from the recorded manuscript run
+configurations above.
 
 ## Figure 3e statistical specification
 

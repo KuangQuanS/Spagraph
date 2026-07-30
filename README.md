@@ -58,7 +58,7 @@ deconv_result = spg.deconv(
     signature_init=True,
     signature_affinity_graph=True,
     signature_residual_scale=5.0,
-    lambda_mse=0.01,
+    lambda_mse=0.02,
     lambda_signature_consistency=3.0,
     save_reconstructed_genes=True,
     seed=42,
@@ -95,7 +95,7 @@ initializes the graph and composition logits, while the GAT learns the final
 residual correction. In logit form the default update is
 `log(affinity) + 5 * tanh(GAT residual)`, with a soft consistency term rather
 than a fixed output clamp. Signature-guided runs use a small MSE reconstruction
-weight (`lambda_mse=0.01`) alongside the Pearson and cosine objectives; legacy
+weight (`lambda_mse=0.02`) alongside the Pearson and cosine objectives; legacy
 graph-mode runs retain MSE weight 0 unless it is set explicitly. Spot-level
 composition truth is not read during fitting or model selection. Setting
 `signature_init=False` retains the original graph-mode workflow.

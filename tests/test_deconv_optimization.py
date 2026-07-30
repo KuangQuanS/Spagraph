@@ -299,7 +299,7 @@ class AutoKValidationTests(unittest.TestCase):
 class OptimizedLossTests(unittest.TestCase):
     def test_balanced_mse_default_only_applies_to_signature_mode(self):
         self.assertEqual(_resolve_lambda_mse(None, signature_init=False), 0.0)
-        self.assertEqual(_resolve_lambda_mse(None, signature_init=True), 0.01)
+        self.assertEqual(_resolve_lambda_mse(None, signature_init=True), 0.02)
         self.assertEqual(_resolve_lambda_mse(0.2, signature_init=True), 0.2)
         with self.assertRaisesRegex(ValueError, "lambda_mse"):
             _resolve_lambda_mse(-0.1, signature_init=True)

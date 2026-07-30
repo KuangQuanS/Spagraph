@@ -27,7 +27,7 @@ def _resolve_lambda_mse(
 ) -> float:
     """Keep legacy graph mode unchanged while balancing residual-GAT fitting."""
     if lambda_mse is None:
-        return 0.01 if signature_init else 0.0
+        return 0.02 if signature_init else 0.0
     if not np.isfinite(lambda_mse) or lambda_mse < 0:
         raise ValueError("lambda_mse must be finite and non-negative")
     return float(lambda_mse)

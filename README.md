@@ -58,6 +58,7 @@ deconv_result = spg.deconv(
     signature_init=True,
     signature_affinity_graph=True,
     signature_residual_scale=5.0,
+    lambda_mse=0.02,
     lambda_signature_consistency=3.0,
     save_reconstructed_genes=True,
     seed=42,
@@ -78,6 +79,24 @@ spg.cellcom(
 )
 ```
 
+For a more stable final estimate, repeat only Stage 2 while reusing the same
+Stage 1 representation:
+
+```python
+deconv_result = spg.deconv_ensemble(
+    vae=vae_result,
+    st_file="data/spatial.h5ad",
+    output_dir="results/deconv_ensemble",
+    n_repeats=3,
+    seeds=[11, 23, 42],
+    signature_init=True,
+)
+```
+
+The returned composition is the simplex-normalized arithmetic mean of the
+independent GAT residual predictions. `spg.deconv(...)` remains the faster
+single-run API.
+
 Stage 1 returns an in-memory `Stage1Artifacts` object. When `output_dir` is
 provided it also writes the run configuration and modality-alignment plots.
 Stage 2 writes `*_composition.csv`, configuration and training diagnostics;
@@ -93,9 +112,11 @@ the annotated single-cell reference and observed spot expression. The matrix
 initializes the graph and composition logits, while the GAT learns the final
 residual correction. In logit form the default update is
 `log(affinity) + 5 * tanh(GAT residual)`, with a soft consistency term rather
-than a fixed output clamp. Spot-level composition truth is not read during
-fitting or model selection. Setting `signature_init=False` retains the original
-graph-mode workflow.
+than a fixed output clamp. Signature-guided runs use a small MSE reconstruction
+weight (`lambda_mse=0.02`) alongside the Pearson and cosine objectives; legacy
+graph-mode runs retain MSE weight 0 unless it is set explicitly. Spot-level
+composition truth is not read during fitting or model selection. Setting
+`signature_init=False` retains the original graph-mode workflow.
 
 ### Repeated cell-communication analysis
 

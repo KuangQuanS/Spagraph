@@ -17,7 +17,7 @@ from spagraph.models.deconv_initialization import (
 from spagraph.models.deconv_model import HeterogeneousGATDeconvolution, SpatialDeconvolutionLoss
 from spagraph.models.stage1 import coEncoder
 from spagraph.models.stage2 import GATDeconvolution
-from spagraph.training.deconv import run_deconv_auto_k
+from spagraph.training.deconv import _resolve_lambda_mse, run_deconv_auto_k
 
 
 class Stage1AnnotationTests(unittest.TestCase):
@@ -297,6 +297,13 @@ class AutoKValidationTests(unittest.TestCase):
 
 
 class OptimizedLossTests(unittest.TestCase):
+    def test_balanced_mse_default_only_applies_to_signature_mode(self):
+        self.assertEqual(_resolve_lambda_mse(None, signature_init=False), 0.0)
+        self.assertEqual(_resolve_lambda_mse(None, signature_init=True), 0.02)
+        self.assertEqual(_resolve_lambda_mse(0.2, signature_init=True), 0.2)
+        with self.assertRaisesRegex(ValueError, "lambda_mse"):
+            _resolve_lambda_mse(-0.1, signature_init=True)
+
     def test_signature_consistency_is_soft_and_zero_at_reference(self):
         loss = SpatialDeconvolutionLoss(
             celltype_expressions_full=np.array([[5, 0], [0, 5]], dtype=float),

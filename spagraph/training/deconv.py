@@ -6,9 +6,10 @@ Combines Stage 1 (VAE) and Stage 2 (GAT) into a single call.
 import os
 import sys
 import random
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Sequence
 import numpy as np
 import pandas as pd
 import scanpy as sc
@@ -20,6 +21,17 @@ if str(_current_dir) not in sys.path:
     sys.path.insert(0, str(_current_dir))
 
 from spagraph.models.stage2 import GATDeconvolution
+
+
+def _resolve_lambda_mse(
+    lambda_mse: Optional[float], signature_init: bool
+) -> float:
+    """Keep legacy graph mode unchanged while balancing residual-GAT fitting."""
+    if lambda_mse is None:
+        return 0.02 if signature_init else 0.0
+    if not np.isfinite(lambda_mse) or lambda_mse < 0:
+        raise ValueError("lambda_mse must be finite and non-negative")
+    return float(lambda_mse)
 
 
 @dataclass
@@ -140,7 +152,7 @@ def run_deconv(
     dropout: float = 0.1,
     # Loss weights
     lambda_pearson: float = 1,
-    lambda_mse: float = 0,
+    lambda_mse: Optional[float] = None,
     lambda_cosine: float = 5.0,
     lambda_gene_pearson: float = 0,   # disabled: gene-level metrics are batch-dependent, used for monitoring only
     lambda_gene_cosine: float = 0,    # disabled: gene-level metrics are batch-dependent, used for monitoring only
@@ -286,6 +298,7 @@ def run_deconv(
     # 参数检查
     if isinstance(k_celltype, (list, tuple)) and len(k_celltype) == 0:
         raise ValueError("k_celltype candidate list cannot be empty")
+    lambda_mse = _resolve_lambda_mse(lambda_mse, signature_init)
     if signature_ridge < 0:
         raise ValueError("signature_ridge must be non-negative")
     if signature_prior_strength < 0:
@@ -885,6 +898,180 @@ def run_deconv(
             'n_clusters': n_clusters,
             'n_genes': n_genes
         }
+    }
+
+
+def _mean_aligned_frames(
+    frames: Sequence[pd.DataFrame],
+    normalize_rows: bool = False,
+    join: str = "intersection",
+) -> pd.DataFrame:
+    """Average numeric matrices over their shared labeled support."""
+    if not frames:
+        raise ValueError("at least one frame is required")
+    if join not in {"intersection", "union"}:
+        raise ValueError("join must be 'intersection' or 'union'")
+    aligned_index = frames[0].index
+    aligned_columns = frames[0].columns
+    for frame in frames[1:]:
+        if join == "intersection":
+            aligned_index = aligned_index.intersection(frame.index, sort=False)
+            aligned_columns = aligned_columns.intersection(
+                frame.columns, sort=False
+            )
+        else:
+            aligned_index = aligned_index.union(frame.index, sort=False)
+            aligned_columns = aligned_columns.union(frame.columns, sort=False)
+    if len(aligned_index) == 0 or len(aligned_columns) == 0:
+        raise ValueError("repeat outputs have no shared rows or columns")
+    values = np.stack(
+        [
+            frame.reindex(
+                index=aligned_index,
+                columns=aligned_columns,
+                fill_value=0.0,
+            ).to_numpy(dtype=np.float64)
+            for frame in frames
+        ],
+        axis=0,
+    ).mean(axis=0)
+    if normalize_rows:
+        values = np.maximum(values, 0.0)
+        values /= np.maximum(values.sum(axis=1, keepdims=True), 1e-12)
+    return pd.DataFrame(values, index=aligned_index, columns=aligned_columns)
+
+
+def run_deconv_ensemble(
+    vae: Stage1Artifacts,
+    st_file: Optional[str] = None,
+    output_dir: Optional[str] = None,
+    n_repeats: int = 3,
+    seeds: Optional[Sequence[int]] = None,
+    seed: int = 42,
+    **kwargs,
+) -> Dict[str, Any]:
+    """Average independently trained Stage 2 GAT residuals.
+
+    Stage 1 artifacts and every deterministic signature/graph setting are
+    shared across repeats. Only the Stage 2 random seed changes. The arithmetic
+    mean is projected back onto the non-negative simplex. ``run_deconv`` remains
+    the single-run API and is unchanged.
+    """
+    if not isinstance(n_repeats, (int, np.integer)) or int(n_repeats) < 1:
+        raise ValueError("n_repeats must be a positive integer")
+    n_repeats = int(n_repeats)
+    if seeds is None:
+        repeat_seeds = [int(seed) + index for index in range(n_repeats)]
+    else:
+        repeat_seeds = [int(value) for value in seeds]
+        if len(repeat_seeds) != n_repeats:
+            raise ValueError("len(seeds) must equal n_repeats")
+    if len(set(repeat_seeds)) != len(repeat_seeds):
+        raise ValueError("repeat seeds must be unique")
+
+    k_celltype = kwargs.get("k_celltype", 20)
+    if isinstance(k_celltype, (list, tuple)) and len(k_celltype) > 1:
+        raise ValueError(
+            "run_deconv_ensemble requires a fixed k_celltype; run auto-k first"
+        )
+
+    save_reconstructed = bool(kwargs.get("save_reconstructed_genes", False))
+    root = Path(output_dir) if output_dir is not None else None
+    if root is not None:
+        root.mkdir(parents=True, exist_ok=True)
+
+    repeat_results = []
+    repeat_frames = []
+    repeat_dirs = []
+    for repeat_index, repeat_seed in enumerate(repeat_seeds, start=1):
+        repeat_dir = (
+            root / f"repeat_{repeat_index}_seed_{repeat_seed}"
+            if root is not None
+            else None
+        )
+        result = run_deconv(
+            vae=vae,
+            st_file=st_file,
+            output_dir=str(repeat_dir) if repeat_dir is not None else None,
+            seed=repeat_seed,
+            _silent_header=(repeat_index > 1),
+            **kwargs,
+        )
+        frame = result.get("deconv")
+        if frame is None and result.get("deconv_path"):
+            frame = pd.read_csv(result["deconv_path"], index_col=0)
+        if frame is None:
+            raise RuntimeError(f"repeat {repeat_index} did not return a composition")
+        repeat_results.append(result)
+        repeat_frames.append(frame)
+        repeat_dirs.append(repeat_dir)
+
+    ensemble = _mean_aligned_frames(repeat_frames, normalize_rows=True)
+    first = repeat_results[0]
+    ensemble_path = None
+    if root is not None:
+        first_path = first.get("deconv_path")
+        filename = (
+            Path(first_path).name
+            if first_path
+            else f"{first['sample_name']}_composition.csv"
+        )
+        ensemble_path = root / filename
+        ensemble.to_csv(ensemble_path)
+
+        # Stage 3 consumes these optional Stage 2 matrices. Their arithmetic
+        # mean is consistent with the composition ensemble and avoids silently
+        # pairing an averaged composition with one stochastic repeat.
+        if save_reconstructed:
+            for suffix in ("_reconstructed.csv", "_spot_cell_expr.csv"):
+                paths = []
+                for repeat_dir in repeat_dirs:
+                    matches = list(repeat_dir.glob(f"*{suffix}"))
+                    if len(matches) != 1:
+                        raise RuntimeError(
+                            f"expected one {suffix} file in {repeat_dir}, "
+                            f"found {len(matches)}"
+                        )
+                    paths.append(matches[0])
+                averaged = _mean_aligned_frames(
+                    [pd.read_csv(path, index_col=0) for path in paths],
+                    join=(
+                        "union"
+                        if suffix == "_spot_cell_expr.csv"
+                        else "intersection"
+                    ),
+                )
+                averaged.to_csv(root / paths[0].name)
+
+        manifest = {
+            "n_repeats": n_repeats,
+            "seeds": repeat_seeds,
+            "aggregation": "arithmetic_mean_then_simplex_projection",
+            "stage1_shared": True,
+        }
+        (root / "config_deconv_ensemble.json").write_text(
+            json.dumps(manifest, indent=2),
+            encoding="utf-8",
+        )
+
+    numeric_metrics = {}
+    metric_keys = set.intersection(
+        *[set(result.get("metrics", {})) for result in repeat_results]
+    )
+    for key in metric_keys:
+        values = [result["metrics"].get(key) for result in repeat_results]
+        if all(isinstance(value, (int, float, np.number)) for value in values):
+            numeric_metrics[key] = float(np.mean(values))
+
+    return {
+        **first,
+        "deconv": ensemble,
+        "deconv_path": str(ensemble_path) if ensemble_path is not None else None,
+        "metrics": numeric_metrics,
+        "n_repeats": n_repeats,
+        "repeat_seeds": repeat_seeds,
+        "repeat_results": repeat_results,
+        "aggregation": "arithmetic_mean_then_simplex_projection",
     }
 
 

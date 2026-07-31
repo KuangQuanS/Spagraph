@@ -115,8 +115,12 @@ mean that a value of 20 should be imputed.
 
 Current releases additionally support a reference-affinity-guided Stage 2
 mode with `signature_init=True`, `signature_affinity_graph=True`, a residual
-scale of 5.0, and a soft Jensen-Shannon consistency weight of 3.0. Stage 3
-supports `n_repeats=5` for final ensemble rankings while retaining
+scale of 5.0, a spot-level MSE reconstruction weight of 0.02, and a soft
+Jensen-Shannon consistency weight of 3.0. The MSE term remains disabled by
+default in legacy graph mode. For a final stability run,
+`spg.deconv_ensemble(..., n_repeats=3)` reuses Stage 1 and averages independent
+Stage 2 GAT residual predictions; `spg.deconv(...)` remains the single-run API.
+Stage 3 supports `n_repeats=5` for final ensemble rankings while retaining
 `n_repeats=1` as the exploratory default. These options are documented
 separately from the recorded manuscript run configurations above.
 

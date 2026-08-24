@@ -161,7 +161,7 @@ def run_deconv(
     lambda_proportion: float = 0.01,
     lambda_poisson: float = 0.0,
     lambda_spatial: float = 0.0,
-    lambda_signature_consistency: float = 3.0,
+    lambda_signature_consistency: float = 0.0,
     spatial_temperature: float = 1.0,
     heldout_gene_fraction: float = 0.0,
     # Output options
@@ -249,8 +249,9 @@ def run_deconv(
             ``linear`` for a fully expressive residual head.
         signature_affinity_graph: Use the signature-derived spot/cell-type
             affinity matrix to select heterogeneous graph edges.
-        lambda_signature_consistency: Soft Jensen-Shannon consistency between
-            the GAT output and the reference-derived affinity distribution.
+        lambda_signature_consistency: Legacy opt-in Jensen-Shannon consistency
+            with a reference-derived affinity distribution. The canonical
+            model keeps this at 0 and uses no signature prior.
         signature_prior_final_multiplier: Remaining fraction of the signature
             prior after warm-start annealing.
         signature_prior_anneal_epochs: Number of epochs over which the prior

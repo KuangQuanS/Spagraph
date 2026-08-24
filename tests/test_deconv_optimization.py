@@ -1,4 +1,5 @@
 import unittest
+import inspect
 
 import numpy as np
 import anndata as ad
@@ -14,10 +15,16 @@ from spagraph.models.deconv_initialization import (
     power_calibrate_composition,
     select_celltype_specific_genes,
 )
-from spagraph.models.deconv_model import HeterogeneousGATDeconvolution, SpatialDeconvolutionLoss
+from spagraph.models.deconv_model import (
+    HeterogeneousGATDeconvolution,
+    SpatialDeconvolutionLoss,
+    _mixture_geometry_loss,
+)
+from spagraph.models.mixture_alignment import build_pseudospot_data
 from spagraph.models.stage1 import coEncoder
 from spagraph.models.stage2 import GATDeconvolution
-from spagraph.training.deconv import _resolve_lambda_mse, run_deconv_auto_k
+from spagraph.training.deconv import _resolve_lambda_mse, run_deconv, run_deconv_auto_k
+from spagraph.training.vae import train_vae as run_vae
 
 
 class Stage1AnnotationTests(unittest.TestCase):
@@ -297,6 +304,60 @@ class AutoKValidationTests(unittest.TestCase):
 
 
 class OptimizedLossTests(unittest.TestCase):
+    def test_canonical_defaults_use_mixture_and_no_signature(self):
+        vae_default = inspect.signature(run_vae).parameters[
+            "lambda_pseudospot_contrastive"
+        ].default
+        signature_default = inspect.signature(run_deconv).parameters[
+            "lambda_signature_consistency"
+        ].default
+        signature_init_default = inspect.signature(run_deconv).parameters[
+            "signature_init"
+        ].default
+        self.assertEqual(vae_default, 0.01)
+        self.assertEqual(signature_default, 0.0)
+        self.assertFalse(signature_init_default)
+
+    def test_pseudospots_have_known_simplex_proportions(self):
+        counts = np.array(
+            [[10, 0], [8, 0], [0, 12], [0, 9]], dtype=np.float32
+        )
+        data = build_pseudospot_data(
+            counts, np.array(["A", "A", "B", "B"]),
+            n_train=12, n_validation=4, min_cells=2, max_cells=4,
+            max_types=2, seed=7,
+        )
+        self.assertEqual(data.train_x.shape, (12, 2))
+        self.assertTrue(np.allclose(data.train_p.sum(axis=1), 1.0))
+        self.assertTrue((data.train_p >= 0).all())
+
+    def test_mixture_loss_backpropagates_through_encoder(self):
+        class TinyVAE(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.encoder_layer = torch.nn.Linear(2, 2, bias=False)
+                self.decoder = torch.nn.Linear(2, 2, bias=False)
+
+            def encoder(self, x):
+                mu = self.encoder_layer(x)
+                return mu, torch.zeros_like(mu)
+
+            @staticmethod
+            def reparameterize(mu, logvar):
+                return mu
+
+        model = TinyVAE()
+        contrastive, reconstruction = _mixture_geometry_loss(
+            model,
+            torch.tensor([[0.8, 0.2], [0.2, 0.8]]),
+            torch.tensor([[0.8, 0.2], [0.2, 0.8]]),
+            torch.eye(2),
+            0.15,
+        )
+        (0.01 * contrastive + reconstruction).backward()
+        self.assertIsNotNone(model.encoder_layer.weight.grad)
+        self.assertGreater(float(model.encoder_layer.weight.grad.abs().sum()), 0.0)
+
     def test_balanced_mse_default_only_applies_to_signature_mode(self):
         self.assertEqual(_resolve_lambda_mse(None, signature_init=False), 0.0)
         self.assertEqual(_resolve_lambda_mse(None, signature_init=True), 0.02)
@@ -379,7 +440,7 @@ class OptimizedLossTests(unittest.TestCase):
         self.assertEqual(trainer.loss_fn.heldout_marker_positions.numel(), 1)
         self.assertAlmostEqual(trainer.loss_fn.lambda_poisson, 0.1)
         self.assertAlmostEqual(trainer.loss_fn.lambda_spatial, 0.1)
-        self.assertAlmostEqual(trainer.loss_fn.lambda_signature_consistency, 3.0)
+        self.assertAlmostEqual(trainer.loss_fn.lambda_signature_consistency, 0.0)
         self.assertEqual(trainer.gat_model.signature_residual_mode, "linear")
         self.assertTrue(trainer.gat_model.signature_affinity_graph)
         self.assertAlmostEqual(trainer.signature_prior_final_multiplier, 0.25)

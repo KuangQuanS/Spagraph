@@ -1320,6 +1320,36 @@ class SimpleDataset:
         return self.X[idx], self.modality[idx], self.labels[idx]
 
 
+class MixtureDataset:
+    def __init__(self, X, proportions):
+        self.X = torch.FloatTensor(X)
+        self.proportions = torch.FloatTensor(proportions)
+
+    def __len__(self):
+        return len(self.X)
+
+    def __getitem__(self, idx):
+        return self.X[idx], self.proportions[idx]
+
+
+def _mixture_geometry_loss(vae, pseudo_x, pseudo_p, prototype_x, temperature):
+    """Make pseudo-spot embeddings predict their known cell mixture."""
+    pseudo_mu, pseudo_logvar = vae.encoder(pseudo_x)
+    prototype_mu, _ = vae.encoder(prototype_x)
+    logits = (
+        F.normalize(pseudo_mu, dim=1)
+        @ F.normalize(prototype_mu, dim=1).transpose(0, 1)
+        / float(temperature)
+    )
+    contrastive = -(
+        pseudo_p * F.log_softmax(logits, dim=1)
+    ).sum(dim=1).mean()
+    pseudo_z = vae.reparameterize(pseudo_mu, pseudo_logvar)
+    decoder = vae.decoder_st if hasattr(vae, "decoder_st") else vae.decoder
+    pseudo_recon = F.mse_loss(decoder(pseudo_z), pseudo_x)
+    return contrastive, pseudo_recon
+
+
 def _compute_conditional_mmd(z, sc_mask, st_mask, batch_labels, device):
     """Compute per-celltype conditional MMD between SC and ST embeddings.
 
@@ -1367,7 +1397,12 @@ def _compute_conditional_mmd(z, sc_mask, st_mask, batch_labels, device):
     return compute_mmd(sc_z, st_z, kernel='rbf')
 
 
-def train_vae_epoch(vae, train_loader, optimizer, device, loss_type='mse', beta=1.0, lambda_mmd=0.0):
+def train_vae_epoch(
+    vae, train_loader, optimizer, device, loss_type='mse', beta=1.0,
+    lambda_mmd=0.0, mixture_loader=None, prototype_X=None,
+    lambda_pseudospot_contrastive=0.0, lambda_pseudospot_recon=0.0,
+    mixture_temperature=0.15,
+):
     """Train VAE for one epoch
 
     Args:
@@ -1387,9 +1422,15 @@ def train_vae_epoch(vae, train_loader, optimizer, device, loss_type='mse', beta=
     epoch_recon = 0.0
     epoch_kl = 0.0
     epoch_mmd = 0.0
+    epoch_mixture = 0.0
 
     # 检查是否是双解码器架构
     is_dual_decoder = hasattr(vae, 'decoder_sc') and hasattr(vae, 'decoder_st')
+    mixture_iterator = iter(mixture_loader) if mixture_loader is not None else None
+    prototype_tensor = (
+        torch.as_tensor(prototype_X, dtype=torch.float32, device=device)
+        if prototype_X is not None else None
+    )
 
     for batch_data, batch_modality, batch_labels in train_loader:
         batch_data = batch_data.to(device)
@@ -1434,6 +1475,24 @@ def train_vae_epoch(vae, train_loader, optimizer, device, loss_type='mse', beta=
         recon_loss = recon_loss / len(batch_data)
         kl_div = kl_div / len(batch_data)
 
+        mixture_loss = torch.tensor(0.0, device=device)
+        if mixture_iterator is not None and prototype_tensor is not None:
+            try:
+                pseudo_x, pseudo_p = next(mixture_iterator)
+            except StopIteration:
+                mixture_iterator = iter(mixture_loader)
+                pseudo_x, pseudo_p = next(mixture_iterator)
+            pseudo_x = pseudo_x.to(device)
+            pseudo_p = pseudo_p.to(device)
+            contrastive, pseudo_recon = _mixture_geometry_loss(
+                vae, pseudo_x, pseudo_p, prototype_tensor, mixture_temperature
+            )
+            mixture_loss = (
+                lambda_pseudospot_contrastive * contrastive
+                + lambda_pseudospot_recon * pseudo_recon
+            )
+            total_loss = total_loss + mixture_loss
+
         total_loss.backward()
         optimizer.step()
 
@@ -1441,13 +1500,53 @@ def train_vae_epoch(vae, train_loader, optimizer, device, loss_type='mse', beta=
         epoch_recon += recon_loss.item()
         epoch_kl += kl_div.item()
         epoch_mmd += mmd_loss.item() if lambda_mmd > 0 else 0.0
+        epoch_mixture += mixture_loss.item()
 
     avg_loss = epoch_loss / len(train_loader)
     avg_recon = epoch_recon / len(train_loader)
     avg_kl = epoch_kl / len(train_loader)
     avg_mmd = epoch_mmd / len(train_loader)
+    avg_mixture = epoch_mixture / len(train_loader)
 
-    return avg_loss, avg_recon, avg_kl, avg_mmd
+    return avg_loss, avg_recon, avg_kl, avg_mmd, avg_mixture
+
+
+@torch.no_grad()
+def evaluate_mixture_geometry(
+    vae, X, proportions, prototype_X, device, temperature=0.15
+):
+    if X is None or proportions is None or prototype_X is None:
+        return None
+    vae.eval()
+    x = torch.as_tensor(X, dtype=torch.float32, device=device)
+    p = torch.as_tensor(proportions, dtype=torch.float32, device=device)
+    prototypes = torch.as_tensor(prototype_X, dtype=torch.float32, device=device)
+    mu, _ = vae.encoder(x)
+    prototype_mu, _ = vae.encoder(prototypes)
+    logits = (
+        F.normalize(mu, dim=1)
+        @ F.normalize(prototype_mu, dim=1).T
+        / float(temperature)
+    )
+    q = logits.softmax(dim=1)
+    midpoint = 0.5 * (p.clamp_min(1e-8) + q.clamp_min(1e-8))
+    js = 0.5 * (
+        (
+            p.clamp_min(1e-8)
+            * (p.clamp_min(1e-8).log() - midpoint.log())
+        ).sum(dim=1)
+        + (
+            q.clamp_min(1e-8)
+            * (q.clamp_min(1e-8).log() - midpoint.log())
+        ).sum(dim=1)
+    ).mean()
+    return {
+        "js": float(js.item()),
+        "rmse": float(torch.sqrt(F.mse_loss(q, p)).item()),
+        "soft_ce": float(
+            (-(p * q.clamp_min(1e-8).log()).sum(dim=1)).mean().item()
+        ),
+    }
 
 
 def evaluate_vae(vae, test_loader, device, loss_type='mse', beta=1.0):
@@ -1498,7 +1597,12 @@ def evaluate_vae(vae, test_loader, device, loss_type='mse', beta=1.0):
 def train_vae(vae, train_X, test_X, train_modality, test_modality, device,
               batch_size=256, n_epochs=100, lr=1e-3, beta=1.0, loss_type='mse',
               lambda_mmd=1.0, output_dir="./stage1_results", print_every=50,
-              patience=20, min_delta=1.0, train_labels=None, test_labels=None):
+              patience=20, min_delta=1.0, train_labels=None, test_labels=None,
+              pseudospot_train_X=None, pseudospot_train_proportions=None,
+              pseudospot_validation_X=None, pseudospot_validation_proportions=None,
+              pseudospot_prototype_X=None,
+              lambda_pseudospot_contrastive=0.0,
+              lambda_pseudospot_recon=0.0, mixture_temperature=0.15):
     """Train VAE with optional MMD loss for modality alignment
 
     Args:
@@ -1526,6 +1630,14 @@ def train_vae(vae, train_X, test_X, train_modality, test_modality, device,
     from torch.utils.data import DataLoader
     train_dataset = SimpleDataset(train_X, train_modality, train_labels)
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    mixture_loader = None
+    if pseudospot_train_X is not None:
+        mixture_dataset = MixtureDataset(
+            pseudospot_train_X, pseudospot_train_proportions
+        )
+        mixture_loader = DataLoader(
+            mixture_dataset, batch_size=min(batch_size, 256), shuffle=True
+        )
 
     # Create test loader only if test data exists
     if test_X is not None:
@@ -1546,6 +1658,7 @@ def train_vae(vae, train_X, test_X, train_modality, test_modality, device,
     recon_losses = []
     kl_losses = []
     mmd_losses = []
+    mixture_losses = []
     
     best_loss = float('inf')
     patience_counter = 0
@@ -1553,24 +1666,45 @@ def train_vae(vae, train_X, test_X, train_modality, test_modality, device,
     
     for epoch in range(n_epochs):
         # Training
-        avg_loss, avg_recon, avg_kl, avg_mmd = train_vae_epoch(
-            vae, train_loader, optimizer, device, loss_type, beta, lambda_mmd
+        avg_loss, avg_recon, avg_kl, avg_mmd, avg_mixture = train_vae_epoch(
+            vae, train_loader, optimizer, device, loss_type, beta, lambda_mmd,
+            mixture_loader=mixture_loader,
+            prototype_X=pseudospot_prototype_X,
+            lambda_pseudospot_contrastive=lambda_pseudospot_contrastive,
+            lambda_pseudospot_recon=lambda_pseudospot_recon,
+            mixture_temperature=mixture_temperature,
         )
         
         train_losses.append(avg_loss)
         recon_losses.append(avg_recon)
         kl_losses.append(avg_kl)
         mmd_losses.append(avg_mmd)
+        mixture_losses.append(avg_mixture)
         
         if test_loader is not None:
             test_loss = evaluate_vae(vae, test_loader, device, loss_type, beta)
+            mixture_validation = evaluate_mixture_geometry(
+                vae,
+                pseudospot_validation_X,
+                pseudospot_validation_proportions,
+                pseudospot_prototype_X,
+                device,
+                mixture_temperature,
+            )
             test_losses.append(test_loss)
             
             scheduler.step(test_loss)
             
             # Print every N epochs (total loss only)
             if (epoch + 1) % print_every == 0 or epoch == 0:
-                print(f"Epoch {epoch+1}/{n_epochs} | train_loss={avg_loss:.4f} | test_loss={test_loss:.4f}")
+                mixture_text = (
+                    f" | mixture_js={mixture_validation['js']:.4f}"
+                    if mixture_validation is not None else ""
+                )
+                print(
+                    f"Epoch {epoch+1}/{n_epochs} | train_loss={avg_loss:.4f} "
+                    f"| test_loss={test_loss:.4f}{mixture_text}"
+                )
             
             # Save best model based on test loss
             # 绝对改进阈值：best_loss - test_loss > min_delta
@@ -1615,12 +1749,18 @@ def train_vae(vae, train_X, test_X, train_modality, test_modality, device,
     
     # Plot training curves (only if output_dir is provided)
     if output_dir is not None:
-        plot_vae_training_curves(train_losses, test_losses, recon_losses, kl_losses, mmd_losses, output_dir)
+        plot_vae_training_curves(
+            train_losses, test_losses, recon_losses, kl_losses, mmd_losses,
+            output_dir, mixture_losses=mixture_losses,
+        )
     
     return best_loss
 
 
-def plot_vae_training_curves(train_losses, test_losses, recon_losses, kl_losses, mmd_losses=None, output_dir=None):
+def plot_vae_training_curves(
+    train_losses, test_losses, recon_losses, kl_losses, mmd_losses=None,
+    output_dir=None, mixture_losses=None,
+):
     """Plot VAE training curves
     
     Args:

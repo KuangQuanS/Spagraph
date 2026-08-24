@@ -564,7 +564,12 @@ class coEncoder:
     def run_stage1_training(self, top_n_per_type=100, resolution=0.5, batch_size=256, n_epochs=100, 
                            lr=1e-3, beta=1.0, hidden_dims=[512, 256], latent_dim=128, loss_type='mse', 
                            lambda_mmd=0.0, pretrained_path=None, precomputed_marker_file=None, use_dual_decoder=False,
-                           aggregation_method='weighted', marker_selection_method='l1', print_every=50):
+                           aggregation_method='weighted', marker_selection_method='l1', print_every=50,
+                           lambda_pseudospot_contrastive=0.01,
+                           lambda_pseudospot_recon=0.0,
+                           mixture_temperature=0.15,
+                           n_pseudospots=4096,
+                           n_validation_pseudospots=1024):
         """Run stage 1 training: VAE on SC + ST with marker genes
         
         Args:
@@ -601,6 +606,8 @@ class coEncoder:
         print(f"  Latent Dim:    {latent_dim}")
         print(f"  Beta (KL):     {beta}")
         print(f"  Lambda MMD:    {lambda_mmd}")
+        print(f"  Pseudo Mix:    {lambda_pseudospot_contrastive}")
+        print(f"  Mix Temp:      {mixture_temperature}")
         print(f"  Resolution:    {resolution}")
         print(f"  Top N/Type:    {top_n_per_type}")
         print(f"  Dual Decoder:  {use_dual_decoder}")
@@ -643,6 +650,32 @@ class coEncoder:
         else:
             # Build from scratch
             self.build_vae(input_dim, hidden_dims=hidden_dims, latent_dim=latent_dim, loss_type=loss_type, use_dual_decoder=use_dual_decoder)
+
+        pseudospot_data = None
+        if lambda_pseudospot_contrastive > 0 or lambda_pseudospot_recon > 0:
+            from .mixture_alignment import build_pseudospot_data
+
+            marker_indices = [self.all_genes.index(gene) for gene in self.genes]
+            marker_raw_counts = np.asarray(
+                sc_all_genes_raw[:, marker_indices], dtype=np.float32
+            )
+            mixture_labels = (
+                sc_celltype_labels
+                if sc_celltype_labels is not None
+                else np.asarray(sc_all_labels).astype(str)
+            )
+            pseudospot_data = build_pseudospot_data(
+                marker_raw_counts,
+                mixture_labels,
+                n_train=n_pseudospots,
+                n_validation=n_validation_pseudospots,
+                seed=self.seed,
+            )
+            print(
+                f"Pseudo-spots:     train={len(pseudospot_data.train_x)}, "
+                f"validation={len(pseudospot_data.validation_x)}, "
+                f"classes={len(pseudospot_data.class_names)}"
+            )
         
         # 4. Train VAE with test set for early stopping
         # Only pass output_dir when save_to_disk=True (for saving training curves)
@@ -665,6 +698,24 @@ class coEncoder:
             min_delta=1,
             train_labels=train_labels,
             test_labels=test_labels,
+            pseudospot_train_X=(
+                pseudospot_data.train_x if pseudospot_data else None
+            ),
+            pseudospot_train_proportions=(
+                pseudospot_data.train_p if pseudospot_data else None
+            ),
+            pseudospot_validation_X=(
+                pseudospot_data.validation_x if pseudospot_data else None
+            ),
+            pseudospot_validation_proportions=(
+                pseudospot_data.validation_p if pseudospot_data else None
+            ),
+            pseudospot_prototype_X=(
+                pseudospot_data.prototype_x if pseudospot_data else None
+            ),
+            lambda_pseudospot_contrastive=lambda_pseudospot_contrastive,
+            lambda_pseudospot_recon=lambda_pseudospot_recon,
+            mixture_temperature=mixture_temperature,
         )
         
         # Save training data for cluster center computation

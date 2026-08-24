@@ -304,7 +304,7 @@ class GATDeconvolution:
                        zero_init_signature_residual: bool = False,
                        lambda_poisson: float = 0.0,
                        lambda_spatial: float = 0.0,
-                       lambda_signature_consistency: float = 3.0,
+                       lambda_signature_consistency: float = 0.0,
                        spatial_temperature: float = 1.0,
                        heldout_gene_fraction: float = 0.0):
         """Build GAT deconvolution model

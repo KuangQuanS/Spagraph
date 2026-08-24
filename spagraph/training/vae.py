@@ -40,7 +40,12 @@ def train_vae(
     celltype_key: Optional[str] = None,
     device: Optional[str] = None,
     print_every: int = 50,
-    seed: int = 42
+    seed: int = 42,
+    lambda_pseudospot_contrastive: float = 0.01,
+    lambda_pseudospot_recon: float = 0.0,
+    mixture_temperature: float = 0.15,
+    n_pseudospots: int = 4096,
+    n_validation_pseudospots: int = 1024,
 ) -> Any:
     """Train VAE model for SC-ST integration (Stage 1)
     
@@ -74,6 +79,13 @@ def train_vae(
         device: Computing device ('cuda', 'cpu', or None for auto-select)
         print_every: Print loss every N epochs
         seed: Random seed for reproducibility (default: 42)
+        lambda_pseudospot_contrastive: Weight of the known-composition
+            pseudo-spot soft contrastive loss. The canonical model uses 0.01.
+        lambda_pseudospot_recon: Optional pseudo-spot reconstruction weight.
+        mixture_temperature: Temperature used to convert latent similarities
+            to cell-type mixture probabilities.
+        n_pseudospots: Number of pseudo-spots generated for training.
+        n_validation_pseudospots: Number generated for validation diagnostics.
     
     Returns:
         Stage1Artifacts（默认）或原始字典（as_artifacts=False）:
@@ -99,6 +111,12 @@ def train_vae(
     """
     if hidden_dims is None:
         hidden_dims = [512, 256]
+    if lambda_pseudospot_contrastive < 0 or lambda_pseudospot_recon < 0:
+        raise ValueError("pseudo-spot loss weights must be non-negative")
+    if mixture_temperature <= 0:
+        raise ValueError("mixture_temperature must be positive")
+    if n_pseudospots < 1 or n_validation_pseudospots < 1:
+        raise ValueError("pseudo-spot counts must be positive")
     
     # 判断是否保存到磁盘
     save_to_disk = output_dir is not None
@@ -131,7 +149,12 @@ def train_vae(
         use_dual_decoder=use_dual_decoder,
         aggregation_method=aggregation_method,
         marker_selection_method=marker_selection_method,
-        print_every=print_every
+        print_every=print_every,
+        lambda_pseudospot_contrastive=lambda_pseudospot_contrastive,
+        lambda_pseudospot_recon=lambda_pseudospot_recon,
+        mixture_temperature=mixture_temperature,
+        n_pseudospots=n_pseudospots,
+        n_validation_pseudospots=n_validation_pseudospots,
     )
     
     # Store best_loss in results for config saving
@@ -166,6 +189,10 @@ def train_vae(
             f.write(f"  Hidden Dims:   {hidden_dims}\n")
             f.write(f"  Beta (KL):     {beta}\n")
             f.write(f"  Lambda MMD:    {lambda_mmd}\n")
+            f.write(f"  Lambda Mix:    {lambda_pseudospot_contrastive}\n")
+            f.write(f"  Pseudo Recon:  {lambda_pseudospot_recon}\n")
+            f.write(f"  Mix Temp:      {mixture_temperature}\n")
+            f.write(f"  Pseudo-spots:  {n_pseudospots}\n")
             f.write(f"  Loss Type:     {loss_type}\n")
             f.write(f"  Seed:          {seed}\n\n")
             f.write(f"Clustering Hyperparameters:\n")

@@ -20,11 +20,12 @@ are part of the `codex/manuscript-release` branch.
 | Stage 1 | hidden dimensions | 512, 256 | Dual decoder | GPU `config_vae.txt` |
 | Stage 1 | latent dimension | 256 | — | GPU `config_vae.txt` |
 | Stage 1 | beta / lambda MMD | 0.1 / 0.03 | MSE reconstruction | GPU `config_vae.txt` |
+| Stage 1 | pseudo-spot mixture loss / temperature | 0.01 / 0.15 | 4,096 training and 1,024 validation pseudo-spots | GPU mixture confirmation scripts, 20–21 August 2026 |
 | Stage 1 | seed | 42 | Unless explicitly overridden | GPU `config_vae.txt` |
 | Stage 2 | epochs / learning rate | 300 / 5e-3 | — | GPU `config_deconv.txt` |
 | Stage 2 | spatial k / weight threshold | 5 / 0.001 | `scale_basis=all` | GPU `config_deconv.txt` |
 | Stage 2 | GAT | hidden 512; 4 layers; 4 heads; dropout 0.1 | — | GPU `config_deconv.txt` |
-| Stage 2 | loss weights | spot Pearson 1; spot MSE 0; spot cosine 5; gene Pearson 1; gene cosine 5; regularization 0.1; sparsity 0; proportion 0.01 | Final manuscript runs | GPU `config_deconv.txt` |
+| Stage 2 | loss weights | spot Pearson 1; spot MSE 0; spot cosine 5; gene Pearson 1; gene cosine 5; regularization 0.1; sparsity 0; proportion 0.01; signature consistency 0 | Canonical no-signature model | GPU `config_deconv.txt` and mixture confirmation scripts |
 | Stage 2 | `k_celltype` | Dataset-specific | Spot-to-cell-type graph sparsity; not `k_cells_per_cluster` | GPU `config_deconv.txt` |
 | Stage 2 | `k_cells_per_cluster` | 15 (STARmap: 10) | Dynamic cluster representation | GPU `config_deconv.txt` |
 | Stage 3 | graph/model | 8 spot neighbors; GAT 512,256,128; 8 heads; dropout 0.3; output 128 | Tumour case studies | Final run scripts |
@@ -113,11 +114,9 @@ mean that a value of 20 should be imputed.
 
 ## Current optional model settings
 
-Current releases additionally support a reference-affinity-guided Stage 2
-mode with `signature_init=True`, `signature_affinity_graph=True`, a residual
-scale of 5.0, a spot-level MSE reconstruction weight of 0.02, and a soft
-Jensen-Shannon consistency weight of 3.0. The MSE term remains disabled by
-default in legacy graph mode. For a final stability run,
+Current releases retain the older reference-affinity-guided Stage 2 arguments
+for ablation reproduction, but the canonical model sets `signature_init=False`
+and `lambda_signature_consistency=0`. For a final stability run,
 `spg.deconv_ensemble(..., n_repeats=3)` reuses Stage 1 and averages independent
 Stage 2 GAT residual predictions; `spg.deconv(...)` remains the single-run API.
 Stage 3 supports `n_repeats=5` for final ensemble rankings while retaining

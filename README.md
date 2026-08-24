@@ -45,6 +45,8 @@ artifacts = spg.vae(
     st_file=st_file,
     output_dir=str(deconv_dir),
     resolution=4.0,
+    lambda_pseudospot_contrastive=0.01,
+    mixture_temperature=0.15,
     seed=42,
 )
 
@@ -55,11 +57,6 @@ deconv_result = spg.deconv(
     output_dir=str(deconv_dir),
     k_celltype=[20, 25, 30, 35, 40],
     k_cells_per_cluster=15,
-    signature_init=True,
-    signature_affinity_graph=True,
-    signature_residual_scale=5.0,
-    lambda_mse=0.02,
-    lambda_signature_consistency=3.0,
     save_reconstructed_genes=True,
     seed=42,
 )
@@ -89,7 +86,6 @@ deconv_result = spg.deconv_ensemble(
     output_dir="results/deconv_ensemble",
     n_repeats=3,
     seeds=[11, 23, 42],
-    signature_init=True,
 )
 ```
 
@@ -105,18 +101,16 @@ Stage 2 writes `*_composition.csv`, configuration and training diagnostics;
 unified LR communication tables and model diagnostics under its output
 directory.
 
-### Reference-affinity-guided residual GAT
+### Pseudo-spot mixture alignment
 
-With `signature_init=True`, Stage 2 derives a non-negative affinity matrix from
-the annotated single-cell reference and observed spot expression. The matrix
-initializes the graph and composition logits, while the GAT learns the final
-residual correction. In logit form the default update is
-`log(affinity) + 5 * tanh(GAT residual)`, with a soft consistency term rather
-than a fixed output clamp. Signature-guided runs use a small MSE reconstruction
-weight (`lambda_mse=0.02`) alongside the Pearson and cosine objectives; legacy
-graph-mode runs retain MSE weight 0 unless it is set explicitly. Spot-level
-composition truth is not read during fitting or model selection. Setting
-`signature_init=False` retains the original graph-mode workflow.
+Stage 1 generates pseudo-spots from annotated single cells, so their cell-type
+proportions are known. The shared encoder maps each pseudo-spot and each
+cell-type prototype into the latent space. A soft contrastive loss requires
+the prototype-similarity distribution to match the known mixture. The
+canonical settings are `lambda_pseudospot_contrastive=0.01` and
+`mixture_temperature=0.15`. Stage 2 then trains the GAT without signature
+initialization or a signature consistency loss. Legacy signature-guided
+arguments remain available only for reproducing older ablations.
 
 ### Repeated cell-communication analysis
 

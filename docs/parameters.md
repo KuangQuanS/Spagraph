@@ -25,6 +25,7 @@ are part of the `codex/manuscript-release` branch.
 | Stage 2 | epochs / learning rate | 300 / 5e-3 | — | GPU `config_deconv.txt` |
 | Stage 2 | spatial k / weight threshold | 5 / 0.001 | `scale_basis=all` | GPU `config_deconv.txt` |
 | Stage 2 | GAT | hidden 512; 4 layers; 4 heads; dropout 0.1 | — | GPU `config_deconv.txt` |
+| Stage 2 | attention temperature | 4/3 | Equivalent to row-normalized composition power gamma 0.75 | GPU mixture confirmation scripts, 20–21 August 2026 |
 | Stage 2 | loss weights | spot Pearson 1; spot MSE 0; spot cosine 5; gene Pearson 1; gene cosine 5; regularization 0.1; sparsity 0; proportion 0.01; signature consistency 0 | Canonical no-signature model | GPU `config_deconv.txt` and mixture confirmation scripts |
 | Stage 2 | `k_celltype` | Dataset-specific | Spot-to-cell-type graph sparsity; not `k_cells_per_cluster` | GPU `config_deconv.txt` |
 | Stage 2 | `k_cells_per_cluster` | 15 (STARmap: 10) | Dynamic cluster representation | GPU `config_deconv.txt` |

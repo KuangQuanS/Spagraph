@@ -314,9 +314,27 @@ class OptimizedLossTests(unittest.TestCase):
         signature_init_default = inspect.signature(run_deconv).parameters[
             "signature_init"
         ].default
+        attention_temperature_default = inspect.signature(run_deconv).parameters[
+            "attention_temperature"
+        ].default
         self.assertEqual(vae_default, 0.01)
         self.assertEqual(signature_default, 0.0)
         self.assertFalse(signature_init_default)
+        self.assertAlmostEqual(attention_temperature_default, 4.0 / 3.0)
+
+    def test_attention_temperature_is_validated_and_recorded(self):
+        model = HeterogeneousGATDeconvolution(
+            embedding_dim=2,
+            n_cell_types=2,
+            gat_hidden_dim=2,
+            gat_layers=1,
+            gat_heads=1,
+            celltype_prototypes=torch.eye(2),
+            attention_temperature=4.0 / 3.0,
+        )
+        self.assertAlmostEqual(model.attention_temperature, 4.0 / 3.0)
+        with self.assertRaisesRegex(ValueError, "attention_temperature"):
+            HeterogeneousGATDeconvolution(attention_temperature=0.0)
 
     def test_pseudospots_have_known_simplex_proportions(self):
         counts = np.array(

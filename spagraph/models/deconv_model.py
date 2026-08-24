@@ -427,6 +427,7 @@ class HeterogeneousGATDeconvolution(nn.Module):
                  use_dynamic_cluster_repr=False, k_cells_per_cluster=10,
                  sc_cell_expressions=None,
                  normalize_attention=True,
+                 attention_temperature: float = 1.0,
                  signature_prior_strength: float = 0.0,
                  signature_prior_trainable: bool = False,
                  signature_residual_scale: float = 5.0,
@@ -448,6 +449,9 @@ class HeterogeneousGATDeconvolution(nn.Module):
         self.use_dynamic_cluster_repr = use_dynamic_cluster_repr
         self.k_cells_per_cluster = k_cells_per_cluster
         self.normalize_attention = normalize_attention
+        if not np.isfinite(attention_temperature) or attention_temperature <= 0:
+            raise ValueError("attention_temperature must be finite and positive")
+        self.attention_temperature = float(attention_temperature)
         if signature_prior_strength < 0:
             raise ValueError("signature_prior_strength must be non-negative")
         if signature_residual_scale < 0:
@@ -808,7 +812,9 @@ class HeterogeneousGATDeconvolution(nn.Module):
         # Attention weight normalization (optional)
         if normalize_attention:
             # Softmax normalization (only over connected celltypes)
-            deconv_weights = F.softmax(attention_scores_masked, dim=1)
+            deconv_weights = F.softmax(
+                attention_scores_masked / self.attention_temperature, dim=1
+            )
             if initial_weights is not None and self.signature_output_power != 1.0:
                 deconv_weights = deconv_weights.clamp_min(0).pow(self.signature_output_power)
                 deconv_weights = deconv_weights / deconv_weights.sum(dim=1, keepdim=True).clamp_min(1e-12)

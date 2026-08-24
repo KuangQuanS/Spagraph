@@ -150,6 +150,7 @@ def run_deconv(
     gat_layers: int = 4,
     gat_heads: int = 4,
     dropout: float = 0.1,
+    attention_temperature: float = 4.0 / 3.0,
     # Loss weights
     lambda_pearson: float = 1,
     lambda_mse: Optional[float] = None,
@@ -242,6 +243,9 @@ def run_deconv(
 
         # Signature-guided residual GAT
         signature_init: Initialize spot compositions from reference signatures.
+        attention_temperature: Temperature applied to GAT composition logits.
+            The canonical no-signature model uses 4/3, equivalent to the
+            validated output power gamma of 0.75.
         signature_prior_strength: Scale of the signature log-prior.
         signature_prior_trainable: Whether the prior scale is learned.
         signature_residual_scale: Bound on the GAT residual logit magnitude.
@@ -300,6 +304,8 @@ def run_deconv(
     if isinstance(k_celltype, (list, tuple)) and len(k_celltype) == 0:
         raise ValueError("k_celltype candidate list cannot be empty")
     lambda_mse = _resolve_lambda_mse(lambda_mse, signature_init)
+    if not np.isfinite(attention_temperature) or attention_temperature <= 0:
+        raise ValueError("attention_temperature must be finite and positive")
     if signature_ridge < 0:
         raise ValueError("signature_ridge must be non-negative")
     if signature_prior_strength < 0:
@@ -393,6 +399,7 @@ def run_deconv(
             print(f"K Celltype:         {k_value}")
         print(f"GAT Architecture:   {gat_layers}L × {gat_hidden_dim}D × {gat_heads}H")
         print(f"Dropout:            {dropout}")
+        print(f"Attention Temp:     {attention_temperature:g}")
         print(f"Loss Weights:")
         print(f"  Pearson:          {lambda_pearson}")
         print(f"  MSE:              {lambda_mse}")
@@ -756,6 +763,7 @@ def run_deconv(
         use_dynamic_cluster_repr=use_dynamic_cluster_repr,
         k_cells_per_cluster=k_cells_per_cluster,
         sc_cell_expressions=vae.sc_cell_expressions_raw if use_dynamic_cluster_repr else None,
+        attention_temperature=attention_temperature,
         signature_prior_strength=(signature_prior_strength if signature_init else 0.0),
         signature_prior_trainable=signature_prior_trainable,
         signature_residual_scale=signature_residual_scale,
@@ -844,6 +852,7 @@ def run_deconv(
             f.write(f"  Sparse:        {lambda_sparse}\n")
             f.write(f"  Proportion:    {lambda_proportion}\n")
             f.write(f"  Signature JS:  {lambda_signature_consistency}\n\n")
+            f.write(f"  Attention Temperature: {attention_temperature}\n\n")
             f.write(f"Dynamic Cluster Representation:\n")
             f.write(f"  Enabled:       {use_dynamic_cluster_repr}\n")
             if use_dynamic_cluster_repr:

@@ -57,6 +57,7 @@ deconv_result = spg.deconv(
     output_dir=str(deconv_dir),
     k_celltype=[20, 25, 30, 35, 40],
     k_cells_per_cluster=15,
+    attention_temperature=4 / 3,
     save_reconstructed_genes=True,
     seed=42,
 )
@@ -109,7 +110,8 @@ cell-type prototype into the latent space. A soft contrastive loss requires
 the prototype-similarity distribution to match the known mixture. The
 canonical settings are `lambda_pseudospot_contrastive=0.01` and
 `mixture_temperature=0.15`. Stage 2 then trains the GAT without signature
-initialization or a signature consistency loss. Legacy signature-guided
+initialization or a signature consistency loss and applies an attention
+temperature of `4/3` (the validated `gamma=0.75` output calibration). Legacy signature-guided
 arguments remain available only for reproducing older ablations.
 
 ### Repeated cell-communication analysis

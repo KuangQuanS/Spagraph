@@ -293,6 +293,7 @@ class GATDeconvolution:
                        loss_lambda_proportion=1.0, spot_total_counts=None,
                        use_dynamic_cluster_repr=False, k_cells_per_cluster=10, 
                        sc_cell_expressions=None,
+                       attention_temperature: float = 1.0,
                        signature_prior_strength: float = 0.0,
                        signature_prior_trainable: bool = False,
                        signature_residual_scale: float = 5.0,
@@ -344,6 +345,7 @@ class GATDeconvolution:
             use_dynamic_cluster_repr=use_dynamic_cluster_repr,
             k_cells_per_cluster=k_cells_per_cluster,
             sc_cell_expressions=sc_cell_expressions,  # [n_cells, n_all_genes] full genes
+            attention_temperature=attention_temperature,
             signature_prior_strength=signature_prior_strength,
             signature_prior_trainable=signature_prior_trainable,
             signature_residual_scale=signature_residual_scale,

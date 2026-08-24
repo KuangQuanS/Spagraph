@@ -60,33 +60,67 @@ def _build_active_gene_sets(
     return ligand_sets, receptor_sets, total_counts
 
 
+def _split_complex(name: str) -> List[str]:
+    """Split CellChat complex names into required gene subunits."""
+    return [part.strip() for part in str(name).split("_") if part.strip()]
+
+
+def _geometric_mean_expression(
+    expression: np.ndarray,
+    gene_indices: Tuple[int, ...],
+    total_count: float,
+) -> float:
+    """Return the CP10k geometric mean abundance of a gene complex.
+
+    Normalizing every subunit before aggregation keeps complexes with two or
+    more subunits invariant to library size. All required subunits must be
+    positive; callers enforce the expression threshold separately.
+    """
+    if total_count <= 0 or not gene_indices:
+        return 0.0
+    values = np.asarray(expression[list(gene_indices)], dtype=np.float64)
+    if np.any(values <= 0) or not np.isfinite(values).all():
+        return 0.0
+    normalized = values / float(total_count) * 1e4
+    return float(np.exp(np.mean(np.log(normalized))))
+
+
 def _build_valid_lr_pairs(
     lr_pairs: List[Tuple[str, str]],
     gene_name_to_idx: Dict[str, int],
-) -> Tuple[List[Tuple[int, Tuple[int, ...], str, str]], Dict[int, List[Tuple[int, Tuple[int, ...], str, str]]]]:
-    valid_lr_pairs: List[Tuple[int, Tuple[int, ...], str, str]] = []
-    valid_lr_pairs_by_ligand: Dict[int, List[Tuple[int, Tuple[int, ...], str, str]]] = {}
+) -> Tuple[
+    List[Tuple[Tuple[int, ...], Tuple[int, ...], str, str]],
+    Dict[int, List[Tuple[Tuple[int, ...], Tuple[int, ...], str, str]]],
+]:
+    valid_lr_pairs: List[Tuple[Tuple[int, ...], Tuple[int, ...], str, str]] = []
+    valid_lr_pairs_by_ligand: Dict[
+        int, List[Tuple[Tuple[int, ...], Tuple[int, ...], str, str]]
+    ] = {}
 
     for ligand, receptor in lr_pairs:
-        lig_idx = gene_name_to_idx.get(ligand.upper())
-        if lig_idx is None:
+        lig_indices = tuple(
+            gene_name_to_idx[gene.upper()]
+            for gene in _split_complex(ligand)
+            if gene.upper() in gene_name_to_idx
+        )
+        rec_indices = tuple(
+            gene_name_to_idx[gene.upper()]
+            for gene in _split_complex(receptor)
+            if gene.upper() in gene_name_to_idx
+        )
+        if (
+            len(lig_indices) != len(_split_complex(ligand))
+            or len(rec_indices) != len(_split_complex(receptor))
+            or not lig_indices
+            or not rec_indices
+        ):
             continue
 
-        rec_indices: List[int] = []
-        found_all = True
-        for receptor_gene in receptor.split("_"):
-            rec_idx = gene_name_to_idx.get(receptor_gene.strip().upper())
-            if rec_idx is None:
-                found_all = False
-                break
-            rec_indices.append(rec_idx)
-
-        if not found_all:
-            continue
-
-        record = (lig_idx, tuple(rec_indices), ligand, receptor)
+        record = (lig_indices, rec_indices, ligand, receptor)
         valid_lr_pairs.append(record)
-        valid_lr_pairs_by_ligand.setdefault(lig_idx, []).append(record)
+        # Index by one required subunit for efficient candidate lookup. The
+        # complete-complex check below prevents partial complexes from passing.
+        valid_lr_pairs_by_ligand.setdefault(lig_indices[0], []).append(record)
 
     return valid_lr_pairs, valid_lr_pairs_by_ligand
 
@@ -190,6 +224,7 @@ def calculate_lr_scores(
     lr_support_by_edge: Dict[
         Tuple[str, str, str, str], Dict[Tuple[str, str], float]
     ] = {}
+    lr_candidate_scores: Dict[Tuple[int, int, int, int, int], float] = {}
     lr_id_counter = 1
     total_pairs = 0
     spots_with_cells = 0
@@ -233,22 +268,26 @@ def calculate_lr_scores(
                     if total_j <= 0 or not active_rec_set:
                         continue
 
-                    normalization_factor = 1e4 / np.sqrt(total_i * total_j)
                     for lig_idx in active_lig_set:
                         ligand_pairs = valid_lr_pairs_by_ligand.get(lig_idx)
                         if not ligand_pairs:
                             continue
 
-                        lig_val = cell_i_expr[lig_idx]
-                        if lig_val <= 0:
-                            continue
-
-                        for _, rec_indices, ligand, receptor in ligand_pairs:
+                        for lig_indices, rec_indices, ligand, receptor in ligand_pairs:
+                            if not all(index in active_lig_set for index in lig_indices):
+                                continue
                             if not all(rec_idx in active_rec_set for rec_idx in rec_indices):
                                 continue
 
-                            rec_product = np.prod(cell_j_expr[list(rec_indices)])
-                            score = np.log1p(np.sqrt(lig_val * rec_product) * normalization_factor)
+                            ligand_abundance = _geometric_mean_expression(
+                                cell_i_expr, lig_indices, total_i
+                            )
+                            receptor_abundance = _geometric_mean_expression(
+                                cell_j_expr, rec_indices, total_j
+                            )
+                            score = np.log1p(
+                                np.sqrt(ligand_abundance * receptor_abundance)
+                            )
                             if score >= lr_score_threshold:
                                 lr_pair = (ligand, receptor)
                                 lr_id = lr_pair_to_id.get(lr_pair)
@@ -264,6 +303,14 @@ def calculate_lr_scores(
                                     lr_scores_by_spot_pair[pair_key] = [float(score), lr_id]
                                 else:
                                     pair_data[0] += float(score)
+
+                                candidate_key = (
+                                    i, j, celltype_i_idx, celltype_j_idx, lr_id
+                                )
+                                lr_candidate_scores[candidate_key] = (
+                                    lr_candidate_scores.get(candidate_key, 0.0)
+                                    + float(score)
+                                )
 
                                 support_key = (
                                     spot_i_barcode,
@@ -316,11 +363,26 @@ def calculate_lr_scores(
     else:
         print("LR scores saved:    skipped (save_lr_scores_csv=False)")
 
+    lr_candidates_by_spot_pair: Dict[
+        Tuple[int, int], List[Tuple[int, int, float, int]]
+    ] = {}
+    for (
+        spot_i_idx,
+        spot_j_idx,
+        cell_i_idx,
+        cell_j_idx,
+        lr_id,
+    ), candidate_score in lr_candidate_scores.items():
+        lr_candidates_by_spot_pair.setdefault((spot_i_idx, spot_j_idx), []).append(
+            (cell_i_idx, cell_j_idx, float(candidate_score), int(lr_id))
+        )
+
     graph_data = {
         "coords": spot_coords,
         "composition": composition,
         "knn_mask": knn_mask,
         "lr_support_by_edge": lr_support_by_edge,
+        "lr_candidates_by_spot_pair": lr_candidates_by_spot_pair,
     }
     comm_by_spot_pair: Dict[Tuple[int, int], List[Tuple[int, int, float, int]]] = {}
     for (spot_i_idx, spot_j_idx, cell_i_idx, cell_j_idx), (total_score, lr_id) in lr_scores_by_spot_pair.items():

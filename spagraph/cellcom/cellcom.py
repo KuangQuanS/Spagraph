@@ -20,7 +20,11 @@ from .cellcom_graph_builder import (
     hetero_subgraph_collate_fn_batched,
     set_seed,
 )
-from .cellcom_evaluate import evaluate_cell_communication, plot_training_loss
+from .cellcom_evaluate import (
+    evaluate_cell_communication,
+    evaluate_lr_candidate_scores,
+    plot_training_loss,
+)
 from .lr_scores import calculate_lr_scores
 
 def _scalar(x):
@@ -159,8 +163,8 @@ def parse_args():
     parser.add_argument('--lambda_mask_recon', type=float, default=1.0, help='mask边重构损失的权重 (default: 1.0)')
     parser.add_argument('--lambda_node_recon', type=float, default=0.5, help='节点特征重构损失的权重 (default: 0.5)')
     parser.add_argument(
-        '--lambda_relation_rank', type=float, default=0.0,
-        help='Weight for self-supervised directed-relation ranking loss (default: 0, disabled)',
+        '--lambda_relation_rank', type=float, default=0.1,
+        help='Weight for directed-relation and LR-candidate contrastive losses (default: 0.1)',
     )
     parser.add_argument(
         '--relation_rank_margin', type=float, default=0.1,
@@ -491,6 +495,7 @@ def main(args=None):
         gat_dropout=args.gat_dropout,
         output_dim=args.output_dim,
         n_celltypes=n_cells,
+        n_lr_pairs=max(len(dataset.lr_id_to_pair), 1),
     ).to(device)
     
     optimizer = torch.optim.Adam(
@@ -591,6 +596,8 @@ def main(args=None):
                         edge_attr_cc = edge_attr_cc.view(-1, 2) if edge_attr_cc.numel() > 0 else edge_attr_cc.new_zeros((0, 2))
                     edge_attr_cc = edge_attr_cc.to(device, non_blocking=pin_memory)
                     edge_attr_cc_input = edge_attr_cc[:, :1]
+                    lr_candidate_index = batch['lr_candidate_index'][b].to(device, non_blocking=pin_memory)
+                    lr_candidate_attr = batch['lr_candidate_attr'][b].to(device, non_blocking=pin_memory)
 
                     model_outputs = model(
                         expr_raw=expr_raw,
@@ -605,6 +612,8 @@ def main(args=None):
                         mask_generator=None,
                         return_relation_loss=lambda_relation_rank > 0,
                         relation_rank_margin=relation_rank_margin,
+                        lr_candidate_index=lr_candidate_index,
+                        lr_candidate_attr=lr_candidate_attr,
                     )
                     (
                         _, _, _, _, cc_attention, predicted_masked_edges,
@@ -651,6 +660,8 @@ def main(args=None):
                     edge_attr_cc = edge_attr_cc.view(-1, 2) if edge_attr_cc.numel() > 0 else edge_attr_cc.new_zeros((0, 2))
                 edge_attr_cc = edge_attr_cc.to(device, non_blocking=pin_memory)
                 edge_attr_cc_input = edge_attr_cc[:, :1]
+                lr_candidate_index = batch['lr_candidate_index'].to(device, non_blocking=pin_memory)
+                lr_candidate_attr = batch['lr_candidate_attr'].to(device, non_blocking=pin_memory)
 
                 model_outputs = model(
                     expr_raw=expr_raw,
@@ -668,6 +679,11 @@ def main(args=None):
                         device, non_blocking=pin_memory
                     ),
                     relation_rank_margin=relation_rank_margin,
+                    lr_candidate_index=lr_candidate_index,
+                    lr_candidate_attr=lr_candidate_attr,
+                    lr_candidate_batch=batch['lr_candidate_batch'].to(
+                        device, non_blocking=pin_memory
+                    ),
                 )
                 (
                     _, _, _, _, cc_attention, predicted_masked_edges,
@@ -738,6 +754,8 @@ def main(args=None):
                             edge_attr_cc = edge_attr_cc.view(-1, 2) if edge_attr_cc.numel() > 0 else edge_attr_cc.new_zeros((0, 2))
                         edge_attr_cc = edge_attr_cc.to(device, non_blocking=pin_memory)
                         edge_attr_cc_input = edge_attr_cc[:, :1]
+                        lr_candidate_index = batch['lr_candidate_index'][b].to(device, non_blocking=pin_memory)
+                        lr_candidate_attr = batch['lr_candidate_attr'][b].to(device, non_blocking=pin_memory)
 
                         model_outputs = model(
                             expr_raw=expr_raw,
@@ -753,6 +771,8 @@ def main(args=None):
                             return_relation_loss=lambda_relation_rank > 0,
                             relation_rank_margin=relation_rank_margin,
                             relation_generator=val_mask_gen,
+                            lr_candidate_index=lr_candidate_index,
+                            lr_candidate_attr=lr_candidate_attr,
                         )
                         (
                             _, _, _, _, _, predicted_masked_edges,
@@ -799,6 +819,8 @@ def main(args=None):
                         edge_attr_cc = edge_attr_cc.view(-1, 2) if edge_attr_cc.numel() > 0 else edge_attr_cc.new_zeros((0, 2))
                     edge_attr_cc = edge_attr_cc.to(device, non_blocking=pin_memory)
                     edge_attr_cc_input = edge_attr_cc[:, :1]
+                    lr_candidate_index = batch['lr_candidate_index'].to(device, non_blocking=pin_memory)
+                    lr_candidate_attr = batch['lr_candidate_attr'].to(device, non_blocking=pin_memory)
 
                     model_outputs = model(
                         expr_raw=expr_raw,
@@ -817,6 +839,11 @@ def main(args=None):
                         ),
                         relation_rank_margin=relation_rank_margin,
                         relation_generator=val_mask_gen,
+                        lr_candidate_index=lr_candidate_index,
+                        lr_candidate_attr=lr_candidate_attr,
+                        lr_candidate_batch=batch['lr_candidate_batch'].to(
+                            device, non_blocking=pin_memory
+                        ),
                     )
                     (
                         _, _, _, _, _, predicted_masked_edges,
@@ -928,6 +955,7 @@ def main(args=None):
     all_n_spots_sub = []
     all_src_barcodes = []  # 新增：发送方barcode
     all_dst_barcodes = []  # 新增：接收方barcode
+    all_lr_candidate_records = []
     
     # ✅ 定义细胞类型名称列表
     all_cell_names = cell_names
@@ -950,6 +978,8 @@ def main(args=None):
                 if edge_attr_cc.dim() == 1:
                     edge_attr_cc = edge_attr_cc.view(-1, 2) if edge_attr_cc.numel() > 0 else edge_attr_cc.new_zeros((0, 2))
                 edge_attr_cc = edge_attr_cc.to(device, non_blocking=pin_memory)
+                lr_candidate_index = batch['lr_candidate_index'][b].to(device, non_blocking=pin_memory)
+                lr_candidate_attr = batch['lr_candidate_attr'][b].to(device, non_blocking=pin_memory)
                 
                 # 模型前向传播
                 # ✅ 推理阶段也传入真实通信特征，收集的注意力才与LR信息一致
@@ -965,6 +995,33 @@ def main(args=None):
                     edge_mask_ratio=0.0,
                     node_mask_ratio=0.0
                 )
+
+                candidate_logits = model.score_lr_candidates(
+                    combined, lr_candidate_index, lr_candidate_attr
+                )
+                spot_cell_mapping = batch['spot_cell_mapping'][b]
+                cell_node_to_spot_cell = {
+                    cell_node: (spot_local, cell_type)
+                    for (spot_local, cell_type), cell_node in spot_cell_mapping.items()
+                }
+                subgraph_spot_indices = batch['spot_indices'][b]
+                n_spots_sub = batch['n_spots_sub'][b]
+                for candidate_idx in range(lr_candidate_index.size(1)):
+                    src_local = int(lr_candidate_index[0, candidate_idx].item()) - n_spots_sub
+                    dst_local = int(lr_candidate_index[1, candidate_idx].item()) - n_spots_sub
+                    src_spot_local, src_cell_type = cell_node_to_spot_cell[src_local]
+                    dst_spot_local, dst_cell_type = cell_node_to_spot_cell[dst_local]
+                    all_lr_candidate_records.append(
+                        {
+                            'src_spot_barcode': spot_names[subgraph_spot_indices[src_spot_local]],
+                            'dst_spot_barcode': spot_names[subgraph_spot_indices[dst_spot_local]],
+                            'source_cell': all_cell_names[src_cell_type],
+                            'target_cell': all_cell_names[dst_cell_type],
+                            'lr_id': int(lr_candidate_attr[candidate_idx, 1].item()),
+                            'lr_score': float(lr_candidate_attr[candidate_idx, 0].item()),
+                            'candidate_logit': float(candidate_logits[candidate_idx].item()),
+                        }
+                    )
                 
                 if cc_attention is not None:
                     all_cc_attention_scores.append(cc_attention.detach().cpu())
@@ -1052,6 +1109,11 @@ def main(args=None):
         export_filtered=getattr(args, 'export_filtered_csv', True),
         attention_threshold=args.attention_threshold,
         lr_support_by_edge=graph_data.get("lr_support_by_edge"),
+    )
+    evaluate_lr_candidate_scores(
+        records=all_lr_candidate_records,
+        lr_id_to_pair=dataset.lr_id_to_pair,
+        output_dir=args.output_dir,
     )
     
     # 绘制损失曲线

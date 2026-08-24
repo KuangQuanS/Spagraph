@@ -476,6 +476,9 @@ class STHeteroSubgraphDataset:
         self.cell_full_expr = cell_full_expr
         self.spot_cell_expr_df = spot_cell_expr
         self.graph_data = graph_data
+        self.lr_candidates_by_spot_pair = graph_data.get(
+            'lr_candidates_by_spot_pair', {}
+        )
         self.device = device
         self.k_neighbors = k_neighbors
         self.lr_pairs = lr_pairs
@@ -845,6 +848,8 @@ class STHeteroSubgraphDataset:
 
         edge_index_cc_list = []
         edge_attr_cc_list = []  # 现在包含两个特征：[lr_score, lr_id]
+        lr_candidate_index_list = []
+        lr_candidate_attr_list = []  # [pair-specific score, lr_id]
 
         # ✅ 计算子图内所有spot的cell之间的通讯（有向边：配体细胞 -> 受体细胞）
         # 仅遍历“预计算里存在通讯”的 cell 对，避免对 cells_in_i × cells_in_j 做穷举
@@ -866,6 +871,26 @@ class STHeteroSubgraphDataset:
                     cell_j_node_global_id = n_spots_sub + cell_j_node_local_idx
                     edge_index_cc_list.append([cell_i_node_global_id, cell_j_node_global_id])
                     edge_attr_cc_list.append([total_lr_score, lr_id])
+
+                candidate_list = self.lr_candidates_by_spot_pair.get(
+                    (spot_i_global, spot_j_global), ()
+                )
+                for cell_type_i, cell_type_j, lr_score, lr_id in candidate_list:
+                    cell_i_node_local_idx = spot_cell_mapping.get(
+                        (i_local, cell_type_i)
+                    )
+                    cell_j_node_local_idx = spot_cell_mapping.get(
+                        (j_local, cell_type_j)
+                    )
+                    if cell_i_node_local_idx is None or cell_j_node_local_idx is None:
+                        continue
+                    lr_candidate_index_list.append(
+                        [
+                            n_spots_sub + cell_i_node_local_idx,
+                            n_spots_sub + cell_j_node_local_idx,
+                        ]
+                    )
+                    lr_candidate_attr_list.append([lr_score, lr_id])
                         
         edge_index_cc = torch.tensor(
             np.array(edge_index_cc_list).T if edge_index_cc_list else np.array([[], []]).astype(int),
@@ -875,6 +900,16 @@ class STHeteroSubgraphDataset:
             edge_attr_cc_list if edge_attr_cc_list else [],
             dtype=torch.float32
         )
+        lr_candidate_index = torch.tensor(
+            np.array(lr_candidate_index_list).T
+            if lr_candidate_index_list
+            else np.empty((2, 0), dtype=np.int64),
+            dtype=torch.long,
+        )
+        lr_candidate_attr = torch.tensor(
+            lr_candidate_attr_list if lr_candidate_attr_list else [],
+            dtype=torch.float32,
+        ).reshape(-1, 2)
         
         # 如果通讯边数量少于阈值，直接丢弃该子图样本
         if edge_index_cc.size(1) < self.min_comm_edges:
@@ -897,6 +932,8 @@ class STHeteroSubgraphDataset:
             'edge_attr_like': edge_attr_like,
             'edge_index_cc': edge_index_cc,  # cell-cell通讯边
             'edge_attr_cc': edge_attr_cc,
+            'lr_candidate_index': lr_candidate_index,
+            'lr_candidate_attr': lr_candidate_attr,
             'coords_subgraph': coords_subgraph,
             'composition_subgraph': composition_subgraph,  # [k+1, n_cell_types]
         }
@@ -923,6 +960,8 @@ def hetero_subgraph_collate_fn(batch):
     edge_attr_like_list = [torch.cat([sample['edge_attr_like'].unsqueeze(-1), torch.zeros_like(sample['edge_attr_like'].unsqueeze(-1))], dim=-1) for sample in batch]    # list of [E_i, 2] - [weight, 0]
     edge_index_cc_list = [sample['edge_index_cc'] for sample in batch]      # list of [2, E_i]
     edge_attr_cc_list = [sample['edge_attr_cc'] for sample in batch]        # list of [E_i, 2] - [lr_score, lr_id]
+    lr_candidate_index_list = [sample['lr_candidate_index'] for sample in batch]
+    lr_candidate_attr_list = [sample['lr_candidate_attr'] for sample in batch]
     
     # ✅ 收集每个样本的实际 cell 节点数
     n_cells_list = [sample['n_cells'] for sample in batch]
@@ -940,6 +979,8 @@ def hetero_subgraph_collate_fn(batch):
         'edge_attr_like': edge_attr_like_list,    # list of [E_i]
         'edge_index_cc': edge_index_cc_list,      # list of [2, E_i]
         'edge_attr_cc': edge_attr_cc_list,        # list of [E_i]
+        'lr_candidate_index': lr_candidate_index_list,
+        'lr_candidate_attr': lr_candidate_attr_list,
     }
     
     return batch_dict
@@ -970,6 +1011,9 @@ def hetero_subgraph_collate_fn_batched(batch):
     edge_index_cc_parts = []
     edge_attr_cc_parts = []
     cc_edge_batch_parts = []
+    lr_candidate_index_parts = []
+    lr_candidate_attr_parts = []
+    lr_candidate_batch_parts = []
 
     for graph_id, (sample, n_spots_sub, n_cells, spot_off, cell_off) in enumerate(zip(
         batch, n_spots_sub_list, n_cells_list, spot_offsets, cell_offsets
@@ -1007,6 +1051,22 @@ def hetero_subgraph_collate_fn_batched(batch):
             if ea_cc.numel() > 0:
                 edge_attr_cc_parts.append(ea_cc)
 
+        candidate_index = sample['lr_candidate_index']
+        if candidate_index.numel() > 0:
+            src = (
+                candidate_index[0] - n_spots_sub + total_spots + cell_off
+            )
+            dst = (
+                candidate_index[1] - n_spots_sub + total_spots + cell_off
+            )
+            lr_candidate_index_parts.append(torch.stack([src, dst], dim=0))
+            lr_candidate_attr_parts.append(sample['lr_candidate_attr'])
+            lr_candidate_batch_parts.append(
+                torch.full(
+                    (candidate_index.size(1),), graph_id, dtype=torch.long
+                )
+            )
+
     edge_index_like = (
         torch.cat(edge_index_like_parts, dim=1)
         if edge_index_like_parts
@@ -1032,6 +1092,21 @@ def hetero_subgraph_collate_fn_batched(batch):
         if cc_edge_batch_parts
         else torch.empty((0,), dtype=torch.long)
     )
+    lr_candidate_index = (
+        torch.cat(lr_candidate_index_parts, dim=1)
+        if lr_candidate_index_parts
+        else torch.empty((2, 0), dtype=torch.long)
+    )
+    lr_candidate_attr = (
+        torch.cat(lr_candidate_attr_parts, dim=0)
+        if lr_candidate_attr_parts
+        else torch.empty((0, 2), dtype=torch.float32)
+    )
+    lr_candidate_batch = (
+        torch.cat(lr_candidate_batch_parts, dim=0)
+        if lr_candidate_batch_parts
+        else torch.empty((0,), dtype=torch.long)
+    )
 
     return {
         'batch_size': batch_size,
@@ -1044,4 +1119,7 @@ def hetero_subgraph_collate_fn_batched(batch):
         'edge_index_cc': edge_index_cc,
         'edge_attr_cc': edge_attr_cc,
         'cc_edge_batch': cc_edge_batch,
+        'lr_candidate_index': lr_candidate_index,
+        'lr_candidate_attr': lr_candidate_attr,
+        'lr_candidate_batch': lr_candidate_batch,
     }

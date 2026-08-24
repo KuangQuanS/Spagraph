@@ -16,6 +16,77 @@ from typing import Dict, List, Tuple, Optional, Any
 from .relation_ranker import calibrate_lr_statistics
 
 
+def evaluate_lr_candidate_scores(
+    records: List[Dict[str, Any]],
+    lr_id_to_pair: Dict[int, Tuple[str, str]],
+    output_dir: str,
+    min_ranking_edges: int = 10,
+) -> Optional[pd.DataFrame]:
+    """Write the canonical pair-specific LR ranking table.
+
+    A candidate may occur in several overlapping center-spot subgraphs. Exact
+    spatial/cell/LR events are deduplicated before pair statistics are formed.
+    The resulting neural score is produced by the LR candidate head rather
+    than copied from a shared aggregate communication edge.
+    """
+    if not records:
+        print("LR candidate stats: no candidate scores collected")
+        return None
+    frame = pd.DataFrame.from_records(records)
+    required = {
+        "src_spot_barcode", "dst_spot_barcode", "source_cell", "target_cell",
+        "lr_id", "lr_score", "candidate_logit",
+    }
+    missing = required.difference(frame.columns)
+    if missing:
+        raise ValueError(f"Missing LR candidate columns: {sorted(missing)}")
+
+    keys = [
+        "src_spot_barcode", "dst_spot_barcode", "source_cell", "target_cell",
+        "lr_id",
+    ]
+    unique = frame.groupby(keys, as_index=False).agg(
+        lr_score=("lr_score", "mean"),
+        candidate_logit=("candidate_logit", "mean"),
+        n_subgraph_occurrences=("candidate_logit", "size"),
+    )
+    unique["lr_pair"] = unique["lr_id"].map(
+        lambda value: "_".join(lr_id_to_pair.get(int(value), (f"lr_{int(value)}",)))
+    )
+    edge_path = os.path.join(output_dir, "lr_candidate_edge_statistics.csv")
+    unique.sort_values("candidate_logit", ascending=False).to_csv(
+        edge_path, index=False
+    )
+
+    pair_rows = []
+    for lr_pair, group in unique.groupby("lr_pair", sort=False):
+        scores = group["candidate_logit"].to_numpy(dtype=float)
+        pair_rows.append(
+            {
+                "lr_pair": lr_pair,
+                "supporting_unique_edges": len(group),
+                "associated_edge_attention_mean": float(scores.mean()),
+                "associated_edge_attention_median": float(np.median(scores)),
+                "associated_edge_attention_std": float(scores.std()),
+                "associated_edge_attention_min": float(scores.min()),
+                "associated_edge_attention_max": float(scores.max()),
+                "total_lr_score": float(group["lr_score"].sum()),
+                "n_source_spots": int(group["src_spot_barcode"].nunique()),
+                "n_target_spots": int(group["dst_spot_barcode"].nunique()),
+                "eligible_for_ranking": len(group) >= int(min_ranking_edges),
+                "score_source": "pair_specific_lr_candidate_head",
+            }
+        )
+    pair_df = calibrate_lr_statistics(pd.DataFrame(pair_rows))
+    pair_path = os.path.join(output_dir, "lr_pair_associated_edge_statistics.csv")
+    pair_df.to_csv(pair_path, index=False)
+    print(
+        "LR candidate stats: "
+        f"{pair_path} (events={len(unique)}, LR pairs={len(pair_df)})"
+    )
+    return pair_df
+
+
 def evaluate_cell_communication(
     all_cc_attention_scores: List[torch.Tensor],
     all_edge_index_cc: List[torch.Tensor],

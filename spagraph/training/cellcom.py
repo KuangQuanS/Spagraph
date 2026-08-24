@@ -87,7 +87,7 @@ def run_cellcom(
     output_dim: int = 128,
     lambda_mask_recon: float = 1.0,
     lambda_node_recon: float = 0.5,
-    lambda_relation_rank: float = 0.0,
+    lambda_relation_rank: float = 0.1,
     relation_rank_margin: float = 0.1,
     attention_threshold: float = 1.0,
     edge_mask_ratio: float = 0.2,
@@ -147,7 +147,8 @@ def run_cellcom(
         output_dim: Output dimension
         lambda_mask_recon: Mask reconstruction loss weight
         lambda_node_recon: Node reconstruction loss weight
-        lambda_relation_rank: Directed-relation ranking loss weight; 0 disables it
+        lambda_relation_rank: Joint directed relation ranking and LR candidate
+            contrastive loss weight; 0 disables both losses
         relation_rank_margin: Margin between observed and corrupted relation logits
         attention_threshold: Attention score threshold for edge filtering
         edge_mask_ratio: Edge mask ratio

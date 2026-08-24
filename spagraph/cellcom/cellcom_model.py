@@ -82,6 +82,83 @@ def pairwise_relation_ranking_loss(
         float(margin) - (positive_logits - negative_logits)
     ).mean()
 
+
+def sample_lr_candidate_negatives(
+    candidate_index: torch.Tensor,
+    candidate_attr: torch.Tensor,
+    candidate_batch: Optional[torch.Tensor] = None,
+    generator: Optional[torch.Generator] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Create matched corruptions for pair-specific LR candidates.
+
+    Direction reversal and within-subgraph receiver swaps inherit the positive
+    candidate's expression score and LR identity. Consequently the scorer
+    cannot solve the task from the LR score alone. Only exact observed
+    ``(source, target, LR)`` triples and self loops are removed.
+    """
+    n_candidates = int(candidate_index.size(1))
+    if n_candidates == 0:
+        return (
+            candidate_index.new_empty((2, 0)),
+            candidate_attr.new_empty((0, candidate_attr.size(-1))),
+            candidate_index.new_empty((0,)),
+        )
+    if candidate_attr.ndim != 2 or candidate_attr.size(0) != n_candidates:
+        raise ValueError("candidate_attr must have one row per LR candidate")
+    if candidate_attr.size(1) < 2:
+        raise ValueError("candidate_attr must contain score and LR identity")
+
+    if candidate_batch is None:
+        candidate_batch = candidate_index.new_zeros(n_candidates)
+    else:
+        candidate_batch = candidate_batch.to(
+            device=candidate_index.device, dtype=torch.long
+        )
+    if candidate_batch.numel() != n_candidates:
+        raise ValueError("candidate_batch must have one entry per LR candidate")
+
+    src, dst = candidate_index
+    negative_parts = [torch.stack([dst, src], dim=0)]
+    attr_parts = [candidate_attr]
+    positive_parts = [torch.arange(n_candidates, device=candidate_index.device)]
+
+    for graph_id in torch.unique(candidate_batch, sorted=True):
+        indices = torch.nonzero(
+            candidate_batch == graph_id, as_tuple=False
+        ).flatten()
+        if indices.numel() < 2:
+            continue
+        permutation = torch.randperm(
+            indices.numel(), device=candidate_index.device, generator=generator
+        )
+        negative_parts.append(
+            torch.stack([src[indices], dst[indices[permutation]]], dim=0)
+        )
+        attr_parts.append(candidate_attr[indices])
+        positive_parts.append(indices)
+
+    negative_index = torch.cat(negative_parts, dim=1)
+    negative_attr = torch.cat(attr_parts, dim=0)
+    positive_indices = torch.cat(positive_parts, dim=0)
+
+    n_nodes = max(int(candidate_index.max().item()) + 1, 1)
+    lr_ids = candidate_attr[:, 1].long().clamp_min(0)
+    negative_lr_ids = negative_attr[:, 1].long().clamp_min(0)
+    n_relations = max(
+        int(torch.cat([lr_ids, negative_lr_ids]).max().item()) + 1, 1
+    )
+    positive_hash = ((src * n_nodes + dst) * n_relations) + lr_ids
+    negative_hash = (
+        (negative_index[0] * n_nodes + negative_index[1]) * n_relations
+    ) + negative_lr_ids
+    valid = negative_index[0].ne(negative_index[1])
+    valid &= ~torch.isin(negative_hash, positive_hash)
+    return (
+        negative_index[:, valid],
+        negative_attr[valid],
+        positive_indices[valid],
+    )
+
 class EdgeAttentionLayer(nn.Module):
     """基于边特征的注意力层 - 简化版Edge Attention"""
 
@@ -375,7 +452,8 @@ class HeteroSTModel(nn.Module):
                  image_dim: int = None, fusion_dim: int = 256, 
                  gat_hidden_dims: list = None,
                  gat_heads: int = 4, gat_dropout: float = 0.1,
-                 output_dim: int = 64, n_celltypes: int = None):
+                 output_dim: int = 64, n_celltypes: int = None,
+                 n_lr_pairs: int = 1, lr_candidate_emb_dim: int = 16):
         super().__init__()
         
         if gat_hidden_dims is None:
@@ -385,6 +463,8 @@ class HeteroSTModel(nn.Module):
         self.mlp_latent_dim = mlp_latent_dim
         self.output_dim = output_dim
         self.gat_hidden_dims = gat_hidden_dims
+        self.n_lr_pairs = max(int(n_lr_pairs), 1)
+        self.lr_candidate_emb_dim = int(lr_candidate_emb_dim)
         self.node_recon_head = nn.Linear(output_dim, n_genes)
         
         # ✅ Mask Token (既然要Mask，就用个Learnable Token，显得高级)
@@ -439,6 +519,18 @@ class HeteroSTModel(nn.Module):
             nn.Dropout(gat_dropout),
             nn.Linear(gat_hidden_dims[-1], 1)
         )
+        self.lr_candidate_embedding = nn.Embedding(
+            self.n_lr_pairs + 1, self.lr_candidate_emb_dim
+        )
+        candidate_input_dim = (
+            2 * gat_hidden_dims[-1] + 1 + self.lr_candidate_emb_dim
+        )
+        self.lr_candidate_scorer = nn.Sequential(
+            nn.Linear(candidate_input_dim, gat_hidden_dims[-1]),
+            nn.ReLU(),
+            nn.Dropout(gat_dropout),
+            nn.Linear(gat_hidden_dims[-1], 1),
+        )
         
         # ✅ 去掉双头架构：边存在性判别器 + 边强度回归器
         # 边存在性判别器（用于识别假阳性边）
@@ -473,7 +565,10 @@ class HeteroSTModel(nn.Module):
                 return_relation_loss: bool = False,
                 relation_edge_batch: Optional[torch.Tensor] = None,
                 relation_rank_margin: float = 0.1,
-                relation_generator: Optional[torch.Generator] = None) -> Tuple:
+                relation_generator: Optional[torch.Generator] = None,
+                lr_candidate_index: Optional[torch.Tensor] = None,
+                lr_candidate_attr: Optional[torch.Tensor] = None,
+                lr_candidate_batch: Optional[torch.Tensor] = None) -> Tuple:
         """
         Args:
             expr_raw: [k+1, n_genes] 原始Spot基因表达量
@@ -691,6 +786,22 @@ class HeteroSTModel(nn.Module):
         combined_feat = torch.cat([spatial_repr, comm_repr], dim=-1)  # [n_nodes, hidden_dim*2]
         combined = self.fusion_layer(combined_feat)  # [n_nodes, hidden_dim]
 
+        if (
+            return_relation_loss
+            and lr_candidate_index is not None
+            and lr_candidate_attr is not None
+            and lr_candidate_index.size(1) > 0
+        ):
+            candidate_loss = self.compute_lr_candidate_contrastive_loss(
+                node_repr=combined,
+                candidate_index=lr_candidate_index,
+                candidate_attr=lr_candidate_attr,
+                candidate_batch=lr_candidate_batch,
+                margin=relation_rank_margin,
+                generator=relation_generator,
+            )
+            relation_rank_loss = relation_rank_loss + candidate_loss
+
         # 输出投影
         repr_out = self.output_proj(combined)  # [n_spots+n_cells_total, output_dim]
 
@@ -715,6 +826,60 @@ class HeteroSTModel(nn.Module):
         if return_relation_loss:
             return outputs + (relation_rank_loss,)
         return outputs
+
+    def score_lr_candidates(
+        self,
+        node_repr: torch.Tensor,
+        candidate_index: torch.Tensor,
+        candidate_attr: torch.Tensor,
+    ) -> torch.Tensor:
+        """Score LR candidates after shared GAT message passing."""
+        if candidate_index.size(1) == 0:
+            return node_repr.new_empty((0,))
+        if candidate_attr.ndim != 2 or candidate_attr.size(1) < 2:
+            raise ValueError("candidate_attr must contain score and LR identity")
+        src_repr = node_repr[candidate_index[0]]
+        dst_repr = node_repr[candidate_index[1]]
+        score = candidate_attr[:, :1].to(dtype=node_repr.dtype)
+        lr_ids = candidate_attr[:, 1].long().clamp(
+            min=0, max=self.n_lr_pairs
+        )
+        lr_embedding = self.lr_candidate_embedding(lr_ids)
+        features = torch.cat(
+            [src_repr, dst_repr, score, lr_embedding], dim=-1
+        )
+        return self.lr_candidate_scorer(features).squeeze(-1)
+
+    def compute_lr_candidate_contrastive_loss(
+        self,
+        node_repr: torch.Tensor,
+        candidate_index: torch.Tensor,
+        candidate_attr: torch.Tensor,
+        candidate_batch: Optional[torch.Tensor] = None,
+        margin: float = 0.1,
+        generator: Optional[torch.Generator] = None,
+    ) -> torch.Tensor:
+        negative_index, negative_attr, positive_indices = (
+            sample_lr_candidate_negatives(
+                candidate_index,
+                candidate_attr,
+                candidate_batch=candidate_batch,
+                generator=generator,
+            )
+        )
+        if positive_indices.numel() == 0:
+            return node_repr.sum() * 0.0
+        positive_logits = self.score_lr_candidates(
+            node_repr, candidate_index, candidate_attr
+        )
+        negative_logits = self.score_lr_candidates(
+            node_repr, negative_index, negative_attr
+        )
+        return pairwise_relation_ranking_loss(
+            positive_logits[positive_indices],
+            negative_logits,
+            margin=margin,
+        )
 
 
 # ==================== 辅助方法 ====================

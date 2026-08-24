@@ -21,11 +21,118 @@ from spagraph.cellcom.cellcom import degree_scale_attention
 from spagraph.cellcom.cellcom_model import (
     HeteroSTModel,
     pairwise_relation_ranking_loss,
+    sample_lr_candidate_negatives,
     sample_relation_negatives,
+)
+from spagraph.cellcom.cellcom_evaluate import evaluate_lr_candidate_scores
+from spagraph.cellcom.cellcom_graph_builder import hetero_subgraph_collate_fn_batched
+from spagraph.cellcom.lr_scores import (
+    _build_valid_lr_pairs,
+    _geometric_mean_expression,
 )
 
 
 class CalibrationTests(unittest.TestCase):
+    def test_complex_expression_is_library_size_invariant(self):
+        baseline = _geometric_mean_expression(
+            np.array([10.0, 40.0, 50.0]), (0, 1), 100.0
+        )
+        scaled = _geometric_mean_expression(
+            np.array([100.0, 400.0, 500.0]), (0, 1), 1000.0
+        )
+        self.assertAlmostEqual(baseline, scaled)
+
+    def test_valid_lr_pairs_require_all_ligand_and_receptor_subunits(self):
+        pairs, by_ligand = _build_valid_lr_pairs(
+            [("L1_L2", "R1_R2"), ("L1_MISSING", "R1")],
+            {"L1": 0, "L2": 1, "R1": 2, "R2": 3},
+        )
+        self.assertEqual(pairs, [((0, 1), (2, 3), "L1_L2", "R1_R2")])
+        self.assertEqual(by_ligand[0], pairs)
+
+    def test_lr_candidate_negatives_preserve_identity_without_false_negatives(self):
+        candidate_index = torch.tensor([[0, 2, 4], [1, 3, 5]])
+        candidate_attr = torch.tensor([[1.0, 1.0], [2.0, 2.0], [3.0, 1.0]])
+        batch = torch.tensor([0, 0, 1])
+        negatives, attrs, positives = sample_lr_candidate_negatives(
+            candidate_index,
+            candidate_attr,
+            candidate_batch=batch,
+            generator=torch.Generator().manual_seed(3),
+        )
+        observed = {
+            (int(src), int(dst), int(lr_id))
+            for (src, dst), lr_id in zip(
+                candidate_index.t().tolist(), candidate_attr[:, 1].tolist()
+            )
+        }
+        for (src, dst), lr_id in zip(negatives.t().tolist(), attrs[:, 1].tolist()):
+            self.assertNotIn((int(src), int(dst), int(lr_id)), observed)
+        self.assertTrue(torch.equal(attrs[:, 1], candidate_attr[positives, 1]))
+
+    def test_candidate_head_backpropagates_after_shared_gat(self):
+        model = HeteroSTModel(
+            n_genes=3, n_celltypes=2, n_lr_pairs=2,
+            mlp_latent_dim=4, mlp_hidden_dims=[4], gat_hidden_dims=[4],
+            gat_heads=1, gat_dropout=0.0, output_dim=4,
+        )
+        model.train()
+        outputs = model(
+            expr_raw=torch.rand(2, 3),
+            cell_expr_raw=torch.rand(4, 3),
+            edge_index_like=torch.empty((2, 0), dtype=torch.long),
+            edge_attr_like=torch.empty((0, 2)),
+            edge_index_cc=torch.tensor([[2, 4], [3, 5]]),
+            edge_attr_cc=torch.tensor([[1.0], [2.0]]),
+            return_relation_loss=True,
+            edge_mask_ratio=0.0,
+            node_mask_ratio=0.0,
+            lr_candidate_index=torch.tensor([[2, 4], [3, 5]]),
+            lr_candidate_attr=torch.tensor([[1.0, 1.0], [2.0, 2.0]]),
+            relation_generator=torch.Generator().manual_seed(5),
+        )
+        outputs[-1].backward()
+        grad = model.lr_candidate_scorer[-1].weight.grad
+        self.assertIsNotNone(grad)
+        self.assertGreater(float(grad.abs().sum()), 0.0)
+
+    def test_batched_collate_offsets_lr_candidate_nodes(self):
+        def sample(score, lr_id):
+            return {
+                "n_spots_sub": 1, "n_cells": 2,
+                "expr_raw": torch.zeros((1, 3)),
+                "cell_expr_raw": torch.zeros((2, 3)),
+                "edge_index_like": torch.empty((2, 0), dtype=torch.long),
+                "edge_attr_like": torch.empty((0,)),
+                "edge_index_cc": torch.tensor([[1], [2]]),
+                "edge_attr_cc": torch.tensor([[score, lr_id]]),
+                "lr_candidate_index": torch.tensor([[1], [2]]),
+                "lr_candidate_attr": torch.tensor([[score, lr_id]]),
+            }
+        batch = hetero_subgraph_collate_fn_batched([sample(1.0, 1.0), sample(2.0, 2.0)])
+        self.assertTrue(torch.equal(batch["lr_candidate_index"], torch.tensor([[2, 4], [3, 5]])))
+        self.assertTrue(torch.equal(batch["lr_candidate_batch"], torch.tensor([0, 1])))
+
+    def test_candidate_evaluator_writes_pair_specific_canonical_table(self):
+        records = []
+        for idx in range(10):
+            for lr_id, logit in ((1, 0.2), (2, 1.2)):
+                records.append({
+                    "src_spot_barcode": f"s{idx}", "dst_spot_barcode": f"t{idx}",
+                    "source_cell": "A", "target_cell": "B", "lr_id": lr_id,
+                    "lr_score": 2.0, "candidate_logit": logit,
+                })
+        with tempfile.TemporaryDirectory() as tmp:
+            ranked = evaluate_lr_candidate_scores(
+                records, {1: ("L1", "R1"), 2: ("L2", "R2")}, tmp
+            ).set_index("lr_pair")
+            self.assertEqual(ranked.loc["L2_R2", "score_source"], "pair_specific_lr_candidate_head")
+            self.assertGreater(
+                ranked.loc["L2_R2", "neural_attention_score"],
+                ranked.loc["L1_R1", "neural_attention_score"],
+            )
+            self.assertTrue((Path(tmp) / "lr_candidate_edge_statistics.csv").exists())
+
     def test_public_api_rejects_negative_relation_loss_weight(self):
         with self.assertRaisesRegex(ValueError, "lambda_relation_rank"):
             run_cellcom(

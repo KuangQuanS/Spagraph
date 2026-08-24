@@ -39,12 +39,29 @@ def _scalar(x):
 
 def _unpack_cellcom_outputs(outputs):
     """Keep legacy nine-item model outputs compatible with optional rank loss."""
-    if len(outputs) == 10:
+    if len(outputs) == 12:
         return outputs
+    if len(outputs) == 10:
+        zero = outputs[0].sum() * 0.0
+        return outputs + (zero, zero)
     if len(outputs) != 9:
         raise ValueError(f"Unexpected HeteroSTModel output length: {len(outputs)}")
     zero = outputs[0].sum() * 0.0
-    return outputs + (zero,)
+    return outputs + (zero, zero, zero)
+
+
+def _aggregate_reconstruction_loss(
+    prediction: torch.Tensor,
+    raw_target: torch.Tensor,
+    transform: str,
+) -> torch.Tensor:
+    """Match reconstruction loss to the aggregate score representation."""
+    if transform == "log1p":
+        target = torch.log1p(raw_target.clamp_min(0))
+        return torch.nn.functional.smooth_l1_loss(prediction, target)
+    if transform == "raw":
+        return torch.nn.functional.mse_loss(prediction, raw_target)
+    raise ValueError("aggregate_score_transform must be 'raw' or 'log1p'")
 
 
 def degree_scale_attention(attention: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
@@ -99,8 +116,14 @@ def _print_stage3_header(args, device: torch.device):
     )
     print(f"Mask Seed:          {args.mask_seed}")
     print('Aggregate LR ID:    excluded; candidate output head enabled')
+    print(f"Aggregate Scores:   {getattr(args, 'aggregate_score_transform', 'raw')}")
+    print(f"Candidate Negatives:{getattr(args, 'candidate_negative_mode', 'graph')}")
+    print(f"Candidate Ranking:  {getattr(args, 'candidate_score_mode', 'absolute')}")
     if getattr(args, "early_stop_patience", 0) > 0:
-        print(f"Early Stop:         patience={args.early_stop_patience}, min_delta={args.early_stop_min_delta}")
+        print(
+            f"Early Stop:         metric={getattr(args, 'early_stop_metric', 'total')}, "
+            f"patience={args.early_stop_patience}, min_delta={args.early_stop_min_delta}"
+        )
     else:
         print("Early Stop:         Disabled")
     print(f"Seed:               {args.seed}")
@@ -170,6 +193,9 @@ def parse_args():
         '--relation_rank_margin', type=float, default=0.1,
         help='Margin for observed-vs-corrupted communication relation ranking',
     )
+    parser.add_argument('--candidate_negative_mode', choices=['graph', 'lr_matched'], default='graph')
+    parser.add_argument('--candidate_score_mode', choices=['absolute', 'gap'], default='absolute')
+    parser.add_argument('--aggregate_score_transform', choices=['raw', 'log1p'], default='raw')
     parser.add_argument('--attention_threshold', type=float, default=1,
                        help='注意力得分阈值，用于过滤边 (default: 0)')
     parser.add_argument('--export_unified_csv', type=lambda x: str(x).lower() == 'true', default=False,
@@ -194,6 +220,7 @@ def parse_args():
                        help='验证集比例 (default: 0.1，即10%%作为验证集)')
     parser.add_argument('--early_stop_patience', type=int, default=10, help='早停patience，0表示不使用早停 (default: 0)')
     parser.add_argument('--early_stop_min_delta', type=float, default=0.1, help='早停最小改善阈值 (default: 0.0001)')
+    parser.add_argument('--early_stop_metric', choices=['total', 'relation_rank'], default='total')
     
     return parser.parse_args()
 
@@ -496,6 +523,7 @@ def main(args=None):
         output_dim=args.output_dim,
         n_celltypes=n_cells,
         n_lr_pairs=max(len(dataset.lr_id_to_pair), 1),
+        aggregate_score_transform=getattr(args, 'aggregate_score_transform', 'raw'),
     ).to(device)
     
     optimizer = torch.optim.Adam(
@@ -517,6 +545,10 @@ def main(args=None):
     val_node_losses = []
     train_relation_rank_losses = []
     val_relation_rank_losses = []
+    train_aggregate_relation_losses = []
+    val_aggregate_relation_losses = []
+    train_candidate_losses = []
+    val_candidate_losses = []
     learning_rates = []
     
     # ========== 阶段4：训练循环 ==========
@@ -528,16 +560,24 @@ def main(args=None):
     
     # 主训练早停参数
     best_val_metric = float('inf')
+    best_state_dict = None
+    best_epoch = None
     patience_counter = 0
     early_stop_patience = args.early_stop_patience
     early_stop_min_delta = args.early_stop_min_delta
     lambda_relation_rank = float(getattr(args, 'lambda_relation_rank', 0.0))
     relation_rank_margin = float(getattr(args, 'relation_rank_margin', 0.1))
+    candidate_negative_mode = getattr(args, 'candidate_negative_mode', 'graph')
+    aggregate_score_transform = getattr(args, 'aggregate_score_transform', 'raw')
+    early_stop_metric = getattr(args, 'early_stop_metric', 'total')
     if lambda_relation_rank < 0 or relation_rank_margin < 0:
         raise ValueError("relation ranking weight and margin must be non-negative")
     
     if early_stop_patience > 0:
-        print(f"Early stop:         patience={early_stop_patience}, min_delta={early_stop_min_delta}")
+        print(
+            f"Early stop:         metric={early_stop_metric}, "
+            f"patience={early_stop_patience}, min_delta={early_stop_min_delta}"
+        )
     else:
         print("Early stop:         Disabled")
     
@@ -564,6 +604,8 @@ def main(args=None):
         total_train_mask = 0.0
         total_train_node = 0.0
         total_train_relation_rank = 0.0
+        total_train_aggregate_relation = 0.0
+        total_train_candidate = 0.0
         processed_train_batches = 0
         
         for batch_idx, batch in enumerate(train_dataloader, 1):
@@ -584,6 +626,8 @@ def main(args=None):
                 batch_mask = 0.0
                 batch_node = 0.0
                 batch_relation_rank = 0.0
+                batch_aggregate_relation = 0.0
+                batch_candidate = 0.0
 
                 for b in range(batch_size):
                     expr_raw = batch['expr_raw'][b].to(device, non_blocking=pin_memory)
@@ -614,17 +658,23 @@ def main(args=None):
                         relation_rank_margin=relation_rank_margin,
                         lr_candidate_index=lr_candidate_index,
                         lr_candidate_attr=lr_candidate_attr,
+                        candidate_negative_mode=candidate_negative_mode,
+                        return_relation_components=True,
                     )
                     (
                         _, _, _, _, cc_attention, predicted_masked_edges,
                         edge_mask, node_recon_pred, node_mask, relation_rank_loss,
+                        aggregate_relation_loss, candidate_loss,
                     ) = _unpack_cellcom_outputs(model_outputs)
 
                     mask_recon_loss = 0.0
                     if edge_mask is not None and edge_mask.any() and predicted_masked_edges is not None:
                         target_scores = edge_attr_cc[:, 0][edge_mask]
                         if target_scores.numel() > 0:
-                            mask_recon_loss = torch.nn.functional.mse_loss(predicted_masked_edges, target_scores)
+                            mask_recon_loss = _aggregate_reconstruction_loss(
+                                predicted_masked_edges, target_scores,
+                                aggregate_score_transform,
+                            )
 
                     node_recon_loss = 0.0
                     if node_recon_pred is not None and node_mask is not None and node_mask.any():
@@ -643,11 +693,15 @@ def main(args=None):
                     batch_mask += mask_recon_loss
                     batch_node += node_recon_loss
                     batch_relation_rank += relation_rank_loss
+                    batch_aggregate_relation += aggregate_relation_loss
+                    batch_candidate += candidate_loss
 
                 avg_batch_loss = batch_loss / batch_size
                 avg_batch_mask = batch_mask / batch_size
                 avg_batch_node = batch_node / batch_size
                 avg_batch_relation_rank = batch_relation_rank / batch_size
+                avg_batch_aggregate_relation = batch_aggregate_relation / batch_size
+                avg_batch_candidate = batch_candidate / batch_size
             else:
                 # 真正 batch 化（disjoint-union 大图），只前向/反向一次
                 expr_raw = batch['expr_raw'].to(device, non_blocking=pin_memory)
@@ -684,17 +738,23 @@ def main(args=None):
                     lr_candidate_batch=batch['lr_candidate_batch'].to(
                         device, non_blocking=pin_memory
                     ),
+                    candidate_negative_mode=candidate_negative_mode,
+                    return_relation_components=True,
                 )
                 (
                     _, _, _, _, cc_attention, predicted_masked_edges,
                     edge_mask, node_recon_pred, node_mask, relation_rank_loss,
+                    aggregate_relation_loss, candidate_loss,
                 ) = _unpack_cellcom_outputs(model_outputs)
 
                 mask_recon_loss = 0.0
                 if edge_mask is not None and edge_mask.any() and predicted_masked_edges is not None:
                     target_scores = edge_attr_cc[:, 0][edge_mask]
                     if target_scores.numel() > 0:
-                        mask_recon_loss = torch.nn.functional.mse_loss(predicted_masked_edges, target_scores)
+                        mask_recon_loss = _aggregate_reconstruction_loss(
+                            predicted_masked_edges, target_scores,
+                            aggregate_score_transform,
+                        )
 
                 node_recon_loss = 0.0
                 if node_recon_pred is not None and node_mask is not None and node_mask.any():
@@ -711,6 +771,8 @@ def main(args=None):
                     + lambda_relation_rank * relation_rank_loss
                 )
                 avg_batch_relation_rank = relation_rank_loss
+                avg_batch_aggregate_relation = aggregate_relation_loss
+                avg_batch_candidate = candidate_loss
 
             # 反向传播
             optimizer.zero_grad()
@@ -722,6 +784,8 @@ def main(args=None):
             total_train_mask += _scalar(avg_batch_mask)
             total_train_node += _scalar(avg_batch_node)
             total_train_relation_rank += _scalar(avg_batch_relation_rank)
+            total_train_aggregate_relation += _scalar(avg_batch_aggregate_relation)
+            total_train_candidate += _scalar(avg_batch_candidate)
             processed_train_batches += 1
         
         # ========== 验证阶段 ==========
@@ -730,6 +794,8 @@ def main(args=None):
         total_val_mask = 0.0
         total_val_node = 0.0
         total_val_relation_rank = 0.0
+        total_val_aggregate_relation = 0.0
+        total_val_candidate = 0.0
         processed_val_batches = 0
         
         with torch.no_grad():
@@ -742,6 +808,8 @@ def main(args=None):
                     batch_mask = 0.0
                     batch_node = 0.0
                     batch_relation_rank = 0.0
+                    batch_aggregate_relation = 0.0
+                    batch_candidate = 0.0
 
                     for b in range(batch_size):
                         expr_raw = batch['expr_raw'][b].to(device, non_blocking=pin_memory)
@@ -773,18 +841,24 @@ def main(args=None):
                             relation_generator=val_mask_gen,
                             lr_candidate_index=lr_candidate_index,
                             lr_candidate_attr=lr_candidate_attr,
+                            candidate_negative_mode=candidate_negative_mode,
+                            return_relation_components=True,
                         )
                         (
                             _, _, _, _, _, predicted_masked_edges,
                             edge_mask, node_recon_pred, node_mask,
-                            relation_rank_loss,
+                            relation_rank_loss, aggregate_relation_loss,
+                            candidate_loss,
                         ) = _unpack_cellcom_outputs(model_outputs)
 
                         mask_recon_loss = 0.0
                         if edge_mask is not None and edge_mask.any() and predicted_masked_edges is not None:
                             target_scores = edge_attr_cc[:, 0][edge_mask]
                             if target_scores.numel() > 0:
-                                mask_recon_loss = torch.nn.functional.mse_loss(predicted_masked_edges, target_scores)
+                                mask_recon_loss = _aggregate_reconstruction_loss(
+                                    predicted_masked_edges, target_scores,
+                                    aggregate_score_transform,
+                                )
 
                         node_recon_loss = 0.0
                         if node_recon_pred is not None and node_mask is not None and node_mask.any():
@@ -803,11 +877,15 @@ def main(args=None):
                         batch_mask += mask_recon_loss
                         batch_node += node_recon_loss
                         batch_relation_rank += relation_rank_loss
+                        batch_aggregate_relation += aggregate_relation_loss
+                        batch_candidate += candidate_loss
 
                     avg_batch_loss = batch_loss / batch_size
                     avg_batch_mask = batch_mask / batch_size
                     avg_batch_node = batch_node / batch_size
                     avg_batch_relation_rank = batch_relation_rank / batch_size
+                    avg_batch_aggregate_relation = batch_aggregate_relation / batch_size
+                    avg_batch_candidate = batch_candidate / batch_size
                 else:
                     expr_raw = batch['expr_raw'].to(device, non_blocking=pin_memory)
                     cell_expr_raw = batch['cell_expr_raw'].to(device, non_blocking=pin_memory)
@@ -844,18 +922,24 @@ def main(args=None):
                         lr_candidate_batch=batch['lr_candidate_batch'].to(
                             device, non_blocking=pin_memory
                         ),
+                        candidate_negative_mode=candidate_negative_mode,
+                        return_relation_components=True,
                     )
                     (
                         _, _, _, _, _, predicted_masked_edges,
                         edge_mask, node_recon_pred, node_mask,
-                        relation_rank_loss,
+                        relation_rank_loss, aggregate_relation_loss,
+                        candidate_loss,
                     ) = _unpack_cellcom_outputs(model_outputs)
 
                     avg_batch_mask = 0.0
                     if edge_mask is not None and edge_mask.any() and predicted_masked_edges is not None:
                         target_scores = edge_attr_cc[:, 0][edge_mask]
                         if target_scores.numel() > 0:
-                            avg_batch_mask = torch.nn.functional.mse_loss(predicted_masked_edges, target_scores)
+                            avg_batch_mask = _aggregate_reconstruction_loss(
+                                predicted_masked_edges, target_scores,
+                                aggregate_score_transform,
+                            )
 
                     avg_batch_node = 0.0
                     if node_recon_pred is not None and node_mask is not None and node_mask.any():
@@ -870,11 +954,15 @@ def main(args=None):
                         + lambda_relation_rank * relation_rank_loss
                     )
                     avg_batch_relation_rank = relation_rank_loss
+                    avg_batch_aggregate_relation = aggregate_relation_loss
+                    avg_batch_candidate = candidate_loss
 
                 total_val_loss += _scalar(avg_batch_loss)
                 total_val_mask += _scalar(avg_batch_mask)
                 total_val_node += _scalar(avg_batch_node)
                 total_val_relation_rank += _scalar(avg_batch_relation_rank)
+                total_val_aggregate_relation += _scalar(avg_batch_aggregate_relation)
+                total_val_candidate += _scalar(avg_batch_candidate)
                 processed_val_batches += 1
         
         # 计算epoch平均损失
@@ -886,6 +974,10 @@ def main(args=None):
         avg_val_node = total_val_node / processed_val_batches if processed_val_batches > 0 else 0
         avg_train_relation_rank = total_train_relation_rank / processed_train_batches if processed_train_batches > 0 else 0
         avg_val_relation_rank = total_val_relation_rank / processed_val_batches if processed_val_batches > 0 else 0
+        avg_train_aggregate_relation = total_train_aggregate_relation / processed_train_batches if processed_train_batches > 0 else 0
+        avg_val_aggregate_relation = total_val_aggregate_relation / processed_val_batches if processed_val_batches > 0 else 0
+        avg_train_candidate = total_train_candidate / processed_train_batches if processed_train_batches > 0 else 0
+        avg_val_candidate = total_val_candidate / processed_val_batches if processed_val_batches > 0 else 0
         
         train_losses.append(avg_train_loss)
         val_losses.append(avg_val_loss)
@@ -895,6 +987,10 @@ def main(args=None):
         val_node_losses.append(avg_val_node)
         train_relation_rank_losses.append(avg_train_relation_rank)
         val_relation_rank_losses.append(avg_val_relation_rank)
+        train_aggregate_relation_losses.append(avg_train_aggregate_relation)
+        val_aggregate_relation_losses.append(avg_val_aggregate_relation)
+        train_candidate_losses.append(avg_train_candidate)
+        val_candidate_losses.append(avg_val_candidate)
         learning_rates.append(float(optimizer.param_groups[0]['lr']))
         
         # 每个epoch结束时更新学习率调度器
@@ -902,17 +998,25 @@ def main(args=None):
         
         # ========== 早停检查 ==========
         if early_stop_patience > 0 and processed_val_batches > 0:
-            # 监控指标：验证总loss
-            val_metric = avg_val_loss
+            val_metric = (
+                avg_val_relation_rank
+                if early_stop_metric == 'relation_rank'
+                else avg_val_loss
+            )
             if val_metric < best_val_metric - early_stop_min_delta:
                 best_val_metric = val_metric
                 patience_counter = 0
+                best_epoch = epoch + 1
+                best_state_dict = {
+                    key: value.detach().cpu().clone()
+                    for key, value in model.state_dict().items()
+                }
             else:
                 patience_counter += 1
                 
             if patience_counter >= early_stop_patience:
                 print(
-                    f"Early stop triggered: val loss not improved for {early_stop_patience} epochs "
+                    f"Early stop triggered: val {early_stop_metric} did not improve for {early_stop_patience} epochs "
                     f"(best={best_val_metric:.6f}, current={val_metric:.6f})"
                 )
                 break
@@ -924,6 +1028,13 @@ def main(args=None):
             'Train_Mask': f'{avg_train_mask:.4f}',
             'Train_Node': f'{avg_train_node:.4f}',
         })
+    if best_state_dict is not None:
+        model.load_state_dict(best_state_dict)
+        print(
+            f"Restored checkpoint: epoch={best_epoch}, "
+            f"val_{early_stop_metric}={best_val_metric:.6f}"
+        )
+
     training_history_path = os.path.join(args.output_dir, "training_history.csv")
     training_history_df = pd.DataFrame(
         {
@@ -936,6 +1047,10 @@ def main(args=None):
             "val_node_loss": val_node_losses,
             "train_relation_rank_loss": train_relation_rank_losses,
             "val_relation_rank_loss": val_relation_rank_losses,
+            "train_aggregate_relation_loss": train_aggregate_relation_losses,
+            "val_aggregate_relation_loss": val_aggregate_relation_losses,
+            "train_candidate_loss": train_candidate_losses,
+            "val_candidate_loss": val_candidate_losses,
             "learning_rate": learning_rates,
         }
     )
@@ -996,9 +1111,28 @@ def main(args=None):
                     node_mask_ratio=0.0
                 )
 
-                candidate_logits = model.score_lr_candidates(
-                    combined, lr_candidate_index, lr_candidate_attr
-                )
+                candidate_score_mode = getattr(args, 'candidate_score_mode', 'absolute')
+                if candidate_score_mode == 'gap':
+                    candidate_generator = torch.Generator(device=device).manual_seed(
+                        int(args.mask_seed) + int(processed_eval_batches) * 1009 + b
+                    )
+                    candidate_logits, candidate_gaps, candidate_control_counts = (
+                        model.score_lr_candidate_contrastive_gaps(
+                            combined,
+                            lr_candidate_index,
+                            lr_candidate_attr,
+                            generator=candidate_generator,
+                            negative_mode=getattr(
+                                args, 'candidate_negative_mode', 'lr_matched'
+                            ),
+                        )
+                    )
+                else:
+                    candidate_logits = model.score_lr_candidates(
+                        combined, lr_candidate_index, lr_candidate_attr
+                    )
+                    candidate_gaps = torch.full_like(candidate_logits, float('nan'))
+                    candidate_control_counts = torch.zeros_like(candidate_logits)
                 spot_cell_mapping = batch['spot_cell_mapping'][b]
                 cell_node_to_spot_cell = {
                     cell_node: (spot_local, cell_type)
@@ -1020,6 +1154,10 @@ def main(args=None):
                             'lr_id': int(lr_candidate_attr[candidate_idx, 1].item()),
                             'lr_score': float(lr_candidate_attr[candidate_idx, 0].item()),
                             'candidate_logit': float(candidate_logits[candidate_idx].item()),
+                            'candidate_gap': float(candidate_gaps[candidate_idx].item()),
+                            'n_matched_controls': int(
+                                candidate_control_counts[candidate_idx].item()
+                            ),
                         }
                     )
                 
@@ -1114,6 +1252,11 @@ def main(args=None):
         records=all_lr_candidate_records,
         lr_id_to_pair=dataset.lr_id_to_pair,
         output_dir=args.output_dir,
+        score_column=(
+            'candidate_gap'
+            if getattr(args, 'candidate_score_mode', 'absolute') == 'gap'
+            else 'candidate_logit'
+        ),
     )
     
     # 绘制损失曲线

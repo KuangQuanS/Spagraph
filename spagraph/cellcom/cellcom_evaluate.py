@@ -21,6 +21,7 @@ def evaluate_lr_candidate_scores(
     lr_id_to_pair: Dict[int, Tuple[str, str]],
     output_dir: str,
     min_ranking_edges: int = 10,
+    score_column: str = "candidate_logit",
 ) -> Optional[pd.DataFrame]:
     """Write the canonical pair-specific LR ranking table.
 
@@ -35,7 +36,7 @@ def evaluate_lr_candidate_scores(
     frame = pd.DataFrame.from_records(records)
     required = {
         "src_spot_barcode", "dst_spot_barcode", "source_cell", "target_cell",
-        "lr_id", "lr_score", "candidate_logit",
+        "lr_id", "lr_score", score_column,
     }
     missing = required.difference(frame.columns)
     if missing:
@@ -45,26 +46,32 @@ def evaluate_lr_candidate_scores(
         "src_spot_barcode", "dst_spot_barcode", "source_cell", "target_cell",
         "lr_id",
     ]
-    unique = frame.groupby(keys, as_index=False).agg(
-        lr_score=("lr_score", "mean"),
-        candidate_logit=("candidate_logit", "mean"),
-        n_subgraph_occurrences=("candidate_logit", "size"),
-    )
+    aggregation = {
+        "lr_score": ("lr_score", "mean"),
+        score_column: (score_column, "mean"),
+        "n_subgraph_occurrences": (score_column, "count"),
+    }
+    if "n_matched_controls" in frame.columns:
+        aggregation["n_matched_controls"] = ("n_matched_controls", "sum")
+    unique = frame.groupby(keys, as_index=False).agg(**aggregation)
     unique["lr_pair"] = unique["lr_id"].map(
         lambda value: "_".join(lr_id_to_pair.get(int(value), (f"lr_{int(value)}",)))
     )
+    unique = unique.loc[unique[score_column].notna()].copy()
     edge_path = os.path.join(output_dir, "lr_candidate_edge_statistics.csv")
-    unique.sort_values("candidate_logit", ascending=False).to_csv(
+    unique.sort_values(score_column, ascending=False).to_csv(
         edge_path, index=False
     )
 
     pair_rows = []
     for lr_pair, group in unique.groupby("lr_pair", sort=False):
-        scores = group["candidate_logit"].to_numpy(dtype=float)
+        scores = group[score_column].to_numpy(dtype=float)
+        if scores.size == 0:
+            continue
         pair_rows.append(
             {
                 "lr_pair": lr_pair,
-                "supporting_unique_edges": len(group),
+                "supporting_unique_edges": int(scores.size),
                 "associated_edge_attention_mean": float(scores.mean()),
                 "associated_edge_attention_median": float(np.median(scores)),
                 "associated_edge_attention_std": float(scores.std()),
@@ -73,10 +80,17 @@ def evaluate_lr_candidate_scores(
                 "total_lr_score": float(group["lr_score"].sum()),
                 "n_source_spots": int(group["src_spot_barcode"].nunique()),
                 "n_target_spots": int(group["dst_spot_barcode"].nunique()),
-                "eligible_for_ranking": len(group) >= int(min_ranking_edges),
-                "score_source": "pair_specific_lr_candidate_head",
+                "eligible_for_ranking": scores.size >= int(min_ranking_edges),
+                "score_source": (
+                    "pair_specific_lr_candidate_gap"
+                    if score_column == "candidate_gap"
+                    else "pair_specific_lr_candidate_head"
+                ),
             }
         )
+    if not pair_rows:
+        print("LR candidate stats: no candidates with matched controls")
+        return None
     pair_df = calibrate_lr_statistics(pd.DataFrame(pair_rows))
     pair_path = os.path.join(output_dir, "lr_pair_associated_edge_statistics.csv")
     pair_df.to_csv(pair_path, index=False)

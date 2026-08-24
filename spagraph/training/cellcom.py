@@ -89,6 +89,9 @@ def run_cellcom(
     lambda_node_recon: float = 0.5,
     lambda_relation_rank: float = 0.1,
     relation_rank_margin: float = 0.1,
+    candidate_negative_mode: str = "graph",
+    candidate_score_mode: str = "absolute",
+    aggregate_score_transform: str = "raw",
     attention_threshold: float = 1.0,
     edge_mask_ratio: float = 0.2,
     node_mask_ratio: float = 0.15,
@@ -107,6 +110,7 @@ def run_cellcom(
     val_split: float = 0.1,
     early_stop_patience: int = 20,
     early_stop_min_delta: float = 0.1,
+    early_stop_metric: str = "total",
     save_lr_scores_csv: bool = False,
     export_unified_csv: bool = False,
     export_filtered_csv: bool = True,
@@ -150,6 +154,12 @@ def run_cellcom(
         lambda_relation_rank: Joint directed relation ranking and LR candidate
             contrastive loss weight; 0 disables both losses
         relation_rank_margin: Margin between observed and corrupted relation logits
+        candidate_negative_mode: ``graph`` for legacy graph corruptions or
+            ``lr_matched`` for experimental within graph and within LR controls
+        candidate_score_mode: ``absolute`` for candidate logits or ``gap`` for
+            positive minus matched control logits
+        aggregate_score_transform: ``raw`` for legacy aggregate LR strength or
+            experimental ``log1p`` scaling
         attention_threshold: Attention score threshold for edge filtering
         edge_mask_ratio: Edge mask ratio
         node_mask_ratio: Node mask ratio
@@ -162,6 +172,8 @@ def run_cellcom(
         n_repeats: Number of independent Stage3 runs to ensemble
         seeds: Explicit unique seeds; when supplied, overrides generated repeat seeds
         device: Computing device ('cuda' or 'cpu')
+        early_stop_metric: Validation metric used for checkpoint selection,
+            either ``total`` or ``relation_rank``
         args: Legacy argparse.Namespace or dict (for backward compatibility)
         **overrides: Additional overrides for arguments
     
@@ -186,6 +198,14 @@ def run_cellcom(
         raise ValueError("lambda_relation_rank must be non-negative")
     if relation_rank_margin < 0:
         raise ValueError("relation_rank_margin must be non-negative")
+    if candidate_negative_mode not in {"graph", "lr_matched"}:
+        raise ValueError("candidate_negative_mode must be 'graph' or 'lr_matched'")
+    if candidate_score_mode not in {"absolute", "gap"}:
+        raise ValueError("candidate_score_mode must be 'absolute' or 'gap'")
+    if aggregate_score_transform not in {"raw", "log1p"}:
+        raise ValueError("aggregate_score_transform must be 'raw' or 'log1p'")
+    if early_stop_metric not in {"total", "relation_rank"}:
+        raise ValueError("early_stop_metric must be 'total' or 'relation_rank'")
     if seeds is not None:
         seed_values = [int(value) for value in seeds]
         if not seed_values:
@@ -221,6 +241,9 @@ def run_cellcom(
             lambda_node_recon=lambda_node_recon,
             lambda_relation_rank=lambda_relation_rank,
             relation_rank_margin=relation_rank_margin,
+            candidate_negative_mode=candidate_negative_mode,
+            candidate_score_mode=candidate_score_mode,
+            aggregate_score_transform=aggregate_score_transform,
             attention_threshold=attention_threshold,
             edge_mask_ratio=edge_mask_ratio, node_mask_ratio=node_mask_ratio,
             mask_seed=mask_seed, batch_size=batch_size,
@@ -228,6 +251,7 @@ def run_cellcom(
             weight_decay=weight_decay, device=device, sample_rate=sample_rate,
             val_split=val_split, early_stop_patience=early_stop_patience,
             early_stop_min_delta=early_stop_min_delta, save_lr_scores_csv=save_lr_scores_csv,
+            early_stop_metric=early_stop_metric,
             export_unified_csv=export_unified_csv, export_filtered_csv=export_filtered_csv,
         )
         base_kwargs.update(overrides)
@@ -296,6 +320,9 @@ def run_cellcom(
         lambda_node_recon=lambda_node_recon,
         lambda_relation_rank=lambda_relation_rank,
         relation_rank_margin=relation_rank_margin,
+        candidate_negative_mode=candidate_negative_mode,
+        candidate_score_mode=candidate_score_mode,
+        aggregate_score_transform=aggregate_score_transform,
         attention_threshold=attention_threshold,
         edge_mask_ratio=edge_mask_ratio,
         node_mask_ratio=node_mask_ratio,
@@ -311,6 +338,7 @@ def run_cellcom(
         val_split=val_split,
         early_stop_patience=early_stop_patience,
         early_stop_min_delta=early_stop_min_delta,
+        early_stop_metric=early_stop_metric,
     )
     
     # Apply any additional overrides

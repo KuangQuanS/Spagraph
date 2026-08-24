@@ -70,6 +70,64 @@ class CalibrationTests(unittest.TestCase):
             self.assertNotIn((int(src), int(dst), int(lr_id)), observed)
         self.assertTrue(torch.equal(attrs[:, 1], candidate_attr[positives, 1]))
 
+    def test_lr_matched_negatives_stay_within_graph_and_lr_identity(self):
+        candidate_index = torch.tensor(
+            [[0, 2, 0, 2, 6, 8], [1, 3, 3, 1, 7, 9]]
+        )
+        candidate_attr = torch.tensor(
+            [[1.0, 1.0], [2.0, 1.0], [3.0, 2.0],
+             [4.0, 2.0], [5.0, 1.0], [6.0, 1.0]]
+        )
+        candidate_batch = torch.tensor([0, 0, 0, 0, 1, 1])
+        negatives, attrs, positives = sample_lr_candidate_negatives(
+            candidate_index,
+            candidate_attr,
+            candidate_batch=candidate_batch,
+            generator=torch.Generator().manual_seed(7),
+            mode="lr_matched",
+        )
+        self.assertGreater(negatives.size(1), 0)
+        self.assertTrue(torch.equal(attrs[:, 1], candidate_attr[positives, 1]))
+        node_graph = {0: 0, 1: 0, 2: 0, 3: 0, 6: 1, 7: 1, 8: 1, 9: 1}
+        for src, dst in negatives.t().tolist():
+            self.assertEqual(node_graph[src], node_graph[dst])
+
+    def test_candidate_gap_reports_matched_control_counts(self):
+        model = HeteroSTModel(
+            n_genes=3,
+            n_celltypes=2,
+            n_lr_pairs=2,
+            gat_hidden_dims=[4],
+            gat_heads=1,
+            output_dim=4,
+        )
+        node_repr = torch.rand(6, 4)
+        candidate_index = torch.tensor([[0, 2, 0, 2], [1, 3, 3, 1]])
+        candidate_attr = torch.tensor(
+            [[1.0, 1.0], [2.0, 1.0], [3.0, 2.0], [4.0, 2.0]]
+        )
+        logits, gaps, counts = model.score_lr_candidate_contrastive_gaps(
+            node_repr,
+            candidate_index,
+            candidate_attr,
+            generator=torch.Generator().manual_seed(5),
+        )
+        self.assertEqual(logits.shape, gaps.shape)
+        self.assertTrue(torch.isfinite(gaps[counts > 0]).all())
+        self.assertTrue((counts > 0).any())
+
+    def test_lr_matched_negatives_do_not_invent_impossible_controls(self):
+        candidate_index = torch.tensor([[0, 0], [1, 3]])
+        candidate_attr = torch.tensor([[1.0, 1.0], [2.0, 1.0]])
+        negatives, _, positives = sample_lr_candidate_negatives(
+            candidate_index,
+            candidate_attr,
+            mode="lr_matched",
+            generator=torch.Generator().manual_seed(9),
+        )
+        self.assertEqual(negatives.size(1), 0)
+        self.assertEqual(positives.numel(), 0)
+
     def test_candidate_head_backpropagates_after_shared_gat(self):
         model = HeteroSTModel(
             n_genes=3, n_celltypes=2, n_lr_pairs=2,
@@ -95,6 +153,57 @@ class CalibrationTests(unittest.TestCase):
         grad = model.lr_candidate_scorer[-1].weight.grad
         self.assertIsNotNone(grad)
         self.assertGreater(float(grad.abs().sum()), 0.0)
+
+    def test_relation_negatives_reuse_masked_transformed_positive_scores(self):
+        class CaptureCommunication(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.positive_attr = None
+                self.negative_attr = None
+
+            def forward(
+                self, edge_attr, edge_index, node_feat, return_attention=False,
+                relation_negative_edge_index=None,
+                relation_negative_edge_attr=None,
+                return_relation_scores=False,
+            ):
+                self.positive_attr = edge_attr.detach().clone()
+                self.negative_attr = relation_negative_edge_attr.detach().clone()
+                representation = node_feat.new_zeros((node_feat.size(0), 4))
+                attention = (
+                    node_feat.new_ones(edge_index.size(1)),
+                    node_feat.new_ones(edge_index.size(1)),
+                )
+                relation_scores = (
+                    node_feat.new_zeros(edge_index.size(1)),
+                    node_feat.new_zeros(relation_negative_edge_index.size(1)),
+                )
+                return representation, attention, relation_scores
+
+        model = HeteroSTModel(
+            n_genes=3, n_celltypes=2, n_lr_pairs=2,
+            mlp_latent_dim=4, mlp_hidden_dims=[4], gat_hidden_dims=[4],
+            gat_heads=1, gat_dropout=0.0, output_dim=4,
+            aggregate_score_transform="log1p",
+        )
+        capture = CaptureCommunication()
+        model.edge_attn_comm = capture
+        model(
+            expr_raw=torch.rand(2, 3),
+            cell_expr_raw=torch.rand(4, 3),
+            edge_index_like=torch.empty((2, 0), dtype=torch.long),
+            edge_attr_like=torch.empty((0, 2)),
+            edge_index_cc=torch.tensor([[2, 4], [3, 5]]),
+            edge_attr_cc=torch.tensor([[9.0], [24.0]]),
+            return_attention=True,
+            return_relation_loss=True,
+            edge_mask_ratio=1.0,
+            node_mask_ratio=0.0,
+            relation_generator=torch.Generator().manual_seed(5),
+        )
+        self.assertTrue(torch.equal(capture.positive_attr, torch.zeros((2, 1))))
+        self.assertGreater(capture.negative_attr.numel(), 0)
+        self.assertEqual(int(torch.count_nonzero(capture.negative_attr)), 0)
 
     def test_batched_collate_offsets_lr_candidate_nodes(self):
         def sample(score, lr_id):

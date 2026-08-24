@@ -88,6 +88,7 @@ def sample_lr_candidate_negatives(
     candidate_attr: torch.Tensor,
     candidate_batch: Optional[torch.Tensor] = None,
     generator: Optional[torch.Generator] = None,
+    mode: str = "graph",
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Create matched corruptions for pair-specific LR candidates.
 
@@ -117,25 +118,64 @@ def sample_lr_candidate_negatives(
     if candidate_batch.numel() != n_candidates:
         raise ValueError("candidate_batch must have one entry per LR candidate")
 
-    src, dst = candidate_index
-    negative_parts = [torch.stack([dst, src], dim=0)]
-    attr_parts = [candidate_attr]
-    positive_parts = [torch.arange(n_candidates, device=candidate_index.device)]
+    if mode not in {"graph", "lr_matched"}:
+        raise ValueError("candidate negative mode must be 'graph' or 'lr_matched'")
 
-    for graph_id in torch.unique(candidate_batch, sorted=True):
-        indices = torch.nonzero(
-            candidate_batch == graph_id, as_tuple=False
-        ).flatten()
-        if indices.numel() < 2:
-            continue
-        permutation = torch.randperm(
-            indices.numel(), device=candidate_index.device, generator=generator
+    src, dst = candidate_index
+    if mode == "graph":
+        negative_parts = [torch.stack([dst, src], dim=0)]
+        attr_parts = [candidate_attr]
+        positive_parts = [
+            torch.arange(n_candidates, device=candidate_index.device)
+        ]
+        for graph_id in torch.unique(candidate_batch, sorted=True):
+            indices = torch.nonzero(
+                candidate_batch == graph_id, as_tuple=False
+            ).flatten()
+            if indices.numel() < 2:
+                continue
+            permutation = torch.randperm(
+                indices.numel(),
+                device=candidate_index.device,
+                generator=generator,
+            )
+            negative_parts.append(
+                torch.stack([src[indices], dst[indices[permutation]]], dim=0)
+            )
+            attr_parts.append(candidate_attr[indices])
+            positive_parts.append(indices)
+    else:
+        negative_parts = []
+        attr_parts = []
+        positive_parts = []
+        lr_ids = candidate_attr[:, 1].long().clamp_min(0)
+        n_relations = max(int(lr_ids.max().item()) + 1, 1)
+        group_keys = candidate_batch * n_relations + lr_ids
+        for group_id in torch.unique(group_keys, sorted=True):
+            indices = torch.nonzero(
+                group_keys == group_id, as_tuple=False
+            ).flatten()
+            if indices.numel() < 2:
+                continue
+            permutation = torch.randperm(
+                indices.numel(),
+                device=candidate_index.device,
+                generator=generator,
+            )
+            positive_order = indices[permutation]
+            receiver_order = indices[permutation.roll(1)]
+            negative_parts.append(
+                torch.stack([src[positive_order], dst[receiver_order]], dim=0)
+            )
+            attr_parts.append(candidate_attr[positive_order])
+            positive_parts.append(positive_order)
+
+    if not negative_parts:
+        return (
+            candidate_index.new_empty((2, 0)),
+            candidate_attr.new_empty((0, candidate_attr.size(-1))),
+            candidate_index.new_empty((0,)),
         )
-        negative_parts.append(
-            torch.stack([src[indices], dst[indices[permutation]]], dim=0)
-        )
-        attr_parts.append(candidate_attr[indices])
-        positive_parts.append(indices)
 
     negative_index = torch.cat(negative_parts, dim=1)
     negative_attr = torch.cat(attr_parts, dim=0)
@@ -453,7 +493,8 @@ class HeteroSTModel(nn.Module):
                  gat_hidden_dims: list = None,
                  gat_heads: int = 4, gat_dropout: float = 0.1,
                  output_dim: int = 64, n_celltypes: int = None,
-                 n_lr_pairs: int = 1, lr_candidate_emb_dim: int = 16):
+                 n_lr_pairs: int = 1, lr_candidate_emb_dim: int = 16,
+                 aggregate_score_transform: str = "raw"):
         super().__init__()
         
         if gat_hidden_dims is None:
@@ -465,6 +506,9 @@ class HeteroSTModel(nn.Module):
         self.gat_hidden_dims = gat_hidden_dims
         self.n_lr_pairs = max(int(n_lr_pairs), 1)
         self.lr_candidate_emb_dim = int(lr_candidate_emb_dim)
+        if aggregate_score_transform not in {"raw", "log1p"}:
+            raise ValueError("aggregate_score_transform must be 'raw' or 'log1p'")
+        self.aggregate_score_transform = aggregate_score_transform
         self.node_recon_head = nn.Linear(output_dim, n_genes)
         
         # ✅ Mask Token (既然要Mask，就用个Learnable Token，显得高级)
@@ -568,7 +612,9 @@ class HeteroSTModel(nn.Module):
                 relation_generator: Optional[torch.Generator] = None,
                 lr_candidate_index: Optional[torch.Tensor] = None,
                 lr_candidate_attr: Optional[torch.Tensor] = None,
-                lr_candidate_batch: Optional[torch.Tensor] = None) -> Tuple:
+                lr_candidate_batch: Optional[torch.Tensor] = None,
+                candidate_negative_mode: str = "graph",
+                return_relation_components: bool = False) -> Tuple:
         """
         Args:
             expr_raw: [k+1, n_genes] 原始Spot基因表达量
@@ -698,6 +744,8 @@ class HeteroSTModel(nn.Module):
             # Masked edges use score=0. LR identity is deliberately excluded
             # from aggregate message passing to avoid first-pair leakage.
             comm_edge_feat = masked_edge_attr_cc[:, 0:1]
+            if self.aggregate_score_transform == "log1p":
+                comm_edge_feat = torch.log1p(comm_edge_feat.clamp_min(0))
 
             relation_negative_edges = None
             relation_negative_attrs = None
@@ -705,7 +753,7 @@ class HeteroSTModel(nn.Module):
             if return_relation_loss:
                 (
                     relation_negative_edges,
-                    relation_negative_attrs,
+                    _,
                     relation_positive_indices,
                 ) = sample_relation_negatives(
                     edge_index_cc,
@@ -713,6 +761,13 @@ class HeteroSTModel(nn.Module):
                     edge_batch=relation_edge_batch,
                     generator=relation_generator,
                 )
+                # A corrupted relation must preserve exactly the same observed
+                # edge evidence as its positive.  Reuse the already masked and
+                # transformed feature so the rank head cannot exploit a scale
+                # or masking mismatch instead of node geometry.
+                relation_negative_attrs = comm_edge_feat[
+                    relation_positive_indices
+                ]
 
             comm_outputs = self.edge_attn_comm(
                 comm_edge_feat,
@@ -753,17 +808,20 @@ class HeteroSTModel(nn.Module):
 
             if relation_scores is not None and relation_positive_indices.numel() > 0:
                 positive_logits, negative_logits = relation_scores
-                relation_rank_loss = pairwise_relation_ranking_loss(
+                aggregate_relation_loss = pairwise_relation_ranking_loss(
                     positive_logits[relation_positive_indices],
                     negative_logits,
                     margin=relation_rank_margin,
                 )
             else:
-                relation_rank_loss = all_feat.sum() * 0.0
+                aggregate_relation_loss = all_feat.sum() * 0.0
         else:
             comm_repr = self.fallback_proj(all_feat)
             cc_attention = None
-            relation_rank_loss = all_feat.sum() * 0.0
+            aggregate_relation_loss = all_feat.sum() * 0.0
+
+        relation_rank_loss = aggregate_relation_loss
+        candidate_loss = all_feat.sum() * 0.0
 
         # ✅ 去掉双头预测：边存在性判别 + 边强度回归
         # exist_logits = None
@@ -799,6 +857,7 @@ class HeteroSTModel(nn.Module):
                 candidate_batch=lr_candidate_batch,
                 margin=relation_rank_margin,
                 generator=relation_generator,
+                negative_mode=candidate_negative_mode,
             )
             relation_rank_loss = relation_rank_loss + candidate_loss
 
@@ -824,6 +883,10 @@ class HeteroSTModel(nn.Module):
             predicted_masked_edges, edge_mask, node_recon_pred, node_mask,
         )
         if return_relation_loss:
+            if return_relation_components:
+                return outputs + (
+                    relation_rank_loss, aggregate_relation_loss, candidate_loss,
+                )
             return outputs + (relation_rank_loss,)
         return outputs
 
@@ -858,6 +921,7 @@ class HeteroSTModel(nn.Module):
         candidate_batch: Optional[torch.Tensor] = None,
         margin: float = 0.1,
         generator: Optional[torch.Generator] = None,
+        negative_mode: str = "graph",
     ) -> torch.Tensor:
         negative_index, negative_attr, positive_indices = (
             sample_lr_candidate_negatives(
@@ -865,6 +929,7 @@ class HeteroSTModel(nn.Module):
                 candidate_attr,
                 candidate_batch=candidate_batch,
                 generator=generator,
+                mode=negative_mode,
             )
         )
         if positive_indices.numel() == 0:
@@ -880,6 +945,45 @@ class HeteroSTModel(nn.Module):
             negative_logits,
             margin=margin,
         )
+
+    def score_lr_candidate_contrastive_gaps(
+        self,
+        node_repr: torch.Tensor,
+        candidate_index: torch.Tensor,
+        candidate_attr: torch.Tensor,
+        candidate_batch: Optional[torch.Tensor] = None,
+        generator: Optional[torch.Generator] = None,
+        negative_mode: str = "lr_matched",
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return absolute logits, matched-control gaps, and control counts."""
+        positive_logits = self.score_lr_candidates(
+            node_repr, candidate_index, candidate_attr
+        )
+        negative_index, negative_attr, positive_indices = (
+            sample_lr_candidate_negatives(
+                candidate_index,
+                candidate_attr,
+                candidate_batch=candidate_batch,
+                generator=generator,
+                mode=negative_mode,
+            )
+        )
+        counts = positive_logits.new_zeros(positive_logits.shape)
+        gaps = positive_logits.new_full(positive_logits.shape, float("nan"))
+        if positive_indices.numel() == 0:
+            return positive_logits, gaps, counts
+
+        negative_logits = self.score_lr_candidates(
+            node_repr, negative_index, negative_attr
+        )
+        negative_sum = positive_logits.new_zeros(positive_logits.shape)
+        negative_sum.scatter_add_(0, positive_indices, negative_logits)
+        counts.scatter_add_(0, positive_indices, torch.ones_like(negative_logits))
+        valid = counts > 0
+        gaps[valid] = (
+            positive_logits[valid] - negative_sum[valid] / counts[valid]
+        )
+        return positive_logits, gaps, counts
 
 
 # ==================== 辅助方法 ====================

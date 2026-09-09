@@ -3,12 +3,38 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 from typing import Optional, Sequence
 
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
+
+
+def read_associated_lr_events(path) -> pd.DataFrame:
+    """Expand complete LR support in memory for plots; never infer from first IDs."""
+    edges = pd.read_csv(path)
+    keys = ["src_spot_barcode", "dst_spot_barcode", "source_cell", "target_cell"]
+    required = set(keys + ["edge_attention", "supporting_lr_scores"])
+    if not required.issubset(edges.columns):
+        raise ValueError("Complete supporting_lr_scores are required; legacy LR exports are unsupported")
+    if edges.duplicated(keys).any():
+        raise ValueError("Communication edge statistics must be deduplicated")
+    rows = []
+    for record in edges.to_dict("records"):
+        support = json.loads(record["supporting_lr_scores"])
+        if not isinstance(support, dict) or not support:
+            raise ValueError("Each communication edge must contain a nonempty LR support mapping")
+        if not np.isfinite(float(record["edge_attention"])):
+            raise ValueError("Edge attention must be finite")
+        for lr, strength in support.items():
+            if not lr or not np.isfinite(float(strength)) or float(strength) < 0:
+                raise ValueError("LR support requires named pairs and finite nonnegative strengths")
+            rows.append({**{key: record[key] for key in keys}, "lr_pair": lr,
+                         "original_lr_score": float(strength),
+                         "attention_score": float(record["edge_attention"])})
+    return pd.DataFrame(rows, columns=keys + ["lr_pair", "original_lr_score", "attention_score"])
 
 
 @dataclass(frozen=True)
@@ -96,6 +122,49 @@ def _eligible_for_ranking(frame: pd.DataFrame) -> pd.Series:
     )
 
 
+def rank_associated_attention(statistics: pd.DataFrame) -> pd.DataFrame:
+    """Rank shared attention on unique LR-associated edges, without calibration."""
+    frame = statistics.copy()
+    if frame.lr_pair.duplicated().any():
+        raise ValueError("LR statistics must contain one row per pair")
+    score = pd.to_numeric(frame["associated_edge_attention_mean"], errors="raise")
+    if not np.isfinite(score).all():
+        raise ValueError("Attention scores must be finite")
+    eligible = _eligible_for_ranking(frame)
+    frame["eligible_for_ranking"] = eligible
+    frame["attention_percentile"] = np.nan
+    frame.loc[eligible, "attention_percentile"] = score[eligible].rank(method="average", pct=True)
+    frame["rank"] = pd.Series(pd.NA, index=frame.index, dtype="Int64")
+    frame.loc[eligible, "rank"] = score[eligible].rank(ascending=False, method="min").astype("Int64")
+    frame["score_source"] = "shared_attention_associated_lr_support"
+    return frame.sort_values(["rank", "lr_pair"], na_position="last").reset_index(drop=True)
+
+
+def aggregate_attention_rankings(frames: Sequence[pd.DataFrame]) -> pd.DataFrame:
+    """Mean within-run percentiles; formal ranks require eligibility in every run."""
+    if not frames:
+        raise ValueError("At least one run is required")
+    sources = {str(s) for f in frames if "score_source" in f for s in f.score_source.dropna().unique()}
+    if sources - {"shared_attention_associated_lr_support"}:
+        raise ValueError("Cannot aggregate candidate-head or mixed score sources as shared attention")
+    ranked = [rank_associated_attention(f).assign(run=i) for i, f in enumerate(frames)]
+    merged = pd.concat(ranked, ignore_index=True)
+    result = merged.groupby("lr_pair", as_index=False).agg(
+        mean_attention_percentile=("attention_percentile", "mean"),
+        attention_percentile_std=("attention_percentile", "std"),
+        mean_attention=("associated_edge_attention_mean", "mean"),
+        run_rank_min=("rank", "min"), run_rank_max=("rank", "max"),
+        n_runs=("run", "nunique"), n_eligible_runs=("eligible_for_ranking", "sum"),
+    )
+    eligible = result.n_runs.eq(len(frames)) & result.n_eligible_runs.eq(len(frames))
+    result["eligible_for_ranking"] = eligible
+    result["rank"] = pd.Series(pd.NA, index=result.index, dtype="Int64")
+    result.loc[eligible, "rank"] = result.loc[eligible, "mean_attention_percentile"].rank(
+        ascending=False, method="min").astype("Int64")
+    result["score_source"] = "mean_run_attention_percentile"
+    return result.sort_values(["rank", "lr_pair"], na_position="last").reset_index(drop=True)
+
+
 def calibrate_lr_statistics(
     statistics: pd.DataFrame,
     weights: Optional[CalibrationWeights] = None,
@@ -103,8 +172,8 @@ def calibrate_lr_statistics(
 ) -> pd.DataFrame:
     """Add robust, support-aware ranking columns without pair-name priors.
 
-    Works with both legacy ``lr_pair_statistics.csv`` and the preferred
-    ``lr_pair_associated_edge_statistics.csv`` schema.
+    Works with the canonical pair-specific ``lr_pair_statistics.csv`` schema
+    and historical result tables supplied explicitly for reanalysis.
     """
     frame = statistics.copy()
     if weights is None:

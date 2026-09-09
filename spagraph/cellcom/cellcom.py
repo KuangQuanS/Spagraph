@@ -101,8 +101,7 @@ def _print_stage3_header(args, device: torch.device):
     print(f"Same-Type Comm:     {getattr(args, 'allow_same_celltype_comm', False)}")
     print(f"Min Comm Edges:     {args.min_comm_edges}")
     print(f"Attention Thr:      {args.attention_threshold}")
-    print(f"Export Unified:     {getattr(args, 'export_unified_csv', False)}")
-    print(f"Export Filtered:    {getattr(args, 'export_filtered_csv', True)}")
+    print("Legacy LR CSV exports: disabled")
     print(f"MLP:               {args.mlp_hidden_dims} -> {args.mlp_latent_dim}")
     print(f"GAT Architecture:   {len(gat_hidden_dims)}L × [{', '.join(gat_hidden_dims)}]D × {args.gat_heads}H")
     print(f"Dropout:            {args.gat_dropout}")
@@ -110,12 +109,16 @@ def _print_stage3_header(args, device: torch.device):
     print(f"  Mask Recon:       {args.lambda_mask_recon} (ratio={args.edge_mask_ratio})")
     print(f"  Node Recon:       {args.lambda_node_recon} (ratio={args.node_mask_ratio})")
     print(
-        "  Relation Rank:    "
+        "  Aggregate Rank:   "
         f"{getattr(args, 'lambda_relation_rank', 0.0)} "
         f"(margin={getattr(args, 'relation_rank_margin', 0.1)})"
     )
+    print(
+        "  Candidate Rank:   "
+        f"{getattr(args, 'lambda_candidate_rank', 0.0)}"
+    )
     print(f"Mask Seed:          {args.mask_seed}")
-    print('Aggregate LR ID:    excluded; candidate output head enabled')
+    print('Aggregate LR ID:    excluded; complete LR support retained')
     print(f"Aggregate Scores:   {getattr(args, 'aggregate_score_transform', 'raw')}")
     print(f"Candidate Negatives:{getattr(args, 'candidate_negative_mode', 'graph')}")
     print(f"Candidate Ranking:  {getattr(args, 'candidate_score_mode', 'absolute')}")
@@ -186,8 +189,12 @@ def parse_args():
     parser.add_argument('--lambda_mask_recon', type=float, default=1.0, help='mask边重构损失的权重 (default: 1.0)')
     parser.add_argument('--lambda_node_recon', type=float, default=0.5, help='节点特征重构损失的权重 (default: 0.5)')
     parser.add_argument(
-        '--lambda_relation_rank', type=float, default=0.1,
-        help='Weight for directed-relation and LR-candidate contrastive losses (default: 0.1)',
+        '--lambda_relation_rank', type=float, default=0.0,
+        help='Experimental aggregate relation loss; disabled in the retained reconstruction baseline (default: 0.0)',
+    )
+    parser.add_argument(
+        '--lambda_candidate_rank', type=float, default=0.0,
+        help='Optional LR-candidate contrastive loss weight (default: 0.0)',
     )
     parser.add_argument(
         '--relation_rank_margin', type=float, default=0.1,
@@ -199,9 +206,9 @@ def parse_args():
     parser.add_argument('--attention_threshold', type=float, default=1,
                        help='注意力得分阈值，用于过滤边 (default: 0)')
     parser.add_argument('--export_unified_csv', type=lambda x: str(x).lower() == 'true', default=False,
-                       help='Whether to export full lr_communication.csv (default: False)')
-    parser.add_argument('--export_filtered_csv', type=lambda x: str(x).lower() == 'true', default=True,
-                       help='Whether to export filtered lr_communication CSV (default: True)')
+                       help='Deprecated compatibility flag; legacy representative-LR CSV export is disabled')
+    parser.add_argument('--export_filtered_csv', type=lambda x: str(x).lower() == 'true', default=False,
+                       help='Deprecated compatibility flag; legacy filtered LR CSV export is disabled')
     parser.add_argument('--edge_mask_ratio', type=float, default=0.2, help='mask通讯边的比例 (默认20%%)')
     parser.add_argument('--node_mask_ratio', type=float, default=0.15, help='mask节点特征比例 (默认15%%)')
     parser.add_argument('--mask_seed', type=int, default=1234, help='验证阶段mask的固定随机种子')
@@ -566,11 +573,12 @@ def main(args=None):
     early_stop_patience = args.early_stop_patience
     early_stop_min_delta = args.early_stop_min_delta
     lambda_relation_rank = float(getattr(args, 'lambda_relation_rank', 0.0))
+    lambda_candidate_rank = float(getattr(args, 'lambda_candidate_rank', 0.0))
     relation_rank_margin = float(getattr(args, 'relation_rank_margin', 0.1))
     candidate_negative_mode = getattr(args, 'candidate_negative_mode', 'graph')
     aggregate_score_transform = getattr(args, 'aggregate_score_transform', 'raw')
     early_stop_metric = getattr(args, 'early_stop_metric', 'total')
-    if lambda_relation_rank < 0 or relation_rank_margin < 0:
+    if lambda_relation_rank < 0 or lambda_candidate_rank < 0 or relation_rank_margin < 0:
         raise ValueError("relation ranking weight and margin must be non-negative")
     
     if early_stop_patience > 0:
@@ -654,10 +662,10 @@ def main(args=None):
                         edge_mask_ratio=args.edge_mask_ratio,
                         node_mask_ratio=args.node_mask_ratio,
                         mask_generator=None,
-                        return_relation_loss=lambda_relation_rank > 0,
+                        return_relation_loss=(lambda_relation_rank > 0 or lambda_candidate_rank > 0),
                         relation_rank_margin=relation_rank_margin,
-                        lr_candidate_index=lr_candidate_index,
-                        lr_candidate_attr=lr_candidate_attr,
+                        lr_candidate_index=(lr_candidate_index if lambda_candidate_rank > 0 else None),
+                        lr_candidate_attr=(lr_candidate_attr if lambda_candidate_rank > 0 else None),
                         candidate_negative_mode=candidate_negative_mode,
                         return_relation_components=True,
                     )
@@ -686,7 +694,8 @@ def main(args=None):
                     total_loss = (
                         args.lambda_mask_recon * mask_recon_loss
                         + args.lambda_node_recon * node_recon_loss
-                        + lambda_relation_rank * relation_rank_loss
+                        + lambda_relation_rank * aggregate_relation_loss
+                        + lambda_candidate_rank * candidate_loss
                     )
 
                     batch_loss += total_loss
@@ -728,15 +737,16 @@ def main(args=None):
                     edge_mask_ratio=args.edge_mask_ratio,
                     node_mask_ratio=args.node_mask_ratio,
                     mask_generator=None,
-                    return_relation_loss=lambda_relation_rank > 0,
+                    return_relation_loss=(lambda_relation_rank > 0 or lambda_candidate_rank > 0),
                     relation_edge_batch=batch['cc_edge_batch'].to(
                         device, non_blocking=pin_memory
                     ),
                     relation_rank_margin=relation_rank_margin,
-                    lr_candidate_index=lr_candidate_index,
-                    lr_candidate_attr=lr_candidate_attr,
-                    lr_candidate_batch=batch['lr_candidate_batch'].to(
-                        device, non_blocking=pin_memory
+                    lr_candidate_index=(lr_candidate_index if lambda_candidate_rank > 0 else None),
+                    lr_candidate_attr=(lr_candidate_attr if lambda_candidate_rank > 0 else None),
+                    lr_candidate_batch=(
+                        batch['lr_candidate_batch'].to(device, non_blocking=pin_memory)
+                        if lambda_candidate_rank > 0 else None
                     ),
                     candidate_negative_mode=candidate_negative_mode,
                     return_relation_components=True,
@@ -768,7 +778,8 @@ def main(args=None):
                 avg_batch_loss = (
                     args.lambda_mask_recon * mask_recon_loss
                     + args.lambda_node_recon * node_recon_loss
-                    + lambda_relation_rank * relation_rank_loss
+                    + lambda_relation_rank * aggregate_relation_loss
+                    + lambda_candidate_rank * candidate_loss
                 )
                 avg_batch_relation_rank = relation_rank_loss
                 avg_batch_aggregate_relation = aggregate_relation_loss
@@ -836,11 +847,11 @@ def main(args=None):
                             edge_mask_ratio=args.edge_mask_ratio,
                             node_mask_ratio=args.node_mask_ratio,
                             mask_generator=val_mask_gen,
-                            return_relation_loss=lambda_relation_rank > 0,
+                            return_relation_loss=(lambda_relation_rank > 0 or lambda_candidate_rank > 0),
                             relation_rank_margin=relation_rank_margin,
                             relation_generator=val_mask_gen,
-                            lr_candidate_index=lr_candidate_index,
-                            lr_candidate_attr=lr_candidate_attr,
+                            lr_candidate_index=(lr_candidate_index if lambda_candidate_rank > 0 else None),
+                            lr_candidate_attr=(lr_candidate_attr if lambda_candidate_rank > 0 else None),
                             candidate_negative_mode=candidate_negative_mode,
                             return_relation_components=True,
                         )
@@ -870,7 +881,8 @@ def main(args=None):
                         val_loss = (
                             args.lambda_mask_recon * mask_recon_loss
                             + args.lambda_node_recon * node_recon_loss
-                            + lambda_relation_rank * relation_rank_loss
+                            + lambda_relation_rank * aggregate_relation_loss
+                            + lambda_candidate_rank * candidate_loss
                         )
 
                         batch_loss += val_loss
@@ -911,16 +923,17 @@ def main(args=None):
                         edge_mask_ratio=args.edge_mask_ratio,
                         node_mask_ratio=args.node_mask_ratio,
                         mask_generator=val_mask_gen,
-                        return_relation_loss=lambda_relation_rank > 0,
+                        return_relation_loss=(lambda_relation_rank > 0 or lambda_candidate_rank > 0),
                         relation_edge_batch=batch['cc_edge_batch'].to(
                             device, non_blocking=pin_memory
                         ),
                         relation_rank_margin=relation_rank_margin,
                         relation_generator=val_mask_gen,
-                        lr_candidate_index=lr_candidate_index,
-                        lr_candidate_attr=lr_candidate_attr,
-                        lr_candidate_batch=batch['lr_candidate_batch'].to(
-                            device, non_blocking=pin_memory
+                        lr_candidate_index=(lr_candidate_index if lambda_candidate_rank > 0 else None),
+                        lr_candidate_attr=(lr_candidate_attr if lambda_candidate_rank > 0 else None),
+                        lr_candidate_batch=(
+                            batch['lr_candidate_batch'].to(device, non_blocking=pin_memory)
+                            if lambda_candidate_rank > 0 else None
                         ),
                         candidate_negative_mode=candidate_negative_mode,
                         return_relation_components=True,
@@ -951,7 +964,8 @@ def main(args=None):
                     avg_batch_loss = (
                         args.lambda_mask_recon * avg_batch_mask
                         + args.lambda_node_recon * avg_batch_node
-                        + lambda_relation_rank * relation_rank_loss
+                        + lambda_relation_rank * aggregate_relation_loss
+                        + lambda_candidate_rank * candidate_loss
                     )
                     avg_batch_relation_rank = relation_rank_loss
                     avg_batch_aggregate_relation = aggregate_relation_loss
@@ -1244,20 +1258,21 @@ def main(args=None):
         all_src_barcodes=all_src_barcodes,
         all_dst_barcodes=all_dst_barcodes,
         export_unified=getattr(args, 'export_unified_csv', False),
-        export_filtered=getattr(args, 'export_filtered_csv', True),
+        export_filtered=getattr(args, 'export_filtered_csv', False),
         attention_threshold=args.attention_threshold,
         lr_support_by_edge=graph_data.get("lr_support_by_edge"),
     )
-    evaluate_lr_candidate_scores(
-        records=all_lr_candidate_records,
-        lr_id_to_pair=dataset.lr_id_to_pair,
-        output_dir=args.output_dir,
-        score_column=(
-            'candidate_gap'
-            if getattr(args, 'candidate_score_mode', 'absolute') == 'gap'
-            else 'candidate_logit'
-        ),
-    )
+    if lambda_candidate_rank > 0:
+        evaluate_lr_candidate_scores(
+            records=all_lr_candidate_records,
+            lr_id_to_pair=dataset.lr_id_to_pair,
+            output_dir=args.output_dir,
+            score_column=(
+                'candidate_gap'
+                if getattr(args, 'candidate_score_mode', 'absolute') == 'gap'
+                else 'candidate_logit'
+            ),
+        )
     
     # 绘制损失曲线
     plot_training_loss(train_losses, val_losses, args.output_dir, args.epochs)

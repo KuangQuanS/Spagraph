@@ -15,6 +15,9 @@ from spagraph.cellcom.relation_ranker import (
     SYNTHETIC_V2_FROZEN_WEIGHTS,
     calibrate_lr_statistics,
     ensemble_lr_rankings,
+    aggregate_attention_rankings,
+    rank_associated_attention,
+    read_associated_lr_events,
 )
 from spagraph.training.cellcom import aggregate_cellcom_seed_outputs, run_cellcom
 from spagraph.cellcom.cellcom import degree_scale_attention
@@ -24,7 +27,7 @@ from spagraph.cellcom.cellcom_model import (
     sample_lr_candidate_negatives,
     sample_relation_negatives,
 )
-from spagraph.cellcom.cellcom_evaluate import evaluate_lr_candidate_scores
+from spagraph.cellcom.cellcom_evaluate import evaluate_lr_candidate_scores, evaluate_cell_communication
 from spagraph.cellcom.cellcom_graph_builder import hetero_subgraph_collate_fn_batched
 from spagraph.cellcom.lr_scores import (
     _build_valid_lr_pairs,
@@ -33,6 +36,87 @@ from spagraph.cellcom.lr_scores import (
 
 
 class CalibrationTests(unittest.TestCase):
+    def test_exporter_rejects_missing_lr_support_before_writing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaisesRegex(ValueError, 'Missing complete LR support'):
+                evaluate_cell_communication(
+                    all_cc_attention_scores=[torch.tensor([1.])],
+                    all_edge_index_cc=[torch.tensor([[2], [3]])],
+                    all_edge_attr_cc=[torch.tensor([[10., 99.]])],
+                    all_spot_indices=[torch.tensor([0, 1])],
+                    all_n_spots_sub=[torch.tensor([2])],
+                    all_cell_names=['A', 'B'], all_cell_node_mappings=[{0: 0, 1: 1}],
+                    output_dir=tmp, n_spots=2, n_cells=2,
+                    all_src_barcodes=[['s']], all_dst_barcodes=[['t']],
+                    lr_support_by_edge={('other', 't', 'A', 'B'): {('L', 'R'): 2.}},
+                )
+            self.assertFalse(list(Path(tmp).glob('*.csv')))
+
+    def test_exporter_deduplicates_edges_and_keeps_all_supporting_pairs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            evaluate_cell_communication(
+                all_cc_attention_scores=[torch.tensor([1., 3.])],
+                all_edge_index_cc=[torch.tensor([[2, 2], [3, 3]])],
+                all_edge_attr_cc=[torch.tensor([[10., 99.], [10., 99.]])],
+                all_spot_indices=[torch.tensor([0, 1])],
+                all_n_spots_sub=[torch.tensor([2, 2])],
+                all_cell_names=['A', 'B'], all_cell_node_mappings=[{0: 0, 1: 1}],
+                output_dir=tmp, n_spots=2, n_cells=2,
+                all_src_barcodes=[['s', 's']], all_dst_barcodes=[['t', 't']],
+                export_unified=True, export_filtered=True,
+                lr_support_by_edge={('s', 't', 'A', 'B'): {('L', 'R'): 2., ('X', 'Y'): 8.}},
+            )
+            edges = pd.read_csv(Path(tmp) / 'communication_edge_statistics.csv')
+            pairs = pd.read_csv(Path(tmp) / 'lr_pair_statistics.csv').set_index('lr_pair')
+            self.assertEqual(len(edges), 1)
+            self.assertEqual(edges.loc[0, 'edge_attention'], 2.)
+            self.assertEqual(edges.loc[0, 'n_subgraph_occurrences'], 2)
+            self.assertEqual(json.loads(edges.loc[0, 'supporting_lr_scores']), {'L_R': 2., 'X_Y': 8.})
+            self.assertEqual(set(pairs.index), {'L_R', 'X_Y'})
+            self.assertTrue(pairs.supporting_unique_edges.eq(1).all())
+            self.assertTrue(pairs.associated_edge_attention_mean.eq(2.).all())
+            self.assertTrue(pairs['rank'].isna().all())
+            self.assertFalse(list(Path(tmp).glob('lr_communication*.csv')))
+
+    def test_associated_event_reader_preserves_each_lr_strength(self):
+        row = dict(src_spot_barcode='s', dst_spot_barcode='t',
+                   source_cell='A', target_cell='B', edge_attention=2.,
+                   supporting_lr_scores=json.dumps({'L_R': .2, 'X_Y': .8}))
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'edges.csv'
+            pd.DataFrame([row]).to_csv(path, index=False)
+            events = read_associated_lr_events(path).set_index('lr_pair')
+            self.assertEqual(events.original_lr_score.to_dict(), {'L_R': .2, 'X_Y': .8})
+            self.assertTrue(events.attention_score.eq(2.).all())
+            pd.DataFrame([row, row]).to_csv(path, index=False)
+            with self.assertRaises(ValueError):
+                read_associated_lr_events(path)
+            pd.DataFrame([{'lr_pair': 'L_R', 'attention_score': 2.}]).to_csv(path, index=False)
+            with self.assertRaises(ValueError):
+                read_associated_lr_events(path)
+
+    def test_raw_ensemble_keeps_all_runs_and_excludes_missing_pairs(self):
+        a = pd.DataFrame({'lr_pair': ['A', 'B', 'C'],
+                          'associated_edge_attention_mean': [1., 2., 2.],
+                          'eligible_for_ranking': [True, True, True]})
+        b = pd.DataFrame({'lr_pair': ['A', 'B'],
+                          'associated_edge_attention_mean': [20., 10.],
+                          'eligible_for_ranking': ['true', 'true']})
+        result = aggregate_attention_rankings([a, b]).set_index('lr_pair')
+        self.assertAlmostEqual(result.loc['A', 'mean_attention_percentile'], (1/3 + 1)/2)
+        self.assertAlmostEqual(result.loc['B', 'mean_attention_percentile'], (2.5/3 + .5)/2)
+        self.assertFalse(result.loc['C', 'eligible_for_ranking'])
+        self.assertTrue(pd.isna(result.loc['C', 'rank']))
+
+    def test_raw_ranking_rejects_invalid_or_mixed_scores(self):
+        frame = pd.DataFrame({'lr_pair': ['A'], 'associated_edge_attention_mean': [float('nan')]})
+        with self.assertRaises(ValueError):
+            rank_associated_attention(frame)
+        frame['associated_edge_attention_mean'] = 1.
+        frame['score_source'] = 'pair_specific_lr_candidate_head'
+        with self.assertRaises(ValueError):
+            aggregate_attention_rankings([frame])
+
     def test_complex_expression_is_library_size_invariant(self):
         baseline = _geometric_mean_expression(
             np.array([10.0, 40.0, 50.0]), (0, 1), 100.0
@@ -237,10 +321,35 @@ class CalibrationTests(unittest.TestCase):
             ).set_index("lr_pair")
             self.assertEqual(ranked.loc["L2_R2", "score_source"], "pair_specific_lr_candidate_head")
             self.assertGreater(
-                ranked.loc["L2_R2", "neural_attention_score"],
-                ranked.loc["L1_R1", "neural_attention_score"],
+                ranked.loc["L2_R2", "candidate_score_mean"],
+                ranked.loc["L1_R1", "candidate_score_mean"],
             )
             self.assertTrue((Path(tmp) / "lr_candidate_edge_statistics.csv").exists())
+            self.assertTrue((Path(tmp) / "lr_candidate_pair_diagnostics.csv").exists())
+            self.assertFalse((Path(tmp) / "lr_pair_statistics.csv").exists())
+            self.assertNotIn("associated_edge_attention_mean", ranked.columns)
+            self.assertNotIn("calibrated_score", ranked.columns)
+
+    def test_candidate_evaluator_retains_logit_and_gap_from_same_run(self):
+        records = []
+        for idx in range(10):
+            records.append({
+                "src_spot_barcode": f"s{idx}", "dst_spot_barcode": f"t{idx}",
+                "source_cell": "A", "target_cell": "B", "lr_id": 1,
+                "lr_score": 2.0, "candidate_logit": 0.2 + idx / 100,
+                "candidate_gap": 0.7 + idx / 100,
+                "n_matched_controls": 1,
+            })
+        with tempfile.TemporaryDirectory() as tmp:
+            ranked = evaluate_lr_candidate_scores(
+                records, {1: ("L1", "R1")}, tmp, score_column="candidate_gap"
+            )
+            edges = pd.read_csv(Path(tmp) / "lr_candidate_edge_statistics.csv")
+            self.assertEqual(
+                ranked.loc[0, "score_source"], "pair_specific_lr_candidate_gap"
+            )
+            self.assertIn("candidate_logit", edges.columns)
+            self.assertIn("candidate_gap", edges.columns)
 
     def test_public_api_rejects_negative_relation_loss_weight(self):
         with self.assertRaisesRegex(ValueError, "lambda_relation_rank"):
@@ -472,17 +581,18 @@ class CalibrationTests(unittest.TestCase):
             for seed in (11, 23):
                 seed_dir = root / f"seed_{seed}"
                 seed_dir.mkdir()
-                source.to_csv(seed_dir / "lr_pair_associated_edge_statistics.csv", index=False)
+                source.to_csv(seed_dir / "lr_pair_statistics.csv", index=False)
                 seed_dirs.append(seed_dir)
             result = aggregate_cellcom_seed_outputs(seed_dirs, root, [11, 23])
             self.assertTrue(Path(result["ensemble_path"]).exists())
             self.assertTrue(Path(result["manifest_path"]).exists())
             self.assertEqual(result["seeds"], [11, 23])
             self.assertTrue(
-                (result["ensemble"]["calibration_profile"] == DEFAULT_CALIBRATION_PROFILE).all()
+                (result["ensemble"]["score_source"] == "mean_run_attention_percentile").all()
             )
             manifest = json.loads(Path(result["manifest_path"]).read_text())
-            self.assertEqual(manifest["calibration_weights"]["attention"], 0.60)
+            self.assertEqual(manifest["aggregation"], "mean within-run raw attention percentile")
+            self.assertNotIn("calibration_weights", manifest)
 
     def test_public_api_runs_repeats_in_seed_subdirectories(self):
         source = pd.DataFrame(
@@ -500,7 +610,7 @@ class CalibrationTests(unittest.TestCase):
             output = Path(args.output_dir)
             output.mkdir(parents=True, exist_ok=True)
             calibrate_lr_statistics(source).to_csv(
-                output / "lr_pair_associated_edge_statistics.csv", index=False
+                output / "lr_pair_statistics.csv", index=False
             )
 
         with tempfile.TemporaryDirectory() as tmp, patch(

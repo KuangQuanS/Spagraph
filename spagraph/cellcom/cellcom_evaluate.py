@@ -8,12 +8,13 @@ LR pair statistics, and model-based communication prediction.
 """
 
 import os
+import json
 import torch
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from typing import Dict, List, Tuple, Optional, Any
-from .relation_ranker import calibrate_lr_statistics
+from .relation_ranker import rank_associated_attention
 
 
 def evaluate_lr_candidate_scores(
@@ -23,7 +24,7 @@ def evaluate_lr_candidate_scores(
     min_ranking_edges: int = 10,
     score_column: str = "candidate_logit",
 ) -> Optional[pd.DataFrame]:
-    """Write the canonical pair-specific LR ranking table.
+    """Write diagnostic scores from the optional LR candidate head.
 
     A candidate may occur in several overlapping center-spot subgraphs. Exact
     spatial/cell/LR events are deduplicated before pair statistics are formed.
@@ -51,6 +52,14 @@ def evaluate_lr_candidate_scores(
         score_column: (score_column, "mean"),
         "n_subgraph_occurrences": (score_column, "count"),
     }
+    # Retain both neural outputs when available so absolute logits and
+    # matched-control gaps can be compared from the same trained checkpoint.
+    for diagnostic_column in ("candidate_logit", "candidate_gap"):
+        if (
+            diagnostic_column in frame.columns
+            and diagnostic_column != score_column
+        ):
+            aggregation[diagnostic_column] = (diagnostic_column, "mean")
     if "n_matched_controls" in frame.columns:
         aggregation["n_matched_controls"] = ("n_matched_controls", "sum")
     unique = frame.groupby(keys, as_index=False).agg(**aggregation)
@@ -72,11 +81,12 @@ def evaluate_lr_candidate_scores(
             {
                 "lr_pair": lr_pair,
                 "supporting_unique_edges": int(scores.size),
-                "associated_edge_attention_mean": float(scores.mean()),
-                "associated_edge_attention_median": float(np.median(scores)),
-                "associated_edge_attention_std": float(scores.std()),
-                "associated_edge_attention_min": float(scores.min()),
-                "associated_edge_attention_max": float(scores.max()),
+                "candidate_score_mean": float(scores.mean()),
+                "candidate_score_median": float(np.median(scores)),
+                "candidate_score_std": float(scores.std()),
+                "candidate_score_min": float(scores.min()),
+                "candidate_score_max": float(scores.max()),
+                "candidate_score_column": score_column,
                 "total_lr_score": float(group["lr_score"].sum()),
                 "n_source_spots": int(group["src_spot_barcode"].nunique()),
                 "n_target_spots": int(group["dst_spot_barcode"].nunique()),
@@ -91,11 +101,11 @@ def evaluate_lr_candidate_scores(
     if not pair_rows:
         print("LR candidate stats: no candidates with matched controls")
         return None
-    pair_df = calibrate_lr_statistics(pd.DataFrame(pair_rows))
-    pair_path = os.path.join(output_dir, "lr_pair_associated_edge_statistics.csv")
+    pair_df = pd.DataFrame(pair_rows).sort_values("candidate_score_mean", ascending=False)
+    pair_path = os.path.join(output_dir, "lr_candidate_pair_diagnostics.csv")
     pair_df.to_csv(pair_path, index=False)
     print(
-        "LR candidate stats: "
+        "LR candidate diagnostics: "
         f"{pair_path} (events={len(unique)}, LR pairs={len(pair_df)})"
     )
     return pair_df
@@ -116,7 +126,7 @@ def evaluate_cell_communication(
     all_src_barcodes: List[List[str]] = None,
     all_dst_barcodes: List[List[str]] = None,
     export_unified: bool = False,
-    export_filtered: bool = True,
+    export_filtered: bool = False,
     attention_threshold: float = 0.1,
     lr_support_by_edge: Optional[
         Dict[Tuple[str, str, str, str], Dict[Tuple[str, str], float]]
@@ -172,42 +182,6 @@ def evaluate_cell_communication(
     # 注意：all_scores现在是1维的[total_edges]，直接使用即可
     avg_scores = all_scores  # [total_edges] - 已经是平均后的注意力得分
     
-    # ========== 应用边过滤策略：Attention Threshold ==========
-    # 保留注意力得分高于阈值的边，去除假阳性
-    keep_mask = (avg_scores >= attention_threshold)
-    print(
-        "Filter by attention: "
-        f"thr={attention_threshold}, kept={int(keep_mask.sum())}/{len(avg_scores)} "
-        f"({keep_mask.sum()/len(avg_scores)*100:.1f}%)"
-    )
-
-    # ✅ 保存过滤前的完整数据，用于生成 model_based_comm_path
-    all_scores_full = avg_scores.clone()  # 保存过滤前的完整注意力得分
-    all_edges_full = all_edges.clone()    # 保存过滤前的完整边索引
-    all_attrs_full = all_attrs.clone()    # 保存过滤前的完整边属性
-    all_spots_full = all_spots.clone()    # 保存过滤前的完整spot索引
-    all_n_spots_sub_full = all_n_spots_sub_batch.clone()  # 保存过滤前的完整n_spots_sub
-
-    # 应用过滤
-    filtered_scores = avg_scores[keep_mask]
-    filtered_edges = all_edges[:, keep_mask]
-    filtered_attrs = all_attrs[keep_mask]
-    filtered_spots = all_spots[keep_mask]
-
-    # 加载LR对映射
-    lr_mapping_path = os.path.join(output_dir, "lr_pair_mapping.txt")
-    lr_id_to_pair = {}
-    if os.path.exists(lr_mapping_path):
-        with open(lr_mapping_path, 'r') as f:
-            next(f)  # 跳过表头
-            for line in f:
-                lr_id, ligand, receptor = line.strip().split('\t')
-                lr_id_to_pair[int(lr_id)] = (ligand, receptor)
-        print(f"LR mapping loaded:  {len(lr_id_to_pair)} pairs")
-    else:
-        print(f"WARNING: missing LR mapping file: {lr_mapping_path}")
-
-    # 统计每个LR对的得分（按spot聚合）
     if lr_support_by_edge:
         unique_edges = {}
         for idx in range(all_edges.size(1)):
@@ -216,13 +190,13 @@ def evaluate_cell_communication(
             dst_local = int(all_edges[1, idx].item()) - n_spots_sub
             mapping = all_cell_node_mappings_flat[idx]
             if src_local not in mapping or dst_local not in mapping:
-                continue
+                raise ValueError(f'Missing cell-node mapping for communication edge {idx}')
             src_cell_id = mapping[src_local]
             dst_cell_id = mapping[dst_local]
-            if src_cell_id >= len(all_cell_names) or dst_cell_id >= len(all_cell_names):
-                continue
+            if not (0 <= src_cell_id < len(all_cell_names) and 0 <= dst_cell_id < len(all_cell_names)):
+                raise ValueError(f'Invalid cell identity for communication edge {idx}')
             if all_src_barcodes_flat is None or all_dst_barcodes_flat is None:
-                continue
+                raise ValueError('Spot barcodes are required for unique communication-edge export')
 
             edge_key = (
                 all_src_barcodes_flat[idx],
@@ -246,10 +220,14 @@ def evaluate_cell_communication(
         for edge_key, edge_stats in unique_edges.items():
             support = lr_support_by_edge.get(edge_key, {})
             if not support:
-                continue
+                raise ValueError(f'Missing complete LR support for communication edge {edge_key}')
             edge_attention = (
                 edge_stats["attention_sum"] / edge_stats["n_subgraph_occurrences"]
             )
+            if not np.isfinite(edge_attention):
+                raise ValueError(f'Nonfinite attention for communication edge {edge_key}')
+            if any(not np.isfinite(float(value)) or float(value) < 0 for value in support.values()):
+                raise ValueError(f'Invalid LR expression support for communication edge {edge_key}')
             support_names = sorted(
                 f"{ligand}_{receptor}" for ligand, receptor in support
             )
@@ -264,6 +242,10 @@ def evaluate_cell_communication(
                     "n_subgraph_occurrences": edge_stats["n_subgraph_occurrences"],
                     "supporting_lr_count": len(support),
                     "supporting_lr_pairs": ";".join(support_names),
+                    "supporting_lr_scores": json.dumps({
+                        f"{ligand}_{receptor}": float(value)
+                        for (ligand, receptor), value in sorted(support.items())
+                    }, sort_keys=True),
                 }
             )
             for lr_pair, lr_score in support.items():
@@ -276,6 +258,8 @@ def evaluate_cell_communication(
                     }
                 )
 
+        if not edge_rows:
+            raise ValueError('No valid communication edges available for export')
         edge_df = pd.DataFrame(edge_rows).sort_values(
             "edge_attention", ascending=False
         )
@@ -304,313 +288,29 @@ def evaluate_cell_communication(
             )
 
         pair_df = pd.DataFrame(pair_rows)
-        eligible = pair_df["eligible_for_ranking"]
-        pair_df["attention_rank"] = pd.Series(pd.NA, index=pair_df.index, dtype="Int64")
-        pair_df.loc[eligible, "attention_rank"] = (
-            pair_df.loc[eligible, "associated_edge_attention_mean"]
-            .rank(method="min", ascending=False)
-            .astype("Int64")
-        )
-        pair_df = calibrate_lr_statistics(pair_df)
-        pair_df = pair_df.sort_values(
-            ["eligible_for_ranking", "rank"],
-            ascending=[False, True],
-        )
-        pair_path = os.path.join(
-            output_dir, "lr_pair_associated_edge_statistics.csv"
-        )
+        pair_df["avg_attention_score"] = pair_df[
+            "associated_edge_attention_mean"
+        ]
+        pair_df["std_attention_score"] = pair_df[
+            "associated_edge_attention_std"
+        ]
+        pair_df["occurrence_count"] = pair_df["supporting_unique_edges"]
+        pair_df["score_source"] = "shared_attention_associated_lr_support"
+        pair_df = rank_associated_attention(pair_df)
+        pair_path = os.path.join(output_dir, "lr_pair_statistics.csv")
         pair_df.to_csv(pair_path, index=False)
         print(
             "Unique edge stats:   "
             f"{edge_path} (edges={len(edge_df)}, LR pairs={len(pair_df)}, "
             f"ranking_min_edges={min_ranking_edges})"
         )
-    lr_spot_scores = {}  # {(center_spot, lr_id): [attention_scores]}
-    # 初始化统计计数器
-    processed_edges = 0
-    skipped_no_lr = 0
-
-    for i in range(all_edges.size(1)):
-        center_spot_idx = all_spots[i].item()
-        lr_score = all_attrs[i, 0].item()
-        lr_id = int(all_attrs[i, 1].item())
-        attention_score = avg_scores[i].item()
-
-        if lr_id >= 0:  # 有效的LR对
-            # 收集每个spot-lr对的得分
-            key = (center_spot_idx, lr_id)
-            if key not in lr_spot_scores:
-                lr_spot_scores[key] = []
-            lr_spot_scores[key].append(attention_score)
-            processed_edges += 1
-        else:
-            skipped_no_lr += 1
-
-    print(f"LR scores used:     processed_edges={processed_edges}, skipped_no_lr={skipped_no_lr}")
-
-    # 计算每个spot-lr对的平均得分
-    spot_lr_avg_scores = {}
-    for key, scores in lr_spot_scores.items():
-        spot_lr_avg_scores[key] = np.mean(scores)
-
-    # ========== 统计LR对的出现次数和得分 ==========
-
-    # 按LR ID统计
-    lr_id_stats = {}
-    for (spot_idx, lr_id), score in spot_lr_avg_scores.items():
-        if lr_id not in lr_id_stats:
-            lr_id_stats[lr_id] = {
-                'count': 0,
-                'scores': [],
-                'spots': set()
-            }
-        lr_id_stats[lr_id]['count'] += 1
-        lr_id_stats[lr_id]['scores'].append(score)
-        lr_id_stats[lr_id]['spots'].add(spot_idx)
-
-    # 计算统计量并转换为LR对名称
-    lr_pair_summary = []
-    for lr_id, stats in lr_id_stats.items():
-        if lr_id in lr_id_to_pair:
-            ligand, receptor = lr_id_to_pair[lr_id]
-            lr_pair_name = f"{ligand}_{receptor}"
-        else:
-            lr_pair_name = f"lr_{lr_id}"
-
-        lr_pair_summary.append({
-            'lr_pair': lr_pair_name,
-            'lr_id': lr_id,
-            'occurrence_count': stats['count'],
-            'avg_attention_score': np.mean(stats['scores']),
-            'std_attention_score': np.std(stats['scores']),
-            'min_attention_score': np.min(stats['scores']),
-            'max_attention_score': np.max(stats['scores']),
-            'n_spots': len(stats['spots'])
-        })
-
-    # 保存LR对统计结果
-    lr_stats_path = os.path.join(output_dir, "lr_pair_statistics.csv")
-    legacy_stats_df = calibrate_lr_statistics(pd.DataFrame(lr_pair_summary))
-    legacy_stats_df.to_csv(lr_stats_path, index=False)
-
-    print(f"LR stats saved:     {lr_stats_path} (unique_lr_pairs={len(lr_pair_summary)})")
-    if lr_support_by_edge:
-        print(
-            "LR stats note:      legacy representative labels; "
-            "use lr_pair_associated_edge_statistics.csv for LR ranking"
-        )
-
-    top_k = 10
-    print(f"\nTop {top_k} LR pairs by occurrence:")
-    for i, item in enumerate(sorted(lr_pair_summary, key=lambda x: x['occurrence_count'], reverse=True)[:top_k]):
-        print(
-            f"  {i+1}. {item['lr_pair']}: n={item['occurrence_count']}, "
-            f"avg_attention={item['avg_attention_score']:.4f}, spots={item['n_spots']}"
-        )
-
-    print(f"\nTop {top_k} LR pairs by attention:")
-    for i, item in enumerate(sorted(lr_pair_summary, key=lambda x: x['avg_attention_score'], reverse=True)[:top_k]):
-        print(f"  {i+1}. {item['lr_pair']}: avg_attention={item['avg_attention_score']:.4f}, n={item['occurrence_count']}")
-
-    # ========== 生成统一的通讯结果 ==========
-    print("\nExport communication CSVs...")
-
-    # 生成单一CSV文件，包含所有需要的列
-    unified_comm_path = os.path.join(output_dir, "lr_communication.csv")
-    if export_unified:
-        with open(unified_comm_path, 'w') as f:
-            f.write("src_spot_barcode,dst_spot_barcode,source_cell,target_cell,lr_pair,original_lr_score,attention_score\n")
-
-            # 使用完整数据，先计算哪些边是真正的cell-cell边
-            src_nodes_full = all_edges_full[0]
-            dst_nodes_full = all_edges_full[1]
-            n_spots_sub_arr = all_n_spots_sub_full
-
-            # mask where both src and dst are cell nodes (their node indices >= n_spots_sub for that edge)
-            cell_cell_mask = (src_nodes_full >= n_spots_sub_arr) & (dst_nodes_full >= n_spots_sub_arr)
-            total_cell_cell_edges = int(cell_cell_mask.sum().item())
-            print(f"Unified export:     cell-cell edges={total_cell_cell_edges}/{all_edges_full.size(1)}")
-
-            generated_rows = 0
-
-            # Show examples for debugging if nothing gets generated
-            first_bad_examples = 0
-
-            # If there are no edges matching the per-edge n_spots_sub rule (rare), try a fallback strategy
-            if total_cell_cell_edges == 0:
-                try:
-                    min_n_spots_sub = int(n_spots_sub_arr.min().item())
-                    print(f"WARNING: fallback to global min n_spots_sub={min_n_spots_sub} for cell-cell masking")
-                    cell_cell_mask = (src_nodes_full >= min_n_spots_sub) & (dst_nodes_full >= min_n_spots_sub)
-                    total_cell_cell_edges = int(cell_cell_mask.sum().item())
-                    print(f"Unified export:     fallback cell-cell edges={total_cell_cell_edges}/{all_edges_full.size(1)}")
-                except Exception:
-                    print("WARNING: fallback strategy failed")
-
-            # If still zero, perform a permissive mapping where we try both subtraction and non-subtraction
-            if total_cell_cell_edges == 0:
-                print("WARNING: no cell-cell edges found; trying permissive mapping")
-                candidate_indices = []
-                for idx in range(all_edges_full.size(1)):
-                    src_idx = int(src_nodes_full[idx].item())
-                    dst_idx = int(dst_nodes_full[idx].item())
-                    n_sp = int(n_spots_sub_arr[idx].item())
-                    # Try both schemes
-                    for subtract in (True, False):
-                        s_idx = src_idx - n_sp if subtract else src_idx
-                        d_idx = dst_idx - n_sp if subtract else dst_idx
-                        if 0 <= s_idx < n_cells and 0 <= d_idx < n_cells:
-                            candidate_indices.append(idx)
-                            break
-
-                cell_cell_mask = torch.zeros_like(src_nodes_full, dtype=torch.bool)
-                if candidate_indices:
-                    cell_cell_mask[candidate_indices] = True
-                    total_cell_cell_edges = int(len(candidate_indices))
-                    print(f"Unified export:     permissive cell-cell edges={total_cell_cell_edges}/{all_edges_full.size(1)}")
-            cell_cell_indices = torch.where(cell_cell_mask)[0].tolist()
-            skipped_out_of_range = 0
-            skipped_missing_mapping = 0
-
-            for idx in cell_cell_indices:
-                src_idx = int(src_nodes_full[idx].item())
-                dst_idx = int(dst_nodes_full[idx].item())
-                center_spot_idx = int(all_spots_full[idx].item())
-                n_spots_sub = int(n_spots_sub_arr[idx].item())
-                cell_node_mapping = all_cell_node_mappings_flat[idx]
-
-                # Compute cell indices relative to subgraph
-                src_cell_local_idx = src_idx - n_spots_sub
-                dst_cell_local_idx = dst_idx - n_spots_sub
-
-                if not isinstance(cell_node_mapping, dict):
-                    skipped_missing_mapping += 1
-                    continue
-
-                # Use mapping to get cell type ids
-                if src_cell_local_idx in cell_node_mapping and dst_cell_local_idx in cell_node_mapping:
-                    src_cell_type_id = cell_node_mapping[src_cell_local_idx]
-                    dst_cell_type_id = cell_node_mapping[dst_cell_local_idx]
-                    
-                    # Map cell type ids to cell names
-                    if src_cell_type_id < len(all_cell_names) and dst_cell_type_id < len(all_cell_names):
-                        src_cell = all_cell_names[src_cell_type_id]
-                        dst_cell = all_cell_names[dst_cell_type_id]
-                    else:
-                        skipped_out_of_range += 1
-                        continue
-                else:
-                    skipped_missing_mapping += 1
-                    continue
-
-                lr_score = float(all_attrs_full[idx, 0].item())
-                lr_id = int(all_attrs_full[idx, 1].item())
-                attention_score = float(all_scores_full[idx].item())
-                edge_logits = attention_score
-
-                # Get LR pair name
-                if lr_id in lr_id_to_pair:
-                    ligand, receptor = lr_id_to_pair[lr_id]
-                    lr_pair_name = f"{ligand}_{receptor}"
-                else:
-                    lr_pair_name = f"lr_{lr_id}"
-
-                # Map spot barcodes
-                if all_src_barcodes_flat is not None and all_dst_barcodes_flat is not None and idx < len(all_src_barcodes_flat):
-                    src_barcode = all_src_barcodes_flat[idx]
-                    dst_barcode = all_dst_barcodes_flat[idx]
-                elif spot_names is not None and center_spot_idx < len(spot_names):
-                    src_barcode = spot_names[center_spot_idx]
-                    dst_barcode = spot_names[center_spot_idx]
-                else:
-                    src_barcode = str(center_spot_idx)
-                    dst_barcode = str(center_spot_idx)
-
-                f.write(f"{src_barcode},{dst_barcode},{src_cell},{dst_cell},{lr_pair_name},{lr_score:.6f},{attention_score:.6f}\n")
-                generated_rows += 1
-
-            if skipped_out_of_range or skipped_missing_mapping:
-                skipped_total = skipped_out_of_range + skipped_missing_mapping
-                print(
-                    f"Unified export:     skipped={skipped_total} (out_of_range={skipped_out_of_range}, missing_mapping={skipped_missing_mapping})"
-                )
-            print(f"Unified CSV saved:  {unified_comm_path} (rows={generated_rows})")
-    else:
-        print("Unified export:     skipped (export_unified=False)")
-
-        # 生成按注意力阈值过滤后的通讯结果
-    if export_filtered:
-        filtered_comm_path = os.path.join(output_dir, f"lr_communication_filtered_{attention_threshold}.csv")
-        with open(filtered_comm_path, 'w') as f:
-            f.write("src_spot_barcode,dst_spot_barcode,source_cell,target_cell,lr_pair,original_lr_score,attention_score\n")
-
-            # 过滤后的数据
-            src_nodes_f = filtered_edges[0]
-            dst_nodes_f = filtered_edges[1]
-            n_spots_sub_f = all_n_spots_sub_full[keep_mask]
-
-            cell_cell_mask_f = (src_nodes_f >= n_spots_sub_f) & (dst_nodes_f >= n_spots_sub_f)
-            total_cell_cell_edges_f = int(cell_cell_mask_f.sum().item())
-            print(f"Filtered export:    cell-cell edges={total_cell_cell_edges_f}/{filtered_edges.size(1)}")
-
-            keep_indices = keep_mask.nonzero(as_tuple=False).view(-1).tolist()
-            filtered_cell_node_mappings = [all_cell_node_mappings_flat[i] for i in keep_indices]
-            if all_src_barcodes_flat is not None and all_dst_barcodes_flat is not None:
-                filtered_src_barcodes = [all_src_barcodes_flat[i] for i in keep_indices]
-                filtered_dst_barcodes = [all_dst_barcodes_flat[i] for i in keep_indices]
-            else:
-                filtered_src_barcodes = None
-                filtered_dst_barcodes = None
-
-            generated_rows = 0
-            cell_cell_indices_f = torch.where(cell_cell_mask_f)[0].tolist()
-            for idx in cell_cell_indices_f:
-                src_idx = int(src_nodes_f[idx].item())
-                dst_idx = int(dst_nodes_f[idx].item())
-                n_spots_sub = int(n_spots_sub_f[idx].item())
-                center_spot_idx = int(filtered_spots[idx].item())
-                cell_node_mapping = filtered_cell_node_mappings[idx]
-
-                src_cell_local_idx = src_idx - n_spots_sub
-                dst_cell_local_idx = dst_idx - n_spots_sub
-                if src_cell_local_idx not in cell_node_mapping or dst_cell_local_idx not in cell_node_mapping:
-                    continue
-
-                src_cell_type_id = cell_node_mapping[src_cell_local_idx]
-                dst_cell_type_id = cell_node_mapping[dst_cell_local_idx]
-                if src_cell_type_id >= len(all_cell_names) or dst_cell_type_id >= len(all_cell_names):
-                    continue
-
-                src_cell = all_cell_names[src_cell_type_id]
-                dst_cell = all_cell_names[dst_cell_type_id]
-
-                lr_score = float(filtered_attrs[idx, 0].item())
-                lr_id = int(filtered_attrs[idx, 1].item())
-                attention_score = float(filtered_scores[idx].item())
-
-                if lr_id in lr_id_to_pair:
-                    ligand, receptor = lr_id_to_pair[lr_id]
-                    lr_pair_name = f"{ligand}_{receptor}"
-                else:
-                    lr_pair_name = f"lr_{lr_id}"
-
-                if filtered_src_barcodes is not None and filtered_dst_barcodes is not None and idx < len(filtered_src_barcodes):
-                    src_barcode = filtered_src_barcodes[idx]
-                    dst_barcode = filtered_dst_barcodes[idx]
-                elif spot_names is not None and center_spot_idx < len(spot_names):
-                    src_barcode = spot_names[center_spot_idx]
-                    dst_barcode = spot_names[center_spot_idx]
-                else:
-                    src_barcode = str(center_spot_idx)
-                    dst_barcode = str(center_spot_idx)
-
-                f.write(f"{src_barcode},{dst_barcode},{src_cell},{dst_cell},{lr_pair_name},{lr_score:.6f},{attention_score:.6f}\n")
-                generated_rows += 1
-
-        print(f"Filtered CSV saved: {filtered_comm_path}")
-    else:
-        print("Filtered export:    skipped (export_filtered=False)")
-
+    # Aggregate-edge representative LR IDs cannot identify individual LR scores.
+    # Stop before the historical exports, including filtered variants.
+    if export_unified or export_filtered:
+        print("Legacy representative-LR exports are disabled; use communication_edge_statistics.csv")
+    if not lr_support_by_edge:
+        raise ValueError("Complete lr_support_by_edge is required for valid LR ranking")
+    return
 def plot_dgi_loss(dgi_train_losses, dgi_val_losses=None, output_dir: str = None, epochs: int = None) -> None:
     """
     Plot and save DGI pretraining loss curve.

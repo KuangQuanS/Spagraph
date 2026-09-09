@@ -8,7 +8,6 @@ import json
 import os
 import random
 import sys
-from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Dict, Optional, Sequence, Union
 
@@ -16,9 +15,7 @@ import pandas as pd
 
 from spagraph.cellcom.cellcom import main as cellcom_main, parse_args
 from spagraph.cellcom.relation_ranker import (
-    DEFAULT_CALIBRATION_PROFILE,
-    SYNTHETIC_V2_FROZEN_WEIGHTS,
-    ensemble_lr_rankings,
+    aggregate_attention_rankings,
 )
 
 
@@ -27,27 +24,30 @@ def aggregate_cellcom_seed_outputs(
     output_dir: Union[str, Path],
     seeds: Sequence[int],
 ) -> Dict[str, Any]:
-    """Aggregate calibrated LR rankings produced by independent Stage3 seeds."""
+    """Aggregate raw attention percentiles from all requested Stage 3 runs."""
     if len(seed_dirs) != len(seeds) or not seed_dirs:
         raise ValueError("seed_dirs and seeds must be non-empty and have equal length")
+    if len(set(seeds)) != len(seeds):
+        raise ValueError("seeds must be unique")
+    if len({str(Path(p).resolve()) for p in seed_dirs}) != len(seed_dirs):
+        raise ValueError("Each run must have a distinct directory")
     frames = []
     for seed_dir in seed_dirs:
-        path = Path(seed_dir) / "lr_pair_associated_edge_statistics.csv"
+        path = Path(seed_dir) / "lr_pair_statistics.csv"
         if not path.exists():
             raise FileNotFoundError(f"Missing per-seed LR statistics: {path}")
         frames.append(pd.read_csv(path))
 
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
-    ensemble = ensemble_lr_rankings(frames)
-    ensemble["calibration_profile"] = DEFAULT_CALIBRATION_PROFILE
+    ensemble = aggregate_attention_rankings(frames)
     ensemble_path = output / "lr_pair_ensemble_statistics.csv"
     ensemble.to_csv(ensemble_path, index=False)
     manifest = {
         "seeds": [int(value) for value in seeds],
         "n_repeats": len(seeds),
-        "calibration_profile": DEFAULT_CALIBRATION_PROFILE,
-        "calibration_weights": asdict(SYNTHETIC_V2_FROZEN_WEIGHTS),
+        "aggregation": "mean within-run raw attention percentile",
+        "eligibility": "present and eligible in every requested run",
         "per_seed_directories": [str(Path(value)) for value in seed_dirs],
     }
     manifest_path = output / "cellcom_ensemble_manifest.json"
@@ -87,7 +87,8 @@ def run_cellcom(
     output_dim: int = 128,
     lambda_mask_recon: float = 1.0,
     lambda_node_recon: float = 0.5,
-    lambda_relation_rank: float = 0.1,
+    lambda_relation_rank: float = 0.0,
+    lambda_candidate_rank: float = 0.0,
     relation_rank_margin: float = 0.1,
     candidate_negative_mode: str = "graph",
     candidate_score_mode: str = "absolute",
@@ -113,7 +114,7 @@ def run_cellcom(
     early_stop_metric: str = "total",
     save_lr_scores_csv: bool = False,
     export_unified_csv: bool = False,
-    export_filtered_csv: bool = True,
+    export_filtered_csv: bool = False,
     # Legacy support
     args: Optional[Union[argparse.Namespace, Dict[str, Any]]] = None,
     **overrides: Any,
@@ -143,16 +144,17 @@ def run_cellcom(
         min_comm_edges: Minimum communication edges threshold
         spot_cell_expr_csv: Pre-computed spot-cell expression CSV (optional)
         save_lr_scores_csv: Whether to save Stage 3.4 lr_scores.csv
-        export_unified_csv: Whether to export full lr_communication.csv
-        export_filtered_csv: Whether to export filtered lr_communication CSV
+        export_unified_csv: Deprecated compatibility flag; representative-LR exports are disabled
+        export_filtered_csv: Deprecated compatibility flag; filtered representative-LR exports are disabled
         gat_hidden_dims: GAT hidden dimensions (comma-separated)
         gat_heads: Number of attention heads
         gat_dropout: Dropout probability
         output_dim: Output dimension
         lambda_mask_recon: Mask reconstruction loss weight
         lambda_node_recon: Node reconstruction loss weight
-        lambda_relation_rank: Joint directed relation ranking and LR candidate
-            contrastive loss weight; 0 disables both losses
+        lambda_relation_rank: Aggregate directed relation ranking loss weight
+        lambda_candidate_rank: Optional LR candidate contrastive loss weight;
+            the frozen associated-edge ranking uses 0
         relation_rank_margin: Margin between observed and corrupted relation logits
         candidate_negative_mode: ``graph`` for legacy graph corruptions or
             ``lr_matched`` for experimental within graph and within LR controls
@@ -196,6 +198,8 @@ def run_cellcom(
         raise ValueError("n_repeats must be at least 1")
     if lambda_relation_rank < 0:
         raise ValueError("lambda_relation_rank must be non-negative")
+    if lambda_candidate_rank < 0:
+        raise ValueError("lambda_candidate_rank must be non-negative")
     if relation_rank_margin < 0:
         raise ValueError("relation_rank_margin must be non-negative")
     if candidate_negative_mode not in {"graph", "lr_matched"}:
@@ -240,6 +244,7 @@ def run_cellcom(
             output_dim=output_dim, lambda_mask_recon=lambda_mask_recon,
             lambda_node_recon=lambda_node_recon,
             lambda_relation_rank=lambda_relation_rank,
+            lambda_candidate_rank=lambda_candidate_rank,
             relation_rank_margin=relation_rank_margin,
             candidate_negative_mode=candidate_negative_mode,
             candidate_score_mode=candidate_score_mode,
@@ -319,6 +324,7 @@ def run_cellcom(
         lambda_mask_recon=lambda_mask_recon,
         lambda_node_recon=lambda_node_recon,
         lambda_relation_rank=lambda_relation_rank,
+        lambda_candidate_rank=lambda_candidate_rank,
         relation_rank_margin=relation_rank_margin,
         candidate_negative_mode=candidate_negative_mode,
         candidate_score_mode=candidate_score_mode,
@@ -353,7 +359,7 @@ def run_cellcom_ensemble(
     seeds: Sequence[int] = (11, 23, 42, 67, 101),
     **kwargs: Any,
 ) -> Dict[str, Any]:
-    """Run public Stage3 repeatedly and return a calibrated seed ensemble."""
+    """Run Stage3 repeatedly and aggregate within-run attention percentiles."""
     return run_cellcom(seeds=seeds, n_repeats=len(seeds), **kwargs)
 
 

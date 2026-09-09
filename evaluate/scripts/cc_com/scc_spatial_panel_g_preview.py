@@ -22,7 +22,6 @@ DATA_DIR = EVALUATE_DIR / "data" / "GSE144236"
 DATABASE_ROOT = EVALUATE_DIR.parent / "spagraph_data" / "database"
 
 ST_H5AD_PATH = DATABASE_ROOT / "GSE144240" / "GSE144236_P2_ST.h5ad"
-SPAGRAPH_LR_PATH = DATA_DIR / "lr_communication.csv"
 COMPOSITION_PATH = DATA_DIR / "Spatial_composition.csv"
 CELLCHAT_SHARED_PATH = DATA_DIR / "cellchat_baseline_figures" / "cellchat_spagraph_shared_pair_ranks.csv"
 COMMOT_PATH = DATA_DIR / "commot_baseline_perm20_min5" / "commot_pair_summary_cross_group.csv"

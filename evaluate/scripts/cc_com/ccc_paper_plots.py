@@ -27,6 +27,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from spagraph.analysis.figure3e_statistics import compare_lr_pair_groups
+from spagraph.cellcom.relation_ranker import read_associated_lr_events
 
 DEFAULT_DATASET = "GSE144236"
 DATASET_ANALYSIS_DIRS = {
@@ -94,14 +95,14 @@ def parse_args() -> argparse.Namespace:
         "--lr-csv",
         type=Path,
         default=None,
-        help="Optional raw lr_communication.csv path. If provided, metrics are rebuilt from this file.",
+        help="Complete communication_edge_statistics.csv; rebuild metrics from all LR support, not representative IDs.",
     )
     parser.add_argument(
         "--pair-ranking-csv",
         type=Path,
         default=None,
         help=(
-            "Optional LR-pair ranking table, such as lr_pair_associated_edge_statistics.csv. "
+            "Optional canonical LR-pair ranking table (lr_pair_statistics.csv). "
             "When provided with --lr-csv, attention ranking uses this table."
         ),
     )
@@ -206,7 +207,7 @@ def load_required_csvs(analysis_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame, 
 
 
 def load_lr_table(csv_path: Path) -> pd.DataFrame:
-    df = pd.read_csv(csv_path, usecols=list(EXPECTED_LR_COLUMNS), low_memory=False)
+    df = read_associated_lr_events(csv_path)
     df["lr_pair"] = df["lr_pair"].astype(str)
     df["src_spot_barcode"] = df["src_spot_barcode"].astype(str)
     df["dst_spot_barcode"] = df["dst_spot_barcode"].astype(str)
@@ -276,13 +277,19 @@ def apply_pair_ranking(pair_stats: pd.DataFrame, pair_ranking_csv: Path | None) 
     cols = ["lr_pair", "associated_edge_attention_mean"]
     if "attention_rank" in ranking.columns:
         cols.append("attention_rank")
-    ranking = ranking[cols].drop_duplicates(subset=["lr_pair"]).copy()
+    if ranking.lr_pair.duplicated().any():
+        raise ValueError("Ranking must contain exactly one row per LR pair")
+    if "score_source" in ranking and not ranking.score_source.eq("shared_attention_associated_lr_support").all():
+        raise ValueError("This attention plot requires single-run associated-edge attention, not candidate or percentile scores")
+    ranking = ranking[cols].copy()
     ranking["lr_pair"] = ranking["lr_pair"].astype(str)
 
     out = pair_stats.copy()
     out["lr_pair"] = out["lr_pair"].astype(str)
     out = out.merge(ranking, on="lr_pair", how="left")
-    out["attention_mean"] = out["associated_edge_attention_mean"].fillna(out["attention_mean"])
+    if out["associated_edge_attention_mean"].isna().any():
+        raise ValueError("Ranking does not cover all plotted LR pairs; refusing to mix historical and current scores")
+    out["attention_mean"] = out["associated_edge_attention_mean"]
     out["attention_sum"] = out["attention_mean"] * out["occurrence_count"]
     return out.drop(columns=["associated_edge_attention_mean"])
 

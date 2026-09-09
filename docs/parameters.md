@@ -149,3 +149,25 @@ replicates.
 The calculation is implemented in
 [`scripts/summarize_communication_focality.py`](../scripts/summarize_communication_focality.py).
 The resulting values and summary are stored under `results/communication/figures/`.
+
+## Communication output compatibility
+
+Current package runs export `communication_edge_statistics.csv` with complete
+LR support and `lr_pair_statistics.csv` with single-run associated-edge ranks.
+Repeated runs additionally produce `lr_pair_ensemble_statistics.csv` and a seed
+manifest. The old representative-LR `lr_communication.csv` is no longer written,
+including when deprecated export flags are supplied.
+
+Use `ccc_minimal_analysis.py` and `ccc_paper_plots.py` in `evaluate/scripts/cc_com/`
+for current single-run analysis. The SCC consensus replacement panels use
+`scripts/plot_communication_ranks.py`, `plot_communication_abundance.py`,
+`plot_communication_focality.py`, and `plot_scc_seed_stability.py`; compose the
+replacement PDFs with `scripts/assemble_communication_figures.py`.
+
+Older `lr_plot.py`, `panel_g_*.py`, `cellchat_scc_baseline_figures.py`, and
+`fix_csv.py` scripts retain historical data contracts. They are archival figure
+recipes, not current package entry points: do not rename a current output to
+`lr_communication.csv` to make them run. Any reuse requires expansion through
+`spagraph.cellcom.relation_ranker.read_associated_lr_events`, which checks
+complete LR support and rejects representative-ID tables. Scripts in `trash/`
+are also historical. This distinction does not revalidate historical figures.

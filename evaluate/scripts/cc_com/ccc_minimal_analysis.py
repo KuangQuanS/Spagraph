@@ -50,7 +50,7 @@ PAIR_SIGNAL = "original_lr_score_sum"
 MIN_PAIR_OCCURRENCE = 10
 OBSERVED_RUN_DIRNAME = "_observed_run"
 OBSERVED_CELLCOM_DIRNAME = "cellcom"
-CELLCOM_UNIFIED_CSV = "lr_communication.csv"
+CELLCOM_UNIFIED_CSV = "communication_edge_statistics.csv"
 LEGACY_OUTPUT_FILES = (
     "boundary_spots.csv",
     "matched_random_summary.csv",
@@ -288,13 +288,10 @@ def resolve_spot_cell_expr_csv(config: DatasetConfig, required: bool) -> Path | 
 
 
 def read_lr_table(csv_path: Path) -> pd.DataFrame:
+    from spagraph.cellcom.relation_ranker import read_associated_lr_events
+
     require_existing(csv_path)
-    try:
-        lr_df = pd.read_csv(csv_path, usecols=list(EXPECTED_LR_COLUMNS), low_memory=False)
-    except ValueError as exc:
-        raise ValueError(
-            f"{csv_path} is missing required columns from {sorted(EXPECTED_LR_COLUMNS)}"
-        ) from exc
+    lr_df = read_associated_lr_events(csv_path)
     lr_df["lr_pair"] = lr_df["lr_pair"].astype(str)
     lr_df["src_spot_barcode"] = lr_df["src_spot_barcode"].astype(str)
     lr_df["dst_spot_barcode"] = lr_df["dst_spot_barcode"].astype(str)
@@ -791,7 +788,7 @@ def run_cellcom_rerun(
         batch_size=config.batch_size,
         num_workers=config.num_workers,
         save_lr_scores_csv=config.save_lr_scores_csv,
-        export_unified_csv=True,
+        export_unified_csv=False,
         export_filtered_csv=False,
         seed=config.seed,
         device=device,

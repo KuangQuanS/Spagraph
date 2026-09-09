@@ -655,9 +655,10 @@ def evaluate_semisynthetic_benchmark(output: Path) -> pd.DataFrame:
     ).astype(bool)
     stats = pd.read_csv(output / "cellcom" / "lr_pair_statistics.csv")
     ranking = truth.merge(stats, on="lr_pair", how="left")
-    communication_path = output / "cellcom" / "lr_communication.csv"
+    communication_path = output / "cellcom" / "communication_edge_statistics.csv"
     if communication_path.exists():
-        communication = pd.read_csv(communication_path)
+        from spagraph.cellcom.relation_ranker import read_associated_lr_events
+        communication = read_associated_lr_events(communication_path)
         edge_stats = communication.groupby("lr_pair").agg(
             edge_count=("attention_score", "size"),
             mean_edge_attention=("attention_score", "mean"),
@@ -783,7 +784,7 @@ def run_semisynthetic_benchmark(config: SemisyntheticBenchmarkConfig) -> pd.Data
         early_stop_patience=max(8, config.epochs // 3),
         early_stop_min_delta=0.001,
         attention_threshold=0.0,
-        export_unified_csv=True,
+        export_unified_csv=False,
         export_filtered_csv=False,
         save_lr_scores_csv=True,
         device=config.device,

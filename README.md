@@ -98,9 +98,10 @@ Stage 1 returns an in-memory `Stage1Artifacts` object. When `output_dir` is
 provided it also writes the run configuration and modality-alignment plots.
 Stage 2 writes `*_composition.csv`, configuration and training diagnostics;
 `save_reconstructed_genes=True` additionally writes the
-`*_spot_cell_expr.csv` file required by Stage 3. Stage 3 writes filtered or
-unified LR communication tables and model diagnostics under its output
-directory.
+`*_spot_cell_expr.csv` file required by Stage 3. Stage 3 writes
+`communication_edge_statistics.csv` (unique directed edges and their complete
+LR support) and `lr_pair_statistics.csv` (associated-edge attention summaries).
+Deprecated unified and filtered LR exports are disabled.
 
 ### Pseudo-spot mixture alignment
 
@@ -118,10 +119,16 @@ arguments remain available only for reproducing older ablations.
 
 Stage 3 supports `n_repeats` for stochastic stability. `n_repeats=5` trains
 five independent models and writes an ensemble LR ranking with score and rank
-variation; `n_repeats=1` remains the faster exploratory default. Candidate
-ranking combines neural attention with support, spatial specificity and
-cross-run uncertainty, while retaining the raw neural score and rank in the
-output. Explicit seeds can be supplied with `spg.cellcom_ensemble(...)`.
+variation; `n_repeats=1` remains the faster exploratory default. Each run ranks
+LR pairs by mean shared attention over unique supporting edges. The ensemble
+ranks by the mean within-run attention percentile, retaining only pairs eligible
+in every requested run. It writes `lr_pair_ensemble_statistics.csv` and
+`cellcom_ensemble_manifest.json`. Support and variability are descriptive, not
+additional ranking factors. Explicit seeds can be supplied with
+`spg.cellcom_ensemble(...)`. The default objective uses edge and node
+reconstruction; relation and candidate ranking losses are disabled. Repeated
+runs assess sensitivity to training randomness, not independent biological
+replication or a guaranteed improvement in ranking accuracy.
 
 ## Inputs and outputs
 

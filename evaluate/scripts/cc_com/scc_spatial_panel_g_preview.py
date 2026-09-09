@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import argparse
 from pathlib import Path
 
 import matplotlib
@@ -54,26 +55,44 @@ def format_pair(lr_pair: str) -> str:
     return lr_pair.replace("_", "-")
 
 
-def load_inputs():
-    spagraph_df = pd.read_csv(SPAGRAPH_LR_PATH)
+def load_inputs(args):
+    keys = ['src_spot_barcode', 'dst_spot_barcode', 'source_cell', 'target_cell']
+    frames = []
+    for path in args.edge_tables:
+        frame = pd.read_csv(path)
+        if frame.duplicated(keys).any():
+            raise ValueError(f'Duplicate directed edges: {path}')
+        frames.append(frame.set_index(keys).sort_index())
+    base = frames[0].copy()
+    for frame in frames:
+        if not base.index.equals(frame.index) or not base.supporting_lr_pairs.equals(frame.supporting_lr_pairs):
+            raise ValueError('Run edge sets or LR support differ')
+        if not np.isfinite(frame.edge_attention).all():
+            raise ValueError('Nonfinite attention')
+    base['attention_score'] = sum(frame.edge_attention for frame in frames) / len(frames)
+    spagraph_df = base.reset_index()
+    spagraph_df['lr_pair'] = spagraph_df.supporting_lr_pairs.str.split(';')
+    spagraph_df = spagraph_df.explode('lr_pair')
     spagraph_df["lr_pair"] = spagraph_df["lr_pair"].astype(str)
     spagraph_df["src_spot_barcode"] = spagraph_df["src_spot_barcode"].astype(str)
     spagraph_df["dst_spot_barcode"] = spagraph_df["dst_spot_barcode"].astype(str)
     spagraph_df["attention_score"] = pd.to_numeric(spagraph_df["attention_score"], errors="coerce")
     spagraph_df = spagraph_df.dropna(subset=["attention_score"]).copy()
 
-    adata = sc.read_h5ad(ST_H5AD_PATH)
+    adata = sc.read_h5ad(args.spatial)
     adata.obs_names = adata.obs_names.astype(str)
     coords = pd.DataFrame(adata.obsm["spatial"], index=adata.obs_names, columns=["x", "y"]).astype(float)
 
-    composition = pd.read_csv(COMPOSITION_PATH, index_col=0)
+    composition = pd.read_csv(args.composition, index_col=0)
     composition.index = composition.index.astype(str)
     composition = composition.loc[coords.index.intersection(composition.index)].copy()
 
-    ranks = pd.read_csv(CELLCHAT_SHARED_PATH)
-    commot = pd.read_csv(COMMOT_PATH)[["interaction_name", "commot_rank"]].rename(columns={"interaction_name": "lr_pair"})
-    giotto = pd.read_csv(GIOTTO_PATH)[["interaction_name", "giotto_spatial_rank"]].rename(columns={"interaction_name": "lr_pair"})
-    rank_df = ranks.merge(commot, on="lr_pair", how="left").merge(giotto, on="lr_pair", how="left")
+    rank_df = pd.read_csv(args.ranks)
+    if not rank_df.lr_pair.is_unique:
+        raise ValueError('Ranks must have unique LR identities')
+    missing = set(spagraph_df.src_spot_barcode) | set(spagraph_df.dst_spot_barcode)
+    if missing - set(coords.index):
+        raise ValueError('Edge endpoints absent from spatial coordinates')
     return spagraph_df, adata, coords, composition, rank_df
 
 
@@ -200,8 +219,8 @@ def draw_spatial_pair(ax, pair_name, role_text, rank_df, spagraph_df, adata, coo
     ax.text(0.5, 1.075, f"{format_pair(pair_name)}  ({role_text})", transform=ax.transAxes, ha="center", va="bottom", fontsize=12, fontweight="bold", color="#111827")
     subtitle1 = f"Spagraph #{int(row.spagraph_rank)} | CellChat #{int(row.cellchat_rank)}"
     subtitle2 = f"COMMOT #{int(row.commot_rank)} | Giotto #{int(row.giotto_spatial_rank)}"
-    ax.text(0.5, 1.032, subtitle1, transform=ax.transAxes, ha="center", va="bottom", fontsize=8.8, color="#6B7280")
-    ax.text(0.5, 1.001, subtitle2, transform=ax.transAxes, ha="center", va="bottom", fontsize=8.8, color="#6B7280")
+    ax.text(0.5, 1.032, subtitle1, transform=ax.transAxes, ha="center", va="bottom", fontsize=11, color="#6B7280")
+    ax.text(0.5, 1.001, subtitle2, transform=ax.transAxes, ha="center", va="bottom", fontsize=11, color="#6B7280")
 
     if not ax.yaxis_inverted():
         ax.invert_yaxis()
@@ -210,9 +229,18 @@ def draw_spatial_pair(ax, pair_name, role_text, rank_df, spagraph_df, adata, coo
 
 
 def main():
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    parser = argparse.ArgumentParser(description='Render corrected LR-associated spatial edges using the original panel style.')
+    parser.add_argument('--edge-tables', type=Path, nargs='+', required=True)
+    parser.add_argument('--spatial', type=Path, required=True)
+    parser.add_argument('--composition', type=Path, required=True)
+    parser.add_argument('--ranks', type=Path, required=True)
+    parser.add_argument('--output-dir', type=Path, required=True)
+    args = parser.parse_args()
+    output_dir = args.output_dir
+    output_dir.mkdir(parents=True, exist_ok=True)
     plt.rcParams.update({"font.family": "sans-serif", "font.sans-serif": ["Arial", "Helvetica", "DejaVu Sans"], "pdf.fonttype": 42, "ps.fonttype": 42})
-    spagraph_df, adata, coords, composition, rank_df = load_inputs()
+    plt.rcParams['svg.fonttype'] = 'none'
+    spagraph_df, adata, coords, composition, rank_df = load_inputs(args)
     interface_spots = build_interface_spots(composition, coords)
 
     fig, axes = plt.subplots(1, len(SPATIAL_PAIRS), figsize=(5.35 * len(SPATIAL_PAIRS), 5.45))
@@ -223,12 +251,15 @@ def main():
         Line2D([0], [0], color=LINE_COLOR, linewidth=1.6, label="Top attention-ranked interactions"),
         Line2D([0], [0], marker="o", color="w", markerfacecolor=SRC_COLOR, markeredgecolor="white", markersize=8, label="Ligand"),
         Line2D([0], [0], marker="o", color="w", markerfacecolor=DST_COLOR, markeredgecolor="white", markersize=8, label="Receptor"),
-        Line2D([0], [0], color=INTERFACE_COLOR, linewidth=2.0, alpha=0.5, label="Tumor-stroma interface"),
+        Line2D([0], [0], color=INTERFACE_COLOR, linewidth=2.0, alpha=0.5, label="Composition-derived interface"),
     ]
-    fig.legend(handles=handles, loc="lower center", bbox_to_anchor=(0.5, 0.02), ncol=4, frameon=False, fontsize=9.2, columnspacing=1.0, handletextpad=0.4)
-    fig.tight_layout(rect=(0, 0.11, 1, 1))
-    fig.savefig(OUTPUT_DIR / "figureG_spatial_triptych_preview.pdf", bbox_inches="tight")
-    fig.savefig(OUTPUT_DIR / "figureG_spatial_triptych_preview.png", dpi=450, bbox_inches="tight")
+    fig.legend(handles=handles, loc="lower center", bbox_to_anchor=(0.5, 0.05), ncol=4, frameon=False, fontsize=11, columnspacing=1.0, handletextpad=0.4)
+    fig.text(0.5, 0.02, 'Ranks within 50 shared LR pairs; at most 280 edges per pair displayed',
+             ha='center', fontsize=11)
+    fig.tight_layout(rect=(0, 0.15, 1, 1))
+    fig.savefig(output_dir / "fig3g.pdf", bbox_inches="tight")
+    fig.savefig(output_dir / "fig3g.svg", bbox_inches="tight")
+    fig.savefig(output_dir / "fig3g.png", dpi=450, bbox_inches="tight")
     plt.close(fig)
 
 

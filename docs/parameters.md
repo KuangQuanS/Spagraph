@@ -126,19 +126,26 @@ separately from the recorded manuscript run configurations above.
 
 ## Figure 3e statistical specification
 
+The corrected five-run consensus and frequency top-15 groups have no overlap
+(15 pairs per group). Focality uses mean edge attention over the retained C0
+seeds 11, 23, 42, 67 and 101; the unique edge sets and LR support agree across
+all five runs. All 164 eligible LR support counts were checked against the
+ranking input before calculating group summaries.
+LR pairs can share supporting edges and are not independent biological
+replicates.
+
 | Item | Specification |
 |---|---|
 | Statistical unit | One LR pair |
-| Per-pair aggregation | All candidate communication edges for that LR pair |
-| Ranking groups | Top 15 by attention; top 15 by frequency |
-| Overlap handling | The single LR pair present in both top-15 lists was excluded from both groups |
-| Final sample sizes | attention-only n=14; frequency-only n=14 |
-| Tests | Two-sided Mann–Whitney U, two prespecified metrics |
+| Per-pair aggregation | Unique directed spatial and cell-type edges supporting that LR pair |
+| Ranking groups | Top 15 by mean within-run attention percentile; top 15 by unique supporting edge count |
+| Overlap handling | No overlap between the two top-15 groups |
+| Final sample sizes | attention n=15; frequency n=15 |
+| Tests | Two-sided asymptotic Mann–Whitney U; descriptive nominal comparisons |
 | Multiplicity | Holm adjustment across the two tests |
-| Edge spatial focality | median 0.851 vs 0.804; U=174; raw P=5.22e-4; Holm P=5.22e-4 |
-| Cell-type-pair count | median 3.0 vs 28.5; U=11; raw P=6.80e-5; Holm P=1.36e-4 |
+| Edge spatial focality | median 0.874156 vs 0.793058; U=175; raw P=0.00995523; Holm P=0.00995523 |
+| Cell-type-pair count | median 2 vs 24; U=0; raw P=2.69542e-6; Holm P=5.39085e-6 |
 
 The calculation is implemented in
-[`spagraph/analysis/figure3e_statistics.py`](../spagraph/analysis/figure3e_statistics.py)
-and exercised by
-[`tests/test_figure3e_statistics.py`](../tests/test_figure3e_statistics.py).
+[`scripts/summarize_communication_focality.py`](../scripts/summarize_communication_focality.py).
+The resulting values and summary are stored under `results/communication/figures/`.

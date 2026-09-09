@@ -82,7 +82,7 @@ def load_panel_table() -> pd.DataFrame:
     return out
 
 
-def draw_panel_f(panel_df: pd.DataFrame) -> None:
+def draw_panel_f(panel_df: pd.DataFrame, axis_label: str = "Rank Percentile Within Each Method's Evaluable Universe") -> None:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     plt.rcParams.update(
@@ -90,12 +90,13 @@ def draw_panel_f(panel_df: pd.DataFrame) -> None:
             "font.family": "sans-serif",
             "font.sans-serif": ["Arial", "Helvetica", "DejaVu Sans"],
             "pdf.fonttype": 42,
+            "svg.fonttype": "none",
             "ps.fonttype": 42,
             "axes.linewidth": 0.8,
         }
     )
 
-    fig, ax = plt.subplots(figsize=(10.2, 5.6), dpi=160)
+    fig, ax = plt.subplots(figsize=(10.2, 5.6), dpi=300)
 
     pair_to_y = dict(zip(panel_df["lr_pair"], panel_df["y"]))
     for idx, (group_name, group_pairs) in enumerate(PAIR_GROUPS):
@@ -171,7 +172,7 @@ def draw_panel_f(panel_df: pd.DataFrame) -> None:
     ax.set_xlim(-2, 102)
     ax.set_ylim(-0.6, len(panel_df) - 0.02)
     ax.set_xticks([0, 25, 50, 75, 100])
-    ax.set_xlabel("Rank Percentile Within Each Method's Evaluable Universe", fontsize=11, fontweight="bold", labelpad=10)
+    ax.set_xlabel(axis_label, fontsize=11, fontweight="bold", labelpad=10)
     ax.xaxis.set_label_position("top")
     ax.grid(axis="x", color="#E5E7EB", linewidth=0.9)
     ax.set_axisbelow(True)
@@ -213,6 +214,7 @@ def draw_panel_f(panel_df: pd.DataFrame) -> None:
     fig.tight_layout(rect=[0.02, 0.06, 0.98, 0.98])
     fig.savefig(OUTPUT_DIR / "figureF_multimethod_rank_strip_preview.png", dpi=300, bbox_inches="tight", pad_inches=0.18)
     fig.savefig(OUTPUT_DIR / "figureF_multimethod_rank_strip_preview.pdf", bbox_inches="tight", pad_inches=0.18)
+    fig.savefig(OUTPUT_DIR / "figureF_multimethod_rank_strip_preview.svg", bbox_inches="tight", pad_inches=0.18)
     plt.close(fig)
 
 

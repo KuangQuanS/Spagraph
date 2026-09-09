@@ -215,11 +215,11 @@ def draw_spatial_pair(ax, pair_name, role_text, rank_df, spagraph_df, adata, coo
         ax.scatter(dx, dy, s=18, color=DST_COLOR, marker="o", edgecolor="white", linewidth=0.3, zorder=6)
 
     row = rank_df.loc[rank_df["lr_pair"] == pair_name].iloc[0]
-    ax.text(0.5, 1.075, f"{format_pair(pair_name)}  ({role_text})", transform=ax.transAxes, ha="center", va="bottom", fontsize=12, fontweight="bold", color="#111827")
+    ax.text(0.5, 1.14, f"{format_pair(pair_name)}  ({role_text})", transform=ax.transAxes, ha="center", va="bottom", fontsize=12, fontweight="bold", color="#111827")
     subtitle1 = f"Spagraph #{int(row.spagraph_rank)} | CellChat #{int(row.cellchat_rank)}"
     subtitle2 = f"COMMOT #{int(row.commot_rank)} | Giotto #{int(row.giotto_spatial_rank)}"
-    ax.text(0.5, 1.032, subtitle1, transform=ax.transAxes, ha="center", va="bottom", fontsize=11, color="#6B7280")
-    ax.text(0.5, 1.001, subtitle2, transform=ax.transAxes, ha="center", va="bottom", fontsize=11, color="#6B7280")
+    ax.text(0.5, 1.085, subtitle1, transform=ax.transAxes, ha="center", va="bottom", fontsize=11, color="#6B7280")
+    ax.text(0.5, 1.03, subtitle2, transform=ax.transAxes, ha="center", va="center", fontsize=11, color="#6B7280")
 
     if not ax.yaxis_inverted():
         ax.invert_yaxis()

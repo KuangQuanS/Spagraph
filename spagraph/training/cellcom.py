@@ -15,20 +15,36 @@ import pandas as pd
 
 from spagraph.cellcom.cellcom import main as cellcom_main, parse_args
 from spagraph.cellcom.relation_ranker import (
-    aggregate_attention_rankings,
+    _validate_attention_weight,
+    aggregate_weighted_rankings,
     aggregate_w075_rankings,
 )
+
+
+def _resolve_attention_weight(
+    ranking_mode: Optional[str], attention_weight: Optional[float]
+) -> float:
+    if ranking_mode not in {None, "attention", "w075"}:
+        raise ValueError("ranking_mode must be 'attention' or 'w075'")
+    preset = 0.75 if ranking_mode == "w075" else 1.0
+    if attention_weight is None:
+        return preset
+    weight = _validate_attention_weight(attention_weight)
+    if ranking_mode is not None and weight != preset:
+        raise ValueError("ranking_mode and attention_weight specify different weights")
+    return weight
 
 
 def aggregate_cellcom_seed_outputs(
     seed_dirs: Sequence[Union[str, Path]],
     output_dir: Union[str, Path],
     seeds: Sequence[int],
-    ranking_mode: str = "attention",
+    ranking_mode: Optional[str] = None,
+    *,
+    attention_weight: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Aggregate existing Stage 3 runs without retraining."""
-    if ranking_mode not in {"attention", "w075"}:
-        raise ValueError("ranking_mode must be 'attention' or 'w075'")
+    weight = _resolve_attention_weight(ranking_mode, attention_weight)
     if len(seed_dirs) != len(seeds) or not seed_dirs:
         raise ValueError("seed_dirs and seeds must be non-empty and have equal length")
     if len(set(seeds)) != len(seeds):
@@ -44,13 +60,12 @@ def aggregate_cellcom_seed_outputs(
 
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
-    if ranking_mode == "w075":
-        ensemble = aggregate_w075_rankings(frames)
-        ensemble_path = output / "lr_pair_ensemble_w075_statistics.csv"
-    else:
-        ensemble = aggregate_attention_rankings(frames)
-        ensemble_path = output / "lr_pair_ensemble_statistics.csv"
-    ensemble.to_csv(ensemble_path, index=False)
+    suffix = ""
+    ensemble = (
+        aggregate_w075_rankings(frames)
+        if weight == 0.75
+        else aggregate_weighted_rankings(frames, weight)
+    )
     manifest = {
         "seeds": [int(value) for value in seeds],
         "n_repeats": len(seeds),
@@ -58,13 +73,18 @@ def aggregate_cellcom_seed_outputs(
         "eligibility": "present and eligible in every requested run",
         "per_seed_directories": [str(Path(value)) for value in seed_dirs],
     }
-    if ranking_mode == "w075":
-        manifest.update(aggregation="mean within-run weighted percentile",
-                        ranking_mode="w075", attention_weight=0.75, support_weight=0.25,
-                        minimum_supporting_edges=10)
-        manifest_path = output / "cellcom_ensemble_w075_manifest.json"
-    else:
-        manifest_path = output / "cellcom_ensemble_manifest.json"
+    if weight != 1.0:
+        suffix = "_w075" if weight == 0.75 else f"_w{str(weight).replace('.', 'p')}"
+        manifest.update(
+            aggregation="mean within-run weighted percentile",
+            ranking_mode="w075" if weight == 0.75 else "weighted",
+            attention_weight=weight,
+            support_weight=1.0 - weight,
+            minimum_supporting_edges=10,
+        )
+    ensemble_path = output / f"lr_pair_ensemble{suffix}_statistics.csv"
+    ensemble.to_csv(ensemble_path, index=False)
+    manifest_path = output / f"cellcom_ensemble{suffix}_manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     return {
         "ensemble": ensemble,
@@ -131,7 +151,9 @@ def run_cellcom(
     export_filtered_csv: bool = False,
     # Legacy support
     args: Optional[Union[argparse.Namespace, Dict[str, Any]]] = None,
-    ranking_mode: str = "attention",
+    ranking_mode: Optional[str] = None,
+    *,
+    attention_weight: Optional[float] = None,
     **overrides: Any,
 ) -> Optional[Dict[str, Any]]:
     """Run Stage 3 (cell communication) analysis.
@@ -188,7 +210,9 @@ def run_cellcom(
         seed: Random seed for a single run or deterministic repeat-seed generation
         n_repeats: Number of independent Stage3 runs to ensemble
         seeds: Explicit unique seeds; when supplied, overrides generated repeat seeds
-        ranking_mode: "attention" (legacy default) or optional "w075" multi-run consensus
+        ranking_mode: Compatibility alias for "attention" (1.0) or "w075" (0.75)
+        attention_weight: Attention percentile weight in [0, 1] for multi-run consensus.
+            Defaults to 1.0. The remaining weight is assigned to edge support.
         device: Computing device ('cuda' or 'cpu')
         early_stop_metric: Validation metric used for checkpoint selection,
             either ``total`` or ``relation_rank``
@@ -210,8 +234,7 @@ def run_cellcom(
         ...     batch_size=4
         ... )
     """
-    if ranking_mode not in {"attention", "w075"}:
-        raise ValueError("ranking_mode must be 'attention' or 'w075'")
+    weight = _resolve_attention_weight(ranking_mode, attention_weight)
     if n_repeats < 1:
         raise ValueError("n_repeats must be at least 1")
     if lambda_relation_rank < 0:
@@ -242,8 +265,8 @@ def run_cellcom(
     else:
         seed_values = [int(seed)]
 
-    if ranking_mode == "w075" and len(seed_values) < 2:
-        raise ValueError("w075 consensus requires multiple runs; use explicit seeds or n_repeats")
+    if weight != 1.0 and len(seed_values) < 2:
+        raise ValueError("Support-weighted consensus requires multiple runs; use seeds or n_repeats")
 
     if len(seed_values) > 1:
         if args is not None:
@@ -292,7 +315,9 @@ def run_cellcom(
                     seeds=None, **base_kwargs
                 )
             )
-        result = aggregate_cellcom_seed_outputs(seed_dirs, output_dir, seed_values, ranking_mode=ranking_mode)
+        result = aggregate_cellcom_seed_outputs(
+            seed_dirs, output_dir, seed_values, attention_weight=weight
+        )
         result["seed_results"] = seed_results
         return result
 
@@ -378,10 +403,13 @@ def run_cellcom(
 def run_cellcom_ensemble(
     *,
     seeds: Sequence[int] = (11, 23, 42, 67, 101),
+    attention_weight: Optional[float] = None,
     **kwargs: Any,
 ) -> Dict[str, Any]:
-    """Run Stage 3 repeatedly and aggregate with the requested ranking mode."""
-    return run_cellcom(seeds=seeds, n_repeats=len(seeds), **kwargs)
+    """Run Stage 3 repeatedly and aggregate with the requested attention weight."""
+    return run_cellcom(
+        seeds=seeds, n_repeats=len(seeds), attention_weight=attention_weight, **kwargs
+    )
 
 
 # Backward-compatible alias

@@ -121,29 +121,42 @@ Stage 3 supports `n_repeats` for stochastic stability. `n_repeats=5` trains
 five independent models and writes an ensemble LR ranking with score and rank
 variation; `n_repeats=1` remains the faster exploratory default. Each run ranks
 LR pairs by mean shared attention over unique supporting edges. The ensemble
-ranks by the mean within-run attention percentile, retaining only pairs eligible
-in every requested run. It writes `lr_pair_ensemble_statistics.csv` and
-`cellcom_ensemble_manifest.json`. Support and variability are descriptive, not
-additional ranking factors. Explicit seeds can be supplied with
-`spg.cellcom_ensemble(...)`. The default objective uses edge and node
-reconstruction; relation and candidate ranking losses are disabled. Repeated
+ranks by the mean within-run attention percentile by default, retaining only
+pairs eligible in every requested run. This mode writes
+`lr_pair_ensemble_statistics.csv` and `cellcom_ensemble_manifest.json`.
+Supply explicit seeds with `spg.cellcom_ensemble(...)`. The default objective
+uses edge and node reconstruction with both ranking losses disabled. Repeated
 runs assess sensitivity to training randomness, not independent biological
 replication or a guaranteed improvement in ranking accuracy.
 
-### Optional support-aware ranking (w075)
+### Configurable LR consensus ranking
 
-The default ranking remains attention-only and preserves existing outputs.
-For multi-seed analyses, optionally set `ranking_mode="w075"` with
-`spg.cellcom_ensemble(...)` (the default explicit seeds are 11, 23, 42, 67,
-101). Within each run, w075 combines 0.75 times the attention percentile
-with 0.25 times the percentile of log1p(unique supporting-edge count),
-among eligible pairs with at least 10 unique supporting edges.
-The scores are averaged across runs, and a pair receives a rank if it is
-eligible in every run. Both modes use the same HE-GAT training procedure.
+`attention_weight` sets how much of each run's ranking score comes from
+context-aware attention:
 
-Use a fresh output directory when launching training with
-`spg.cellcom_ensemble(..., ranking_mode="w075")`. To apply w075 to finished
-runs without retraining, read their existing per-seed CSVs:
+| `attention_weight` | Interpretation |
+|---:|---|
+| 1.0 (default) | Attention percentile only |
+| 0.75 | 75% attention percentile and 25% supporting-edge percentile |
+| 0.5 | Equal weight for both percentiles |
+| 0.0 | Supporting-edge percentile only |
+
+For a weight α, each run contributes
+`α × attention percentile + (1 − α) × support percentile`.
+Support uses the within-run percentile of `log1p(unique supporting-edge count)`.
+The per-run scores are averaged across seeds. When α is below 1, pairs need
+at least 10 unique supporting edges per run, in addition to existing
+eligibility rules. Every ranked pair must be eligible in all runs.
+
+For an attention-led analysis, explore weights from 0.5 to 1.0. A weight
+of 0.75 is an empirical starting point that retains a 3:1 emphasis on
+attention. See the [matched case-study comparisons](docs/reproduction.md#configurable-lr-consensus-ranking)
+for how ranks and leave-one-seed-out stability vary across sections.
+
+For a new multi-seed run, pass `attention_weight=0.75` to
+`spg.cellcom_ensemble(...)` and choose a fresh output directory. The weight
+affects only the final ranking. To apply a weight to completed runs without
+retraining, use the saved per-seed CSVs:
 
 ```python
 from pathlib import Path
@@ -152,14 +165,14 @@ from spagraph.training.cellcom import aggregate_cellcom_seed_outputs
 root = Path("outputs/cellcom")
 seeds = [11, 23, 42, 67, 101]
 dirs = [root / f"seed_{seed}" for seed in seeds]
-aggregate_cellcom_seed_outputs(dirs, root, seeds, ranking_mode="w075")
+aggregate_cellcom_seed_outputs(dirs, root, seeds, attention_weight=0.75)
 ```
 
-This writes `lr_pair_ensemble_w075_statistics.csv` and
-`cellcom_ensemble_w075_manifest.json` alongside any existing attention-only
-outputs. Support weighting moderates the influence of high attention scores
-with sparse edge support. Leave-one-seed-out top-10 stability varied by
-section. See the [matched case-study comparison](docs/reproduction.md#optional-w075-analysis).
+The default filenames are `lr_pair_ensemble_statistics.csv` and
+`cellcom_ensemble_manifest.json`. Weights below 1 write separate files
+tagged with their weight, such as `lr_pair_ensemble_w075_statistics.csv`
+for 0.75 or `lr_pair_ensemble_w0p5_statistics.csv` for 0.5.
+`ranking_mode="w075"` remains an alias for `attention_weight=0.75`.
 
 ## Inputs and outputs
 

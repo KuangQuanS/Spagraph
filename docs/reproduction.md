@@ -71,3 +71,61 @@ the unrelated Visium HD colon pilot, partner-swap and archetype experiments,
 historical outputs, checkpoints, server logs, private runbooks and manuscript
 Word files. No full model retraining or additional CCC statistical expansion
 is required to reproduce the documented Figure 3e correction.
+
+
+## Configurable LR consensus ranking
+
+The default attention weight is 1.0, with the original aggregation and
+filenames. The [README example](../README.md#configurable-lr-consensus-ranking)
+shows how to try different weights on the same `lr_pair_statistics.csv` files.
+
+### Matched rankings from the same five runs
+
+All weights used the same archived outputs, LR database and eligible pair set
+within each section. The following are ranks within the Spagraph candidate
+set, with rank 1 indicating highest priority.
+
+| Section | Eligible pairs | LR pair | 1.0 (attention-only) | 0.75 | 0.5 |
+|---|---:|---|---:|---:|---:|
+| cSCC | 165 | TNC–SDC1 | 14 | 1 | 7 |
+| HGSOC | 242 | THBS2–CD47 | 9 | 3 | 5 |
+| HGSOC | 242 | CXCL12–CXCR4 | 41 | 6 | 3 |
+| DCIS | 428 | CDH5–CDH5 | 46 | 7 | 8 |
+| DCIS | 428 | CCL21–CCR7 | 24 | 10 | 23 |
+| TNBC | 267 | CLEC2D–KLRB1 | 2 | 1 | 5 |
+| TNBC | 267 | CXCL12–CXCR4 | 183 | 144 | 80 |
+
+The historical cSCC attention-only analysis placed TNC–SDC1 in the top 7%
+of 164 eligible pairs. The matched comparison above uses a 165-pair analysis
+that also includes MMP9–LRP1.
+
+### Leave-one-seed-out stability
+
+We compared the five-run top 10 with the top 10 from each four-run
+aggregation, holding the five-run eligible candidate set fixed. The table
+gives the range of Jaccard overlaps across the five omissions and includes
+ties at the rank cutoff.
+
+| Section | Attention-only | w075 |
+|---|---:|---:|
+| cSCC | 0.750–1.000 | 1.000–1.000 |
+| HGSOC | 0.750–1.000 | 0.818–1.000 |
+| DCIS | 0.667–1.000 | 0.667–0.818 |
+| TNBC | 0.429–1.000 | 0.538–1.000 |
+
+### Common-set comparisons
+
+For HGSOC, 18 of the 50 published stroma-to-tumor candidates from long-term
+survivors were rankable in the 233-pair common set. At the top 10% cutoff,
+Spagraph attention-only, Spagraph w075, CellChat and COMMOT recovered 3, 9, 6
+and 2 of the 18 pairs, respectively. At the top 20% cutoff, they recovered
+6, 10, 10 and 10. The reference is from the published spatial analysis of
+[Ferri-Borgogno et al.](https://doi.org/10.1158/0008-5472.CAN-22-1821).
+
+Within the 257-pair TNBC common set, Spagraph w075 ranked CLEC2D–KLRB1 first.
+CXCL12–CXCR4 ranked 138th with Spagraph w075, 16th with CellChat and seventh
+with COMMOT. The Spagraph-only ranks above use a different denominator.
+
+These comparisons were checked against archived per-seed and frozen ranking
+tables. The repository does not distribute those inputs. Figure S2 evaluates
+attention against abundance under controlled conditions.

@@ -1145,7 +1145,7 @@ class GATDeconvolution:
         # If duplicate celltype names exist, merge corresponding columns (sum by column) and log
         dup_names = [name for name in set(celltype_columns) if celltype_columns.count(name) > 1]
         if len(dup_names) > 0:
-            composition_by_celltype = composition_df.groupby(by=composition_df.columns, axis=1).sum()
+            composition_by_celltype = composition_df.T.groupby(level=0).sum().T
         else:
             composition_by_celltype = composition_df
 

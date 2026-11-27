@@ -36,6 +36,8 @@ python -m pip install --upgrade pip
 python -m pip install -e .
 ```
 
+> **Tip:** If your GPU server uses an older NVIDIA driver (e.g. CUDA 12.x), install a driver-compatible PyTorch wheel from [pytorch.org](https://pytorch.org/get-started/locally/) first, then run `python -m pip install -e .`.
+
 ## 🚀 Tutorial: Three-Stage Workflow
 
 ### Input Data Requirements

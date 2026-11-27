@@ -16,6 +16,8 @@ from spagraph.cellcom.relation_ranker import (
     calibrate_lr_statistics,
     ensemble_lr_rankings,
     aggregate_attention_rankings,
+    aggregate_weighted_rankings,
+    aggregate_w075_rankings,
     rank_associated_attention,
     read_associated_lr_events,
 )
@@ -107,6 +109,33 @@ class CalibrationTests(unittest.TestCase):
         self.assertAlmostEqual(result.loc['B', 'mean_attention_percentile'], (2.5/3 + .5)/2)
         self.assertFalse(result.loc['C', 'eligible_for_ranking'])
         self.assertTrue(pd.isna(result.loc['C', 'rank']))
+
+    def test_w075_consensus_uses_eligible_percentiles_and_keeps_legacy(self):
+        frame = pd.DataFrame({
+            "lr_pair": ["A", "B", "C", "D"],
+            "associated_edge_attention_mean": [3., 2., 1., 100.],
+            "supporting_unique_edges": [10, 100, 50, 9],
+            "eligible_for_ranking": [True, True, True, False],
+        })
+        other = frame[frame.lr_pair != "C"].copy()
+        result = aggregate_w075_rankings([frame, other]).set_index("lr_pair")
+        self.assertAlmostEqual(result.loc["A", "mean_w075_score"],
+                               ((.75 + .25/3) + (.75 + .25/2))/2)
+        self.assertAlmostEqual(result.loc["B", "mean_w075_score"],
+                               ((.75*2/3 + .25) + (.75/2 + .25))/2)
+        self.assertEqual(result.loc["A", "rank"], 1)
+        self.assertTrue(pd.isna(result.loc["C", "rank"]))
+        self.assertTrue(pd.isna(result.loc["D", "rank"]))
+        legacy = aggregate_attention_rankings([frame, other])
+        self.assertNotIn("mean_w075_score", legacy.columns)
+        pd.testing.assert_frame_equal(aggregate_weighted_rankings([frame, other], 1.0), legacy)
+        for weight in (0.0, 0.5):
+            weighted = aggregate_weighted_rankings([frame, other], weight).set_index("lr_pair")
+            self.assertEqual(weighted.loc["B", "rank"], 1)
+            self.assertTrue(pd.isna(weighted.loc["D", "rank"]))
+        for weight in (-0.1, 1.1, float("nan"), float("inf")):
+            with self.subTest(weight=weight), self.assertRaisesRegex(ValueError, "attention_weight"):
+                aggregate_weighted_rankings([frame], weight)
 
     def test_raw_ranking_rejects_invalid_or_mixed_scores(self):
         frame = pd.DataFrame({'lr_pair': ['A'], 'associated_edge_attention_mean': [float('nan')]})
@@ -593,6 +622,28 @@ class CalibrationTests(unittest.TestCase):
             manifest = json.loads(Path(result["manifest_path"]).read_text())
             self.assertEqual(manifest["aggregation"], "mean within-run raw attention percentile")
             self.assertNotIn("calibration_weights", manifest)
+            legacy_paths = [Path(result[key]) for key in ("ensemble_path", "manifest_path")]
+            legacy_bytes = [path.read_bytes() for path in legacy_paths]
+
+            weighted = aggregate_cellcom_seed_outputs(
+                seed_dirs, root, [11, 23], attention_weight=0.75
+            )
+
+            self.assertEqual(Path(weighted["ensemble_path"]).name, "lr_pair_ensemble_w075_statistics.csv")
+            weighted_manifest = Path(weighted["manifest_path"])
+            self.assertEqual(weighted_manifest.name, "cellcom_ensemble_w075_manifest.json")
+            self.assertEqual(json.loads(weighted_manifest.read_text())["ranking_mode"], "w075")
+            alias = aggregate_cellcom_seed_outputs(seed_dirs, root, [11, 23], ranking_mode="w075")
+            self.assertEqual(alias["ensemble_path"], weighted["ensemble_path"])
+            pd.testing.assert_frame_equal(alias["ensemble"], weighted["ensemble"])
+            mixed = aggregate_cellcom_seed_outputs(seed_dirs, root, [11, 23], attention_weight=0.5)
+            self.assertEqual(Path(mixed["ensemble_path"]).name, "lr_pair_ensemble_w0p5_statistics.csv")
+            self.assertEqual(json.loads(Path(mixed["manifest_path"]).read_text())["attention_weight"], 0.5)
+            with self.assertRaisesRegex(ValueError, "different weights"):
+                aggregate_cellcom_seed_outputs(
+                    seed_dirs, root, [11, 23], ranking_mode="w075", attention_weight=1.0
+                )
+            self.assertEqual([path.read_bytes() for path in legacy_paths], legacy_bytes)
 
     def test_public_api_runs_repeats_in_seed_subdirectories(self):
         source = pd.DataFrame(

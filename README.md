@@ -1,8 +1,12 @@
-# 🧬 Spagraph
+<p align="center">
+  <img src="assets/spagraph_logo.png" alt="Spagraph logo" width="260" />
+</p>
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-3776AB.svg)](pyproject.toml)
-[![Release v1.0.0](https://img.shields.io/badge/Release-v1.0.0-2ea44f.svg)](https://github.com/KuangQuanS/Spagraph/releases/tag/v1.0.0)
+<p align="center">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License: MIT" /></a>
+  <a href="pyproject.toml"><img src="https://img.shields.io/badge/Python-3.10%2B-3776AB.svg" alt="Python 3.10+" /></a>
+  <a href="https://github.com/KuangQuanS/Spagraph/releases/tag/v1.0.0"><img src="https://img.shields.io/badge/Release-v1.0.0-2ea44f.svg" alt="Release v1.0.0" /></a>
+</p>
 
 👋 **Welcome to Spagraph!**
 
@@ -192,7 +196,7 @@ Spagraph/
 ├── spagraph/               # Core Python package (Stage 1 VAE, Stage 2 GAT, Stage 3 CellCom)
 ├── examples/               # Four tumor case studies (cscc, tnbc, dcis, hgsoc)
 ├── docs/                   # Manuscript parameter record (parameters.md) and reproduction guide (reproduction.md)
-├── assets/                 # Workflow figure displayed in this README
+├── assets/                 # Logo and workflow figure displayed in this README
 ├── README.md               # Welcome guide, installation, tutorial, and dataset sources
 ├── pyproject.toml          # Package metadata and dependencies
 └── requirements.txt        # Runtime dependencies

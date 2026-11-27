@@ -75,27 +75,57 @@ is required to reproduce the documented Figure 3e correction.
 
 ## Optional w075 analysis
 
-The attention-only mode is the default and its existing output filenames and
-aggregation are unchanged. The optional w075 mode is a separate post-processing
-analysis of per-seed `lr_pair_statistics.csv` files. Use the README example
-with explicit seeds 11, 23, 42, 67 and 101. Supply the exact same upstream inputs
-and LR database when comparing weights.
+Attention-only is the default, with the original aggregation and filenames.
+The [README example](../README.md#optional-support-aware-ranking-w075) shows
+how to apply w075 to existing `lr_pair_statistics.csv` files.
 
-The following are manuscript-reported case-study observations, not results
-reproduced by this PR:
+### Matched rankings from the same five runs
 
-| Analysis | Reported observation |
-|---|---|
-| cSCC historical attention-only | TNC-SDC1 in top 7% of 164 eligible pairs |
-| cSCC w075 | TNC-SDC1 first of 165 eligible pairs |
-| HGSOC common-set reference recovery, w075 / CellChat / COMMOT | top 10%: 9/18, 6/18, 2/18; top 20%: 10/18 for all three |
-| TNBC common-set comparison | CLEC2D-KLRB1 first by w075; CXCL12-CXCR4 ranked 138th by w075, 16th by CellChat and 7th by COMMOT |
+Both modes used the same archived outputs, LR database and eligible pair set
+within each section. The following are ranks within the Spagraph candidate
+set, with rank 1 indicating highest priority.
 
-The cSCC candidate universe changed (MMP9-LRP1 was added in the revised
-analysis); the historical and revised ranks are not a controlled comparison
-of weights alone. The HGSOC reference list is literature-derived, not
-experimental ground truth. Existing synthetic benchmarks test attention
-against abundance, not necessarily the w075 composite. Full case-study
-reproduction requires the original per-seed outputs, exact database version,
-baseline rankings, and HGSOC reference list; those frozen inputs are not
-included in this change. No new biological or robustness claims are made.
+| Section | Eligible pairs | LR pair | Attention-only | w075 |
+|---|---:|---|---:|---:|
+| cSCC | 165 | TNC–SDC1 | 14 | 1 |
+| HGSOC | 242 | THBS2–CD47 | 9 | 3 |
+| HGSOC | 242 | CXCL12–CXCR4 | 41 | 6 |
+| DCIS | 428 | CDH5–CDH5 | 46 | 7 |
+| DCIS | 428 | CCL21–CCR7 | 24 | 10 |
+| TNBC | 267 | CLEC2D–KLRB1 | 2 | 1 |
+| TNBC | 267 | CXCL12–CXCR4 | 183 | 144 |
+
+The historical cSCC attention-only analysis placed TNC–SDC1 in the top 7%
+of 164 eligible pairs. The matched comparison above uses a 165-pair analysis
+that also includes MMP9–LRP1.
+
+### Leave-one-seed-out stability
+
+We compared the five-run top 10 with the top 10 from each four-run
+aggregation, holding the five-run eligible candidate set fixed. The table
+gives the range of Jaccard overlaps across the five omissions and includes
+ties at the rank cutoff.
+
+| Section | Attention-only | w075 |
+|---|---:|---:|
+| cSCC | 0.750–1.000 | 1.000–1.000 |
+| HGSOC | 0.750–1.000 | 0.818–1.000 |
+| DCIS | 0.667–1.000 | 0.667–0.818 |
+| TNBC | 0.429–1.000 | 0.538–1.000 |
+
+### Common-set comparisons
+
+For HGSOC, 18 of the 50 published stroma-to-tumor candidates from long-term
+survivors were rankable in the 233-pair common set. At the top 10% cutoff,
+Spagraph attention-only, Spagraph w075, CellChat and COMMOT recovered 3, 9, 6
+and 2 of the 18 pairs, respectively. At the top 20% cutoff, they recovered
+6, 10, 10 and 10. The reference is from the published spatial analysis of
+[Ferri-Borgogno et al.](https://doi.org/10.1158/0008-5472.CAN-22-1821).
+
+Within the 257-pair TNBC common set, Spagraph w075 ranked CLEC2D–KLRB1 first.
+CXCL12–CXCR4 ranked 138th with Spagraph w075, 16th with CellChat and seventh
+with COMMOT. The Spagraph-only ranks above use a different denominator.
+
+These comparisons were checked against archived per-seed and frozen ranking
+tables. The repository does not distribute those inputs. Figure S2 evaluates
+attention against abundance under controlled conditions.

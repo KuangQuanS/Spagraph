@@ -613,6 +613,16 @@ class CalibrationTests(unittest.TestCase):
             manifest = json.loads(Path(result["manifest_path"]).read_text())
             self.assertEqual(manifest["aggregation"], "mean within-run raw attention percentile")
             self.assertNotIn("calibration_weights", manifest)
+            legacy_paths = [Path(result[key]) for key in ("ensemble_path", "manifest_path")]
+            legacy_bytes = [path.read_bytes() for path in legacy_paths]
+
+            weighted = aggregate_cellcom_seed_outputs(seed_dirs, root, [11, 23], ranking_mode="w075")
+
+            self.assertEqual(Path(weighted["ensemble_path"]).name, "lr_pair_ensemble_w075_statistics.csv")
+            weighted_manifest = Path(weighted["manifest_path"])
+            self.assertEqual(weighted_manifest.name, "cellcom_ensemble_w075_manifest.json")
+            self.assertEqual(json.loads(weighted_manifest.read_text())["ranking_mode"], "w075")
+            self.assertEqual([path.read_bytes() for path in legacy_paths], legacy_bytes)
 
     def test_public_api_runs_repeats_in_seed_subdirectories(self):
         source = pd.DataFrame(

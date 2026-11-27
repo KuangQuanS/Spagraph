@@ -380,7 +380,7 @@ def run_cellcom_ensemble(
     seeds: Sequence[int] = (11, 23, 42, 67, 101),
     **kwargs: Any,
 ) -> Dict[str, Any]:
-    """Run Stage3 repeatedly and aggregate within-run attention percentiles."""
+    """Run Stage 3 repeatedly and aggregate with the requested ranking mode."""
     return run_cellcom(seeds=seeds, n_repeats=len(seeds), **kwargs)
 
 

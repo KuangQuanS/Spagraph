@@ -904,6 +904,93 @@ class HeterogeneousGATDeconvolution(nn.Module):
 # Stage 2: Loss Functions
 # ================================
 
+class _DynamicMixedExpressionFn(torch.autograd.Function):
+    """Memory-efficient dynamic cluster expression mixing.
+
+    Avoids retaining O(n_clusters * n_spots * k * n_genes) intermediate gather
+    tensors in autograd by chunking along spots and re-gathering constant
+    single-cell expression rows on the fly during backward.
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        attention_weights: torch.Tensor,
+        dynamic_cluster_weights: torch.Tensor,
+        dynamic_cluster_indices: torch.Tensor,
+        sc_cell_expressions: torch.Tensor,
+        spot_chunk_size: int = 512,
+    ) -> torch.Tensor:
+        n_spots, n_cell_types, k = dynamic_cluster_weights.shape
+        n_genes = sc_cell_expressions.shape[1]
+        chunk_size = max(1, int(spot_chunk_size))
+
+        mixed_expr = attention_weights.new_zeros((n_spots, n_genes))
+        for s0 in range(0, n_spots, chunk_size):
+            s1 = min(s0 + chunk_size, n_spots)
+            aw_chunk = attention_weights[s0:s1]
+            mixed_chunk = mixed_expr[s0:s1]
+            for cluster_id in range(n_cell_types):
+                cluster_indices = dynamic_cluster_indices[s0:s1, cluster_id, :]
+                cluster_weights = dynamic_cluster_weights[s0:s1, cluster_id, :]
+                safe_indices = torch.clamp(cluster_indices, min=0).long()
+                cell_expr = sc_cell_expressions[safe_indices.reshape(-1)].reshape(
+                    s1 - s0, k, n_genes
+                )
+                cluster_expr = torch.einsum("sk,skg->sg", cluster_weights, cell_expr)
+                mixed_chunk.addcmul_(aw_chunk[:, cluster_id].unsqueeze(-1), cluster_expr)
+
+        ctx.save_for_backward(
+            attention_weights,
+            dynamic_cluster_weights,
+            dynamic_cluster_indices,
+            sc_cell_expressions,
+        )
+        ctx.spot_chunk_size = chunk_size
+        return mixed_expr
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        (
+            attention_weights,
+            dynamic_cluster_weights,
+            dynamic_cluster_indices,
+            sc_cell_expressions,
+        ) = ctx.saved_tensors
+        chunk_size = ctx.spot_chunk_size
+        n_spots, n_cell_types, k = dynamic_cluster_weights.shape
+        n_genes = sc_cell_expressions.shape[1]
+
+        need_aw = ctx.needs_input_grad[0]
+        need_cw = ctx.needs_input_grad[1]
+        grad_aw = torch.zeros_like(attention_weights) if need_aw else None
+        grad_cw = torch.zeros_like(dynamic_cluster_weights) if need_cw else None
+
+        if need_aw or need_cw:
+            grad_output = grad_output.contiguous()
+            for s0 in range(0, n_spots, chunk_size):
+                s1 = min(s0 + chunk_size, n_spots)
+                go_chunk = grad_output[s0:s1]
+                aw_chunk = attention_weights[s0:s1]
+                for cluster_id in range(n_cell_types):
+                    cluster_indices = dynamic_cluster_indices[s0:s1, cluster_id, :]
+                    cluster_weights = dynamic_cluster_weights[s0:s1, cluster_id, :]
+                    safe_indices = torch.clamp(cluster_indices, min=0).long()
+                    cell_expr = sc_cell_expressions[safe_indices.reshape(-1)].reshape(
+                        s1 - s0, k, n_genes
+                    )
+                    if need_aw:
+                        cluster_expr = torch.einsum("sk,skg->sg", cluster_weights, cell_expr)
+                        grad_aw[s0:s1, cluster_id] = (go_chunk * cluster_expr).sum(dim=-1)
+                    if need_cw:
+                        grad_cluster_expr = go_chunk * aw_chunk[:, cluster_id].unsqueeze(-1)
+                        grad_cw[s0:s1, cluster_id, :] = torch.einsum(
+                            "sg,skg->sk", grad_cluster_expr, cell_expr
+                        )
+
+        return grad_aw, grad_cw, None, None, None
+
+
 class SpatialDeconvolutionLoss(nn.Module):
     """空间解卷积损失函数
     
@@ -991,57 +1078,66 @@ class SpatialDeconvolutionLoss(nn.Module):
                                torch.FloatTensor(sc_celltype_proportions))
         else:
             self.sc_celltype_proportions = None
+        self._sc_expr_cache_key = None
+        self._sc_marker_expr_cache = None
+        self._sc_basis_totals_cache = None
     
+    def _get_dynamic_sc_views(self, sc_cell_expressions: torch.Tensor):
+        """Cache marker-gene slice and 1D per-cell basis totals for dynamic loss."""
+        cache_key = (
+            id(sc_cell_expressions),
+            tuple(sc_cell_expressions.shape),
+            sc_cell_expressions.device,
+            sc_cell_expressions.dtype,
+            getattr(sc_cell_expressions, "_version", 0),
+        )
+        if self._sc_expr_cache_key != cache_key:
+            self._sc_marker_expr_cache = sc_cell_expressions[:, self.marker_gene_indices].contiguous()
+            if self.scale_basis == "all":
+                self._sc_basis_totals_cache = sc_cell_expressions.sum(dim=1, keepdim=True).contiguous()
+            elif self.scale_basis == "hvg" and self.hvg_gene_indices is not None:
+                self._sc_basis_totals_cache = (
+                    sc_cell_expressions[:, self.hvg_gene_indices].sum(dim=1, keepdim=True).contiguous()
+                )
+            else:
+                self._sc_basis_totals_cache = None
+            self._sc_expr_cache_key = cache_key
+        return self._sc_marker_expr_cache, self._sc_basis_totals_cache
+
     def compute_dynamic_mixed_expression(self, 
                                         attention_weights: torch.Tensor,
                                         dynamic_cluster_weights: torch.Tensor,
                                         dynamic_cluster_indices: torch.Tensor,
-                                        sc_cell_expressions: torch.Tensor) -> torch.Tensor:
-        """使用动态cluster权重计算混合表达（向量化优化版本）
-        
-        关键逻辑：
-        1. 每个cluster的表达 = Σ(cell百分比 × cell原始count表达) 
-           - cell百分比来自 dynamic_cluster_weights（已归一化为1）
-           - cell表达是原始count（raw counts，不做normalize/log1p）
-        2. Spot表达 = Σ(spot对cluster权重 × cluster动态表达)
-        
-        优化：使用gather和batch矩阵乘法，避免双重循环
-        
-        Args:
-            attention_weights: [n_spots, n_cell_types] spot对cluster的权重
-            dynamic_cluster_weights: [n_spots, n_cell_types, k] 每个cluster的k个cell百分比（和为1）
-            dynamic_cluster_indices: [n_spots, n_cell_types, k] 每个cluster的k个cell全局索引
-            sc_cell_expressions: [n_cells, n_all_genes] 单细胞所有基因原始count
-        
-        Returns:
-            mixed_expr_full: [n_spots, n_all_genes] 混合表达（原始count scale）
+                                        sc_cell_expressions: torch.Tensor,
+                                        spot_chunk_size: int = 512) -> torch.Tensor:
+        """Compute mixed spot expression from dynamic per-cluster k-NN cells.
+
+        Uses spot-chunked custom autograd when ``sc_cell_expressions`` is
+        constant (the standard training and inference path) so full-graph
+        Visium slides (~5,000 spots) fit comfortably in GPU memory.
         """
+        if not sc_cell_expressions.requires_grad:
+            return _DynamicMixedExpressionFn.apply(
+                attention_weights,
+                dynamic_cluster_weights,
+                dynamic_cluster_indices,
+                sc_cell_expressions,
+                spot_chunk_size,
+            )
+
         n_spots, n_cell_types, k = dynamic_cluster_weights.shape
         n_genes = sc_cell_expressions.shape[1]
         device = attention_weights.device
-        
-        # ✅ 内存优化：避免一次性分配巨大tensor
-        # 改为逐cluster累积到最终结果，减少内存占用
-        
-        mixed_expr_full = torch.zeros(n_spots, n_genes, device=device)
-        
+        mixed_expr_full = torch.zeros(n_spots, n_genes, device=device, dtype=attention_weights.dtype)
+
         for cluster_id in range(n_cell_types):
-            # 当前cluster的索引和权重
-            cluster_indices = dynamic_cluster_indices[:, cluster_id, :]  # [n_spots, k]
-            cluster_weights = dynamic_cluster_weights[:, cluster_id, :]  # [n_spots, k]
-            
-            # 处理padding：将-1替换为0
-            safe_indices = torch.clamp(cluster_indices, min=0).long()  # [n_spots, k]
-            
-            # Gather该cluster的cell表达: [n_spots, k, n_genes]
+            cluster_indices = dynamic_cluster_indices[:, cluster_id, :]
+            cluster_weights = dynamic_cluster_weights[:, cluster_id, :]
+            safe_indices = torch.clamp(cluster_indices, min=0).long()
             cell_expr = sc_cell_expressions[safe_indices.reshape(-1)].reshape(n_spots, k, n_genes)
-            
-            # 计算加权和: [n_spots, k] × [n_spots, k, n_genes] → [n_spots, n_genes]
             cluster_expr = torch.einsum('sk,skg->sg', cluster_weights, cell_expr)
-            
-            # 累积到最终结果
-            mixed_expr_full += attention_weights[:, cluster_id].unsqueeze(-1) * cluster_expr
-        
+            mixed_expr_full = mixed_expr_full + attention_weights[:, cluster_id].unsqueeze(-1) * cluster_expr
+
         return mixed_expr_full
         
     def forward(self, 
@@ -1082,67 +1178,75 @@ class SpatialDeconvolutionLoss(nn.Module):
 
         # ========== 计算混合表达（支持静态和动态模式） ==========
         if knn_cell_indices is not None:
-            # ✅ 动态模式：使用预计算的k-nearest cells + MLP学习权重
+            # 动态模式：仅对 marker 基因计算混合表达，并用单细胞总计数向量精确计算缩放基准，
+            # 与先混合全部基因再切片完全等价，但显存和计算量大幅下降。
             if sc_cell_embeddings is None or sc_cell_expressions is None or gat_model is None:
                 raise ValueError(
                     "Dynamic cluster mode requires: knn_cell_indices, sc_cell_embeddings, "
                     "sc_cell_expressions, and gat_model"
                 )
             
-            # 1) 用MLP计算cell权重（归一化为百分比）
-            # gat_model.compute_cell_weights_from_knn() 会调用 cell_weight_mlp
             dynamic_cluster_weights = gat_model.compute_cell_weights_from_knn(
                 spot_embeddings=spot_embedding,
                 knn_cell_indices=knn_cell_indices,
                 sc_cell_embeddings=sc_cell_embeddings
             )  # [batch_size, n_cell_types, k]
-            
-            # 2) 用动态权重计算混合表达
-            # sc_cell_expressions 必须是原始count（raw counts，不做normalize/log1p）
-            mixed_expr_full = self.compute_dynamic_mixed_expression(
+
+            sc_marker_expr, sc_basis_totals = self._get_dynamic_sc_views(sc_cell_expressions)
+            mixed_expr_marker = self.compute_dynamic_mixed_expression(
                 attention_weights=attention_weights,
-                dynamic_cluster_weights=dynamic_cluster_weights, 
+                dynamic_cluster_weights=dynamic_cluster_weights,
                 dynamic_cluster_indices=knn_cell_indices,
-                sc_cell_expressions=sc_cell_expressions
+                sc_cell_expressions=sc_marker_expr,
             )
+
+            if self.scale_basis == "none":
+                reconstructed_spot_marker_all = mixed_expr_marker
+            elif self.scale_basis == "fixed_10":
+                reconstructed_spot_marker_all = mixed_expr_marker * 10.0
+            else:
+                if batch_spot_total_counts is None:
+                    raise ValueError("batch_spot_total_counts is required when scale_basis != 'none' or 'fixed_10'")
+                spot_counts = batch_spot_total_counts.unsqueeze(-1)  # [batch_size, 1]
+                if sc_basis_totals is not None:
+                    mixed_basis_totals = self.compute_dynamic_mixed_expression(
+                        attention_weights=attention_weights,
+                        dynamic_cluster_weights=dynamic_cluster_weights,
+                        dynamic_cluster_indices=knn_cell_indices,
+                        sc_cell_expressions=sc_basis_totals,
+                    )
+                else:
+                    mixed_basis_totals = mixed_expr_marker.sum(dim=1, keepdim=True)
+                scale = spot_counts / (mixed_basis_totals + 1e-8)
+                reconstructed_spot_marker_all = mixed_expr_marker * scale * self.library_size
         else:
-            # ✅ 静态模式：使用cluster平均表达
-            # celltype_expressions_full 也应该是原始count（raw counts）
+            # 静态模式：使用 cluster 平均表达
             mixed_expr_full = torch.matmul(
                 attention_weights,               # [batch_size, n_cell_types]
                 self.celltype_expressions_full   # [n_cell_types, n_all_genes] raw counts
             )  # [batch_size, n_all_genes]
 
-        # 3) 根据 scale_basis 决定是否缩放
-        if self.scale_basis == "none":
-            # 不使用缩放，直接使用混合表达
-            reconstructed_spot_full = mixed_expr_full
-        elif self.scale_basis == "fixed_10":
-            # 固定缩放因子10：比例×10 = 细胞数量
-            # 例如：cluster1占比0.3 → 0.3×10=3个细胞
-            reconstructed_spot_full = mixed_expr_full * 10.0
-        else:
-            # 使用 spot_total_counts 进行缩放
-            # ✅ 修复：使用传入的 batch_spot_total_counts（对应当前 batch 的实际 spots）
-            if batch_spot_total_counts is None:
-                raise ValueError("batch_spot_total_counts is required when scale_basis != 'none' or 'fixed_10'")
-            spot_counts = batch_spot_total_counts.unsqueeze(-1)  # [batch_size, 1]
-
-            if self.scale_basis == "all":
-                # 使用全部基因总量
-                mixed_basis_totals = mixed_expr_full.sum(dim=1, keepdim=True)
-            elif self.scale_basis == "hvg" and self.hvg_gene_indices is not None:
-                # 使用 HVG 交集
-                mixed_basis_totals = mixed_expr_full[:, self.hvg_gene_indices].sum(dim=1, keepdim=True)
+            if self.scale_basis == "none":
+                reconstructed_spot_full = mixed_expr_full
+            elif self.scale_basis == "fixed_10":
+                reconstructed_spot_full = mixed_expr_full * 10.0
             else:
-                # 默认：使用 marker 子集
-                mixed_basis_totals = mixed_expr_full[:, self.marker_gene_indices].sum(dim=1, keepdim=True)
+                if batch_spot_total_counts is None:
+                    raise ValueError("batch_spot_total_counts is required when scale_basis != 'none' or 'fixed_10'")
+                spot_counts = batch_spot_total_counts.unsqueeze(-1)  # [batch_size, 1]
 
-            scale = spot_counts / (mixed_basis_totals + 1e-8)
-            reconstructed_spot_full = mixed_expr_full * scale * self.library_size  # ✅ 乘以 library_size
-        
-        # 提取 marker 基因: 只在 marker 基因上计算 loss
-        reconstructed_spot_marker_all = reconstructed_spot_full[:, self.marker_gene_indices]
+                if self.scale_basis == "all":
+                    mixed_basis_totals = mixed_expr_full.sum(dim=1, keepdim=True)
+                elif self.scale_basis == "hvg" and self.hvg_gene_indices is not None:
+                    mixed_basis_totals = mixed_expr_full[:, self.hvg_gene_indices].sum(dim=1, keepdim=True)
+                else:
+                    mixed_basis_totals = mixed_expr_full[:, self.marker_gene_indices].sum(dim=1, keepdim=True)
+
+                scale = spot_counts / (mixed_basis_totals + 1e-8)
+                reconstructed_spot_full = mixed_expr_full * scale * self.library_size
+
+            # 提取 marker 基因: 只在 marker 基因上计算 loss
+            reconstructed_spot_marker_all = reconstructed_spot_full[:, self.marker_gene_indices]
         
         # ============ 1. Pearson Correlation Loss ============
         # 计算Pearson相关系数(基于基因表达的相关性)

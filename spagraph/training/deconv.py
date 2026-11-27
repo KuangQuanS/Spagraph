@@ -1171,7 +1171,6 @@ def run_deconv_auto_k(
         # 如果启用 save_all_trials 且提供了 output_dir，保存当前trial的deconv矩阵
         if save_all_trials and output_dir is not None:
             os.makedirs(output_dir, exist_ok=True)
-            import pandas as pd
             deconv_df = result['deconv']
             trial_path = os.path.join(output_dir, f"{result['sample_name']}_cell_composition_k{k}.csv")
             deconv_df.to_csv(trial_path)
@@ -1199,9 +1198,7 @@ def run_deconv_auto_k(
             **deconv_kwargs
         )
         
-        # 保存 deconv 矩阵
-        import pandas as pd
-        import numpy as np
+        # Save final deconvolution matrix
         deconv_df = best_result['deconv']
         deconv_path = os.path.join(output_dir, f"{best_result['sample_name']}_cell_composition.csv")
         deconv_df.to_csv(deconv_path)

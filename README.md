@@ -138,10 +138,12 @@ For multi-seed analyses, optionally set `ranking_mode="w075"` with
 101). Within each run, w075 combines 0.75 times the attention percentile
 with 0.25 times the percentile of log1p(unique supporting-edge count),
 among eligible pairs with at least 10 unique supporting edges.
-The scores are averaged across runs; formal ranks require eligibility in every
-run. This is post-processing, not a change to HE-GAT training or LR inference.
+The scores are averaged across runs, and a pair receives a rank if it is
+eligible in every run. Both modes use the same HE-GAT training procedure.
 
-To compare both modes without retraining, use the existing per-seed CSVs:
+Use a fresh output directory when launching training with
+`spg.cellcom_ensemble(..., ranking_mode="w075")`. To apply w075 to finished
+runs without retraining, read their existing per-seed CSVs:
 
 ```python
 from pathlib import Path
@@ -150,17 +152,14 @@ from spagraph.training.cellcom import aggregate_cellcom_seed_outputs
 root = Path("outputs/cellcom")
 seeds = [11, 23, 42, 67, 101]
 dirs = [root / f"seed_{seed}" for seed in seeds]
-aggregate_cellcom_seed_outputs(dirs, root, seeds, ranking_mode="attention")
 aggregate_cellcom_seed_outputs(dirs, root, seeds, ranking_mode="w075")
 ```
 
-w075 writes separate `lr_pair_ensemble_w075_statistics.csv` and
-`cellcom_ensemble_w075_manifest.json` files, so the attention-only results
-are not overwritten. Support weighting is intended to balance high attention
-with the amount of supporting evidence; it does not establish biochemical
-activity, statistical significance, or universally improved accuracy or
-robustness. See [reproduction notes](docs/reproduction.md#optional-w075-analysis)
-for the validation scope.
+This writes `lr_pair_ensemble_w075_statistics.csv` and
+`cellcom_ensemble_w075_manifest.json` alongside any existing attention-only
+outputs. Support weighting moderates the influence of high attention scores
+with sparse edge support. Leave-one-seed-out top-10 stability varied by
+section. See the [matched case-study comparison](docs/reproduction.md#optional-w075-analysis).
 
 ## Inputs and outputs
 

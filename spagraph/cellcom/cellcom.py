@@ -11,8 +11,6 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader, RandomSampler
 from tqdm import tqdm
 
-# VAE已移除：使用MLPEncoder作为编码器，不再引用DualDecoderVAE
-# 已经将DGI集成到HeteroSTModel (compute_dgi_loss)，不再需要独立的 DGIPretrainModel
 from .cellcom_model import HeteroSTModel
 from .cellcom_graph_builder import (
     STHeteroSubgraphDataset,

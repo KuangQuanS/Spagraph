@@ -15,9 +15,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from typing import List, Tuple, Dict, Optional
 import argparse
-import warnings
 from tqdm import tqdm
-warnings.filterwarnings('ignore')
 
 # Import unified model definitions
 from .deconv_model import VAE, HeterogeneousGATDeconvolution, SpatialDeconvolutionLoss
@@ -768,8 +766,8 @@ class GATDeconvolution:
         Uses spot_total_counts stored during build_gat_model.
         
         Args:
-            knn_cell_indices: [n_spots, n_cell_types, k] 预计算的k-nearest cell索引（动态模式）
-            sc_cell_embeddings: [n_cells, embedding_dim] 单细胞embeddings（动态模式）
+            knn_cell_indices: Precomputed [n_spots, n_cell_types, k] k-nearest cell indices (dynamic mode)
+            sc_cell_embeddings: Single-cell embeddings [n_cells, embedding_dim] (dynamic mode)
         """
         self.gat_model.eval()
         
@@ -877,26 +875,23 @@ class GATDeconvolution:
                 self.gat_model.sc_cell_expressions is not None):
                 
                 # ========== Dynamic cluster reconstruction ==========
-                # 1. 转换为tensor
+                # 1. Convert inputs to tensors
                 deconv_weights_tensor = torch.FloatTensor(deconv_weights).to(self.device)  # [n_spots, n_clusters]
                 knn_indices_tensor = torch.LongTensor(knn_cell_indices).to(self.device)  # [n_spots, n_clusters, k]
-                spot_embeddings_tensor = spot_embeddings  # 已经在GPU上
+                spot_embeddings_tensor = spot_embeddings  # already on device
                 
-                # 2. 计算动态cluster权重（每个spot的每个cluster的k个cell的权重）
-                # 使用均匀权重
+                # 2. Compute uniform dynamic cluster weights across k nearest cells
                 n_spots, n_cell_types, k = knn_indices_tensor.shape
                 dynamic_weights = torch.ones(n_spots, n_cell_types, k, device=self.device) / k
                 
-                # 3. 处理padding（将-1索引对应的权重置零）
+                # 3. Mask out padded (-1) cell indices
                 padding_mask = (knn_indices_tensor == -1)
                 dynamic_weights = dynamic_weights.masked_fill(padding_mask, 0.0)
-                # 重新归一化
+                # Renormalize weights
                 weight_sums = dynamic_weights.sum(dim=-1, keepdim=True)
                 dynamic_weights = dynamic_weights / (weight_sums + 1e-8)
                 
-                # 4. 使用动态权重计算混合表达（全基因）
-                # self.gat_model.sc_cell_expressions: [n_cells, n_all_genes]（全基因原始count）
-                # 直接使用compute_dynamic_mixed_expression进行全基因重建
+                # 4. Reconstruct full-gene mixed expression using raw SC counts [n_cells, n_all_genes]
                 if hasattr(self.loss_fn, 'compute_dynamic_mixed_expression'):
                     mixed_expr_full_tensor = self.loss_fn.compute_dynamic_mixed_expression(
                         attention_weights=deconv_weights_tensor,
@@ -1054,7 +1049,7 @@ class GATDeconvolution:
                     # knn_indices_tensor: [n_spots, n_clusters, k]
                     n_spots, n_clusters, k = dynamic_weights.shape
                     
-                    # cluster到celltype的映射
+                    # Map clusters to cell types
                     cluster_to_celltype_map = {}
                     if self.cluster_to_celltype:
                         cluster_to_celltype_map = {str(k): str(v) for k, v in self.cluster_to_celltype.items()}
@@ -1203,7 +1198,7 @@ class GATDeconvolution:
             if self.output_dir:
                 self.plot_reconstruction_quality_curve(cosine_similarities, sample_name)
         
-        # 缓存到对象并返回，便于上层直接拿到矩阵
+        # Cache result matrix on self for direct access
         self.last_deconv = composition_by_celltype
         self.last_deconv_path = composition_file
         self.last_reconstructed_expr_path = full_expr_file
@@ -1214,7 +1209,7 @@ class GATDeconvolution:
             'composition_path': composition_file,
             'reconstructed_expr_path': full_expr_file,
             'cosine_path': cosine_csv,
-            'deconv_weights_raw': deconv_weights,  # 未合并的 cluster-level 权重 [n_spots, n_clusters]
+            'deconv_weights_raw': deconv_weights,  # unmerged cluster-level weights [n_spots, n_clusters]
             'signature_refinement_mean_abs': signature_refinement_mean_abs,
             'signature_refinement_max_abs': signature_refinement_max_abs,
             'signature_residual_logit_rms': signature_residual_logit_rms,

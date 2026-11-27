@@ -194,6 +194,7 @@ All four scripts accept `--sc-file`, `--st-file`, `--output-dir`, `--device`,
 Spagraph/
 ├── spagraph/               # Core Python package (Stage 1 VAE, Stage 2 GAT, Stage 3 CellCom)
 ├── examples/               # Four tumor case studies (cscc, tnbc, dcis, hgsoc)
+├── docs/                   # Manuscript parameter record (parameters.md) and reproduction guide (reproduction.md)
 ├── assets/                 # Figures displayed in this README
 ├── README.md               # Installation, tutorial, parameters, and case-study guide
 ├── pyproject.toml          # Package metadata and dependencies
@@ -201,15 +202,11 @@ Spagraph/
 └── requirements-paper.txt  # Pinned manuscript environment
 ```
 
-## Paper reproduction archive
+## Paper reproduction & archive
 
-To keep `main` focused on the core software and clean examples, all manuscript
-benchmark runners (32 simulated datasets, STARmap, seqFISH+, synthetic and
-semi-synthetic LR benchmarks, Visium HD CRC), statistical audits, ablations,
-baseline workflows, parameter records, and figure-assembly scripts are archived
-in tagged snapshots:
-
-- **Full manuscript reproduction archive:** [`paper-reproduction-20261127`](https://github.com/KuangQuanS/Spagraph/tree/paper-reproduction-20261127)
+- **Manuscript parameter record:** [`docs/parameters.md`](docs/parameters.md)
+- **Reproduction guide & consensus ranking comparisons:** [`docs/reproduction.md`](docs/reproduction.md)
+- **Full manuscript reproduction archive (benchmarks, baselines, ablations, figure scripts):** [`paper-reproduction-20261127`](https://github.com/KuangQuanS/Spagraph/tree/paper-reproduction-20261127)
 - **Original v1.0.0 release:** [`v1.0.0`](https://github.com/KuangQuanS/Spagraph/tree/v1.0.0)
 
 ## License

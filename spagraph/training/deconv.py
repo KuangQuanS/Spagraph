@@ -15,11 +15,6 @@ import pandas as pd
 import scanpy as sc
 import torch
 
-# Ensure repository root is on path for local execution
-_current_dir = Path(__file__).parent.parent.parent
-if str(_current_dir) not in sys.path:
-    sys.path.insert(0, str(_current_dir))
-
 from spagraph.models.stage2 import GATDeconvolution
 
 
@@ -36,34 +31,28 @@ def _resolve_lambda_mse(
 
 @dataclass
 class Stage1Artifacts:
-    """轻量封装：保存第一阶段的关键产物，便于直接跑第二阶段。
-    
-    支持两种模式：
-    1. 纯内存模式：model_path=None，所有数据在 vae_encoder/vae_state_dict 等字段
-    2. 文件模式：model_path 指向 .pth 文件
-    """
+    """Container holding Stage 1 outputs passed directly into Stage 2."""
     model_path: Optional[str] = None
     cluster_data_path: Optional[str] = None
     output_dir: Optional[str] = None
     st_file: Optional[str] = None
-    
-    # ===== 内存产物：纯内存模式下使用 =====
-    # VAE 编码器（已加载的 PyTorch 模块，可直接用于推理）
+
+    # In-memory VAE encoder artifacts
     vae_encoder: Optional[Any] = None  # torch.nn.Module
     vae_state_dict: Optional[dict] = None
     input_dim: Optional[int] = None
     latent_dim: Optional[int] = None
     output_type: Optional[str] = None
-    
-    # 聚类和标签信息
+
+    # Clustering and gene metadata
     label_encoder: Optional[Any] = None
     marker_genes: Optional[Any] = None
     genes: Optional[Any] = None
     sc_clusters: Optional[Any] = None
     resolution: Optional[float] = None
     celltype_key: Optional[str] = None
-    
-    # 聚类中心和表达（Stage 2 需要）
+
+    # Cluster prototypes and reference expressions for Stage 2
     avg_cell_counts: Optional[Any] = None
     all_genes: Optional[Any] = None
     cluster_to_celltype: Optional[Any] = None
@@ -71,27 +60,27 @@ class Stage1Artifacts:
     celltype_expressions: Optional[Any] = None  # numpy array or tensor
     celltype_expressions_full: Optional[Any] = None  # list of arrays
     hvg_genes_union: Optional[Any] = None
-    auto_library_size: Optional[float] = None  # ✅ Stage1自动计算的library_size (ST_HVG_depth / SC_HVG_depth)
-    
-    # ST 数据相关（在 run_deconv 中计算并保存，用于重建基因表达时缩放）
+    auto_library_size: Optional[float] = None  # ST_HVG_depth / SC_HVG_depth
+
+    # Spatial total counts cached during Stage 2 for expression scaling
     spot_total_counts: Optional[Any] = None  # [n_spots] array
-    
-    # ===== 动态cluster所需数据（可选）=====
-    sc_cell_embeddings: Optional[Any] = None  # [n_sc_cells, latent_dim] SC细胞的VAE embeddings
-    sc_cell_expressions_raw: Optional[Any] = None  # [n_sc_cells, n_all_genes] SC细胞所有基因原始count（后续按barcode和基因名截取）
-    sc_cell_labels: Optional[Any] = None  # [n_sc_cells] SC细胞的cluster标签
-    knn_cell_indices: Optional[Any] = None  # [n_spots, n_clusters, k] 预计算的k-nearest cell索引
-    
-    # 元信息
+
+    # Optional dynamic cluster representation inputs
+    sc_cell_embeddings: Optional[Any] = None  # [n_sc_cells, latent_dim]
+    sc_cell_expressions_raw: Optional[Any] = None  # [n_sc_cells, n_all_genes]
+    sc_cell_labels: Optional[Any] = None  # [n_sc_cells]
+    knn_cell_indices: Optional[Any] = None  # [n_spots, n_clusters, k]
+
+    # Summary metadata
     n_clusters: Optional[int] = None
     n_genes: Optional[int] = None
-    raw_results: Optional[Dict[str, Any]] = None  # 保留原始结果，兼容旧逻辑
-    
+    raw_results: Optional[Dict[str, Any]] = None
+
     sc_cell_marker_expressions: Optional[Any] = None
     sc_celltype_labels: Optional[Any] = None
 
     def is_memory_mode(self) -> bool:
-        """判断是否为纯内存模式（不依赖文件）"""
+        """Return True when Stage 1 artifacts are held in memory."""
         return self.vae_encoder is not None or self.vae_state_dict is not None
 
     @classmethod

@@ -136,7 +136,7 @@ def compute_clusters_and_marker_genes(adata,
                     sub_adata = adata_full[:, selected_genes].copy()
                     y = (adata_full.obs['leiden'] == cluster).astype(int)
                     X = sub_adata.X
-                    # 保持稀疏输入以加速 saga（支持 CSR）
+                    # Keep sparse CSR input for faster saga convergence
                     if not sp.issparse(X):
                         X = sp.csr_matrix(X)
                     clf = LogisticRegression(
@@ -232,7 +232,7 @@ def compute_cluster_centers_and_expressions(
         embeddings: Cell embeddings in latent space [n_cells, latent_dim]
         sc_train_data: Marker gene expression [n_cells, n_marker_genes]
         sc_train_labels: Cluster labels [n_cells]
-        sc_X_full_train_count: Full gene expression [n_cells, n_all_genes] (可选，如果为None则不计算全基因聚合表达)
+        sc_X_full_train_count: Optional full gene expression [n_cells, n_all_genes]
         aggregation_method: 'mean', 'median', or 'weighted'
             - 'mean': Simple average
             - 'median': Median aggregation
@@ -241,7 +241,7 @@ def compute_cluster_centers_and_expressions(
     Returns:
         cluster_prototypes: Dict of cluster centers in latent space
         cluster_expressions: Dict of cluster expressions (marker genes)
-        cluster_expressions_full_count: Dict of cluster expressions (all genes, 如果sc_X_full_train_count=None则为空dict)
+        cluster_expressions_full_count: Dict of cluster expressions (all genes; empty if sc_X_full_train_count is None)
         cluster_cell_weights: Dict of cell weights per cluster (None for mean/median)
     """
 
@@ -281,7 +281,7 @@ def compute_cluster_centers_and_expressions(
             
         elif aggregation_method == 'weighted':
             # Weighted aggregation
-            # 1. UMI weight (如果没有全基因数据，使用marker基因数据)
+            # 1. UMI weight (fall back to marker genes if full-gene matrix is omitted)
             umi_data = cluster_full_data if cluster_full_data is not None else cluster_data
             cell_umi = umi_data.sum(axis=1)
             w_umi = np.log1p(cell_umi) / np.mean(np.log1p(cell_umi))

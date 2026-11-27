@@ -3,15 +3,7 @@
 Wraps the spagraph/models/stage1.py implementation behind a clean API.
 """
 
-import os
-import sys
-from pathlib import Path
-from typing import Optional, Dict, Any
-
-# Ensure repository root is on path for local execution
-_current_dir = Path(__file__).parent.parent.parent
-if str(_current_dir) not in sys.path:
-    sys.path.insert(0, str(_current_dir))
+from typing import Optional, Any
 
 from spagraph.models.stage1 import coEncoder
 from .deconv import Stage1Artifacts
@@ -47,17 +39,16 @@ def train_vae(
     n_pseudospots: int = 4096,
     n_validation_pseudospots: int = 1024,
 ) -> Any:
-    """Train VAE model for SC-ST integration (Stage 1)
-    
-    支持两种模式：
-    1. 纯内存模式（output_dir=None）：不保存任何文件，只返回内存中的 Stage1Artifacts
-    2. 文件模式（output_dir 指定）：保存模型和数据到磁盘
-    
+    """Train VAE model for SC-ST integration (Stage 1).
+
+    Returns an in-memory ``Stage1Artifacts`` object. When ``output_dir`` is
+    provided, run configuration and modality-alignment plots are also saved.
+
     Args:
-        sc_file: Path to single-cell h5ad file
-        st_file: Path to spatial transcriptomics h5ad file
-        output_dir: Output directory path (None 表示纯内存模式，不保存任何文件)
-        as_artifacts: 是否返回 Stage1Artifacts（默认 True），False 返回原始字典
+        sc_file: Path to single-cell h5ad file (raw counts in ``.X``)
+        st_file: Path to spatial transcriptomics h5ad file (raw counts in ``.X``)
+        output_dir: Optional output directory for configuration and plots
+        as_artifacts: Return ``Stage1Artifacts`` (default True) or raw dict
         n_epochs: Number of training epochs
         resolution: Leiden clustering resolution for auto-clustering
         top_n_per_type: Number of marker genes per cluster
@@ -86,28 +77,17 @@ def train_vae(
             to cell-type mixture probabilities.
         n_pseudospots: Number of pseudo-spots generated for training.
         n_validation_pseudospots: Number generated for validation diagnostics.
-    
+
     Returns:
-        Stage1Artifacts（默认）或原始字典（as_artifacts=False）:
-            - 内存模式: 所有数据存储在 artifacts 内存字段中
-            - 文件模式: model_path/cluster_data_path 指向保存的文件
-    
+        ``Stage1Artifacts`` (default) or raw dict when ``as_artifacts=False``.
+
     Example:
         >>> import spagraph
-        >>> # 纯内存模式：不保存任何文件
-        >>> art = spagraph.vae(
-        ...     sc_file="data/sc.h5ad",
-        ...     st_file="data/st.h5ad"
-        ... )
-        >>> # art 包含所有内存数据，可直接传给 deconv()
-        >>>
-        >>> # 文件模式：保存到磁盘
         >>> art = spagraph.vae(
         ...     sc_file="data/sc.h5ad",
         ...     st_file="data/st.h5ad",
-        ...     output_dir="output/stage1/"
+        ...     output_dir="output/stage1/",
         ... )
-        >>> print(f"Model saved to: {art.model_path}")
     """
     if hidden_dims is None:
         hidden_dims = [512, 256]
@@ -118,14 +98,13 @@ def train_vae(
     if n_pseudospots < 1 or n_validation_pseudospots < 1:
         raise ValueError("pseudo-spot counts must be positive")
     
-    # 判断是否保存到磁盘
     save_to_disk = output_dir is not None
-    
-    # Create encoder instance (seed 会在 __init__ 中设置)
+
+    # Create encoder instance (seed is set in __init__)
     encoder = coEncoder(
         sc_file=sc_file,
         st_file=st_file,
-        output_dir=output_dir or "./tmp_stage1",  # 临时目录（不会写入）
+        output_dir=output_dir or "./tmp_stage1",
         celltype_key=celltype_key,
         device=device,
         save_to_disk=save_to_disk,
@@ -168,7 +147,7 @@ def train_vae(
         celltype_key=celltype_key
     )
     
-    # 保存超参数到 txt 文件
+    # Save training configuration summary
     if save_to_disk:
         import datetime
         config_path = f"{output_dir}/config_vae.txt"

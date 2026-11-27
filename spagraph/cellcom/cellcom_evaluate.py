@@ -155,20 +155,20 @@ def evaluate_cell_communication(
 
     print(f"Attention tensors:  {len(all_cc_attention_scores)}")
 
-    # 合并所有batch的注意力得分
+    # Merge attention scores across batches
     all_scores = torch.cat(all_cc_attention_scores, dim=0)  # [total_edges]
     all_edges = torch.cat(all_edge_index_cc, dim=1)  # [2, total_edges]
     all_attrs = torch.cat(all_edge_attr_cc, dim=0)  # [total_edges, 2] - [lr_score, lr_id]
     all_spots = torch.cat(all_spot_indices, dim=0)  # [total_edges] - center spot indices
     all_n_spots_sub_batch = torch.cat(all_n_spots_sub, dim=0)  # [total_edges] - n_spots_sub for each edge
     
-    # 合并cell_node_mappings
+    # Merge cell_node_mappings across batches
     all_cell_node_mappings_flat = []
     for batch_idx, mapping in enumerate(all_cell_node_mappings):
         num_edges_in_batch = all_cc_attention_scores[batch_idx].shape[0]
         all_cell_node_mappings_flat.extend([mapping] * num_edges_in_batch)
     
-    # 合并barcode列表
+    # Merge spot barcode lists across batches
     if all_src_barcodes is not None and all_dst_barcodes is not None:
         all_src_barcodes_flat = [barcode for batch_barcodes in all_src_barcodes for barcode in batch_barcodes]
         all_dst_barcodes_flat = [barcode for batch_barcodes in all_dst_barcodes for barcode in batch_barcodes]
@@ -179,8 +179,8 @@ def evaluate_cell_communication(
     n_unique_spots = len(torch.unique(all_spots))
     print(f"Edges total:        {all_scores.shape[0]} (unique_spots={n_unique_spots})")
 
-    # 注意：all_scores现在是1维的[total_edges]，直接使用即可
-    avg_scores = all_scores  # [total_edges] - 已经是平均后的注意力得分
+    # all_scores is already 1D [total_edges] averaged across heads
+    avg_scores = all_scores
     
     if lr_support_by_edge:
         unique_edges = {}
@@ -321,7 +321,7 @@ def plot_dgi_loss(dgi_train_losses, dgi_val_losses=None, output_dir: str = None,
         output_dir: Output directory for the plot
         epochs: Total number of epochs (optional, will use len(dgi_train_losses) if not provided)
     """
-    # ✅ 使用实际训练的epoch数，而不是预设的epochs参数
+    # Use actual trained epoch count rather than configured maximum epochs
     actual_epochs = len(dgi_train_losses)
     
     plt.figure(figsize=(10, 6))
@@ -356,7 +356,7 @@ def plot_training_loss(train_losses: List[float], val_losses: List[float] = None
         output_dir: Output directory for the plot
         epochs: Total number of epochs (optional, will use len(train_losses) if not provided)
     """
-    # ✅ 使用实际训练的epoch数，而不是预设的epochs参数
+    # Use actual trained epoch count rather than configured maximum epochs
     actual_epochs = len(train_losses)
     
     plt.figure(figsize=(10, 6))

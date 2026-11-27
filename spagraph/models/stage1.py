@@ -16,10 +16,8 @@ import seaborn as sns
 from typing import List, Tuple, Dict, Optional
 import math
 import argparse
-import warnings
 import umap
 from scipy import sparse
-warnings.filterwarnings('ignore')
 
 # Import model and utilities from deconv_model (which now includes vae_utils)
 from .deconv_model import (
@@ -36,12 +34,6 @@ from .stage1_utils import (
     compute_cluster_centers_and_expressions,
     print_weight_statistics
 )
-
-def compute_clusters_and_marker_genes_deprecated(adata, top_n=100, min_fold_change=1.5, resolution=0.5, save_path=None):
-    """
-    DEPRECATED: Use stage1_utils.compute_clusters_and_marker_genes instead
-    """
-    raise DeprecationWarning("This function has been moved to stage1_utils.py")
 
 #============================================================
 # Main Module
@@ -166,7 +158,7 @@ class coEncoder:
 
         # Step 0: Compute auto_library_size first (using raw counts)
         try:
-            # 复制原始数据用于HVG计算
+            # Copy raw counts for HVG selection
             sc_hvg_adata = sc_adata.copy()
             sc.pp.normalize_total(sc_hvg_adata, target_sum=1e4)
             sc.pp.log1p(sc_hvg_adata)
@@ -178,11 +170,11 @@ class coEncoder:
             sc_hvg_genes = list(sc_hvg_adata.var.index[sc_hvg_adata.var["highly_variable"]])
             
             if len(sc_hvg_genes) > 0:
-                # 找出在ST中也存在的HVG
+                # Intersect SC HVGs with genes present in ST
                 sc_hvg_in_st = [g for g in sc_hvg_genes if g in st_adata.var_names]
                 
                 if len(sc_hvg_in_st) > 0:
-                    # 用原始count计算总和
+                    # Sum raw counts across shared HVGs
                     sc_hvg_subset = sc_adata[:, sc_hvg_in_st]
                     sc_hvg_raw = sc_hvg_subset.X.toarray() if hasattr(sc_hvg_subset.X, 'toarray') else sc_hvg_subset.X
                     sc_hvg_total_count = sc_hvg_raw.sum()
@@ -364,7 +356,7 @@ class coEncoder:
             )
             st_hvg_genes = list(st_hvg.var.index[st_hvg.var["highly_variable"]])
 
-            # SC/ST HVG 交集（用于Stage2的scale_basis='hvg'）
+            # SC/ST HVG intersection (used when Stage 2 scale_basis='hvg')
             hvg_intersection = list(sorted(set(sc_hvg_genes) & set(st_hvg_genes)))
             self.hvg_genes_union = hvg_intersection
         except Exception as e:
@@ -447,11 +439,11 @@ class coEncoder:
             use_dual_decoder: If True, use DualDecoderVAE (shared encoder + separate SC/ST decoders)
                             If False, use standard VAE (single encoder + single decoder)
         """
-        # 根据loss_type设置output_type
+        # Set output_type based on loss_type
         output_type = 'zinb' if loss_type == 'zinb' else 'mse'
         
         if use_dual_decoder:
-            # 使用双解码器架构
+            # Use dual-decoder architecture
             self.vae = DualDecoderVAE(
                 input_dim=input_dim,
                 hidden_dims=hidden_dims,
@@ -460,7 +452,7 @@ class coEncoder:
                 output_type=output_type
             ).to(self.device)
         else:
-            # 使用标准VAE
+            # Use standard shared-decoder VAE
             self.vae = VAE(
                 input_dim=input_dim,
                 hidden_dims=hidden_dims,
@@ -528,7 +520,7 @@ class coEncoder:
         if hasattr(self, 'cluster_cell_weights') and self.cluster_cell_weights is not None:
             save_dict['cluster_cell_weights'] = self.cluster_cell_weights
 
-        # 可选：保存 SC/ST 3000-HVG 交集，供 Stage 2 读取
+        # Optionally save SC/ST 3000-HVG intersection for Stage 2
         if hasattr(self, 'hvg_genes_union') and self.hvg_genes_union is not None:
             save_dict['hvg_genes_union'] = np.array(self.hvg_genes_union, dtype=object)
         

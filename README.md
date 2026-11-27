@@ -1,26 +1,26 @@
 # Spagraph
 
-Spagraph is a three-stage framework for joint single-cell and spatial
-transcriptomics analysis. It integrates the two modalities with a variational
-autoencoder (Stage 1), estimates spot-level cell composition and reconstructed
-expression with a graph attention network (Stage 2), and prioritizes spatial
-ligand-receptor communication with a heterogeneous graph model (Stage 3).
+Spagraph is a three-stage framework for joint single-cell (scRNA-seq) and spatial
+transcriptomics (ST) analysis. It integrates both modalities with a variational
+autoencoder (**Stage 1**), estimates spot-level cell composition and cell-type-specific
+gene expression with a graph attention network (**Stage 2**), and prioritizes spatial
+ligand–receptor communication with a heterogeneous graph model (**Stage 3**).
 
-![Spagraph workflow](docs/assets/spagraph_workflow.png)
+![Spagraph workflow](assets/spagraph_workflow.png)
 
 ## Key features
 
-- **Mixture-aware alignment** uses known cell-type proportions in simulated pseudo-spots to supervise single-cell and spatial alignment.
-- **Adaptive graph construction** uses auto-k to select the number of reference prototypes per spot and graph attention to integrate reference and spatial neighbors.
-- **Cell-type-specific expression reconstruction** estimates expression for each inferred cell type within a spot for downstream communication analysis.
-- **Self-supervised communication prioritization** learns cellular and spatial context by reconstructing masked communication-edge strengths and node features.
-- **Configurable consensus ranking** combines evidence across training seeds. The attention weight can be adjusted using saved outputs.
+- **Mixture-aware alignment (Stage 1):** Uses known cell-type proportions in simulated pseudo-spots to supervise joint scRNA-seq/ST latent alignment.
+- **Adaptive GAT deconvolution (Stage 2):** Uses auto-k prototype selection and graph attention to combine reference and spatial neighborhoods, reconstructing cell-type-specific expression for downstream communication analysis.
+- **Spatial cell–cell communication (Stage 3):** Learns cellular and spatial context via masked edge/node reconstruction using the bundled human CellChat ligand–receptor database (`spagraph/cellcom/cellchat_human.csv`).
+- **Configurable multi-seed consensus ranking:** Combines attention and edge-support percentiles across training seeds (`attention_weight` in `[0, 1]`), reusable on saved per-seed outputs without retraining.
 
 ## Benchmark performance
 
-On 32 simulated deconvolution datasets, Spagraph achieved the highest composite average rank score (ARS) among eight methods.
+Across 32 simulated deconvolution datasets, Spagraph achieved the highest composite
+average rank score (ARS) among eight evaluated methods:
 
-![Figure 2a and 2b from the manuscript showing deconvolution metric distributions and composite average rank scores across 32 simulated datasets.](docs/assets/deconvolution-benchmark-fig2ab.png)
+![Deconvolution benchmark across 32 simulated datasets](assets/deconvolution-benchmark-fig2ab.png)
 
 | Metric | Spagraph | RCTD |
 |---|---:|---:|
@@ -32,8 +32,7 @@ On 32 simulated deconvolution datasets, Spagraph achieved the highest composite 
 
 ## Installation
 
-Spagraph was developed with Python 3.10 and a CUDA-enabled PyTorch environment.
-For library use, install the package and its declared dependencies:
+Spagraph targets **Python 3.10+** with a CUDA-enabled PyTorch environment:
 
 ```bash
 git clone https://github.com/KuangQuanS/Spagraph.git
@@ -44,13 +43,18 @@ python -m pip install --upgrade pip
 python -m pip install -e .
 ```
 
-The exact software versions used for the manuscript are pinned in
-[`requirements-paper.txt`](requirements-paper.txt). Install the CUDA build of
-PyTorch appropriate for your system before installing that file. The looser
-ranges in `pyproject.toml` are the supported library dependencies; the pinned
-file is for manuscript reproduction.
+For the exact pinned software versions used in the manuscript, install the CUDA
+build of PyTorch matching your system and then run
+`pip install -r requirements-paper.txt`.
 
-## Three-stage quick start
+## Tutorial: Three-stage workflow
+
+### Inputs
+
+- **scRNA-seq (`.h5ad`):** Gene expression matrix (cells × genes).
+- **Spatial transcriptomics (`.h5ad`):** Spot expression matrix (spots × genes) with spatial coordinates in `adata.obsm["spatial"]`.
+
+### Quick start
 
 ```python
 from pathlib import Path
@@ -61,18 +65,19 @@ st_file = "data/spatial.h5ad"
 deconv_dir = Path("outputs/deconv")
 cellcom_dir = Path("outputs/cellcom")
 
-# Stage 1: joint scRNA-seq/ST representation learning.
+# Stage 1: Joint scRNA-seq / ST representation learning
 artifacts = spg.vae(
     sc_file=sc_file,
     st_file=st_file,
     output_dir=str(deconv_dir),
     resolution=4.0,
+    top_n_per_type=100,
     lambda_pseudospot_contrastive=0.01,
     mixture_temperature=0.15,
     seed=42,
 )
 
-# Stage 2: spatial deconvolution. A list triggers auto-k selection.
+# Stage 2: Spatial deconvolution (a list enables auto-k selection)
 deconv_result = spg.deconv(
     vae=artifacts,
     st_file=st_file,
@@ -80,11 +85,12 @@ deconv_result = spg.deconv(
     k_celltype=[20, 25, 30, 35, 40],
     k_cells_per_cluster=15,
     attention_temperature=4 / 3,
-    save_reconstructed_genes=True,
+    scale_basis="all",
+    save_reconstructed_genes=True,  # Required by Stage 3
     seed=42,
 )
 
-# Stage 3: spatial cell-cell communication.
+# Stage 3: Spatial cell–cell communication (5-seed consensus)
 spg.cellcom(
     deconv_dir=str(deconv_dir),
     st_h5ad=st_file,
@@ -92,93 +98,48 @@ spg.cellcom(
     n_spot_neighbors=8,
     ligand_expr_threshold=3.0,
     receptor_expr_threshold=3.0,
+    lr_score_threshold=1.0,
+    allow_same_celltype_comm=True,
     epochs=200,
-    seed=42,
-    n_repeats=5,
+    seeds=[11, 23, 42, 67, 101],
     export_unified_csv=False,
 )
 ```
 
-For a more stable final estimate, repeat only Stage 2 while reusing the same
-Stage 1 representation:
+### Main outputs
+
+- **Stage 1:** Returns an in-memory `Stage1Artifacts` object and writes `config_vae.txt` plus modality-alignment plots when `output_dir` is set.
+- **Stage 2:** Writes `*_composition.csv`, `config_deconv.txt`, training diagnostics, and (when `save_reconstructed_genes=True`) `*_spot_cell_expr.csv`.
+- **Stage 3:** Writes `communication_edge_statistics.csv` (unique directed edges with complete LR support) and `lr_pair_statistics.csv` per run, plus `lr_pair_ensemble_statistics.csv` and `cellcom_ensemble_manifest.json` for multi-seed runs.
+
+### Optional Stage 2 ensemble
+
+Repeat only Stage 2 while reusing the same Stage 1 representation:
 
 ```python
 deconv_result = spg.deconv_ensemble(
     vae=artifacts,
-    st_file="data/spatial.h5ad",
-    output_dir="results/deconv_ensemble",
+    st_file=st_file,
+    output_dir="outputs/deconv_ensemble",
     n_repeats=3,
     seeds=[11, 23, 42],
 )
 ```
 
-The returned composition is the simplex-normalized arithmetic mean of the
-independent GAT residual predictions. `spg.deconv(...)` remains the faster
-single-run API.
+### Configurable Stage 3 consensus ranking (`attention_weight`)
 
-Stage 1 returns an in-memory `Stage1Artifacts` object. When `output_dir` is
-provided it also writes the run configuration and modality-alignment plots.
-Stage 2 writes `*_composition.csv`, configuration and training diagnostics;
-`save_reconstructed_genes=True` additionally writes the
-`*_spot_cell_expr.csv` file required by Stage 3. Stage 3 writes
-`communication_edge_statistics.csv` (unique directed edges and their complete
-LR support) and `lr_pair_statistics.csv` (associated-edge attention summaries).
-Deprecated unified and filtered LR exports are disabled.
+In multi-seed Stage 3 runs, each run scores eligible LR pairs by
+`α × attention percentile + (1 − α) × log1p(supporting edges) percentile`,
+averaged across seeds:
 
-### Pseudo-spot mixture alignment
+| `attention_weight` (α) | Meaning | Output file |
+|---:|---|---|
+| `1.0` (default) | Attention percentile only | `lr_pair_ensemble_statistics.csv` |
+| `0.75` (`ranking_mode="w075"`) | 75% attention + 25% edge support (≥10 edges/run) | `lr_pair_ensemble_w075_statistics.csv` |
+| `0.5` | Equal attention and support weight (≥10 edges/run) | `lr_pair_ensemble_w0p5_statistics.csv` |
 
-Stage 1 generates pseudo-spots from annotated single cells, so their cell-type
-proportions are known. The shared encoder maps each pseudo-spot and each
-cell-type prototype into the latent space. A soft contrastive loss requires
-the prototype-similarity distribution to match the known mixture. The
-canonical settings are `lambda_pseudospot_contrastive=0.01` and
-`mixture_temperature=0.15`. Stage 2 then trains the GAT without signature
-initialization or a signature consistency loss and applies an attention
-temperature of `4/3` (the validated `gamma=0.75` output calibration). Legacy signature-guided
-arguments remain available only for reproducing older ablations.
-
-### Repeated cell-communication analysis
-
-Stage 3 supports `n_repeats` for stochastic stability. `n_repeats=5` trains
-five independent models and writes an ensemble LR ranking with score and rank
-variation; `n_repeats=1` remains the faster exploratory default. Each run ranks
-LR pairs by mean shared attention over unique supporting edges. The ensemble
-ranks by the mean within-run attention percentile by default, retaining only
-pairs eligible in every requested run. This mode writes
-`lr_pair_ensemble_statistics.csv` and `cellcom_ensemble_manifest.json`.
-Supply explicit seeds with `spg.cellcom_ensemble(...)`. The default objective
-uses edge and node reconstruction with both ranking losses disabled. Repeated
-runs assess sensitivity to training randomness, not independent biological
-replication or a guaranteed improvement in ranking accuracy.
-
-### Configurable LR consensus ranking
-
-`attention_weight` sets how much of each run's ranking score comes from
-context-aware attention:
-
-| `attention_weight` | Interpretation |
-|---:|---|
-| 1.0 (default) | Attention percentile only |
-| 0.75 | 75% attention percentile and 25% supporting-edge percentile |
-| 0.5 | Equal weight for both percentiles |
-| 0.0 | Supporting-edge percentile only |
-
-For a weight α, each run contributes
-`α × attention percentile + (1 − α) × support percentile`.
-Support uses the within-run percentile of `log1p(unique supporting-edge count)`.
-The per-run scores are averaged across seeds. When α is below 1, pairs need
-at least 10 unique supporting edges per run, in addition to existing
-eligibility rules. Every ranked pair must be eligible in all runs.
-
-For an attention-led analysis, explore weights from 0.5 to 1.0. A weight
-of 0.75 is an empirical starting point that retains a 3:1 emphasis on
-attention. See the [matched case-study comparisons](docs/reproduction.md#configurable-lr-consensus-ranking)
-for how ranks and leave-one-seed-out stability vary across sections.
-
-For a new multi-seed run, pass `attention_weight=0.75` to
-`spg.cellcom_ensemble(...)` and choose a fresh output directory. The weight
-affects only the final ranking. To apply a weight to completed runs without
-retraining, use the saved per-seed CSVs:
+Pass `attention_weight=0.75` directly to `spg.cellcom(...)` / `spg.cellcom_ensemble(...)`,
+or re-rank saved per-seed runs without retraining:
 
 ```python
 from pathlib import Path
@@ -186,50 +147,62 @@ from spagraph.training.cellcom import aggregate_cellcom_seed_outputs
 
 root = Path("outputs/cellcom")
 seeds = [11, 23, 42, 67, 101]
-dirs = [root / f"seed_{seed}" for seed in seeds]
+dirs = [root / f"seed_{s}" for s in seeds]
 aggregate_cellcom_seed_outputs(dirs, root, seeds, attention_weight=0.75)
 ```
 
-The default filenames are `lr_pair_ensemble_statistics.csv` and
-`cellcom_ensemble_manifest.json`. Weights below 1 write separate files
-tagged with their weight, such as `lr_pair_ensemble_w075_statistics.csv`
-for 0.75 or `lr_pair_ensemble_w0p5_statistics.csv` for 0.5.
-`ranking_mode="w075"` remains an alias for `attention_weight=0.75`.
+![Support-aware consensus ranking results across tumor sections](assets/support-aware-ranking-results.png)
 
-#### Support-aware ranking results
+## Tumor case-study examples
 
-For each tissue section, these additional Spagraph rankings reuse the same
-five training runs and candidate set at all weights. In HGSOC, 18 of 50
-published candidates were rankable among 233 pairs shared by Spagraph,
-CellChat and COMMOT. At the top 10% cutoff,
-re-ranking at α = 0.75 increased Spagraph's recovery from 3 to 9 of 18 pairs.
+Four ready-to-run Stage 1–3 scripts under [`examples/`](examples/) implement
+the tumor case studies with their exact manuscript parameters (Stage 1:
+`resolution=4.0`, `top_n_per_type=100`, `lambda_pseudospot_contrastive=0.01`,
+`mixture_temperature=0.15`, `seed=42`; Stage 2: `k_cells_per_cluster=15`,
+`attention_temperature=4/3`, `scale_basis="all"`; Stage 3: `n_spot_neighbors=8`,
+`ligand/receptor_expr_threshold=3.0`, `epochs=200`, `seeds=[11, 23, 42, 67, 101]`):
 
-![Representative LR ranks at weights 1.0, 0.75 and 0.5, HGSOC reference recovery at top 10% and top 20%, and cSCC leave-one-seed-out Top 10 Jaccard overlap.](docs/assets/support-aware-ranking-results.png)
+| Case study | Script | Dataset | Stage 2 `k_celltype` | Stage 3 `batch_size` |
+|---|---|---|---:|---:|
+| cSCC (P2) | [`examples/cscc/run.py`](examples/cscc/run.py) | GSE144236 + GSE144239 | `40` | `96` |
+| TNBC | [`examples/tnbc/run.py`](examples/tnbc/run.py) | CID44971 | `[20, 30, 40]` | `128` |
+| DCIS | [`examples/dcis/run.py`](examples/dcis/run.py) | GSE243275 | `20` | `64` |
+| HGSOC (P3) | [`examples/hgsoc/run.py`](examples/hgsoc/run.py) | GSE211956 | `[20, 30, 40]` | `128` |
 
-[Full rankings, reference recovery and stability across tissues](docs/reproduction.md#configurable-lr-consensus-ranking)
+The cSCC example includes a one-command downloader for compact `v1.0.0` release inputs:
 
-## Inputs and outputs
+```bash
+python examples/cscc/download.py
+python examples/cscc/run.py
+```
 
-- Stage 1 inputs: an scRNA-seq `.h5ad` and an ST `.h5ad` with genes as
-  variables; the spatial object must contain coordinates in `obsm["spatial"]`.
-- Stage 2 input: the Stage 1 artifact plus the ST file. The principal output is
-  a spot-by-cluster composition table.
-- Stage 3 inputs: the ST file, Stage 2 composition table, reconstructed
-  spot-cell expression, and the bundled `cellchat_human.csv` LR database.
-- Generated data, checkpoints and manuscript result tables are intentionally
-  not versioned. Dataset paths are supplied as command-line arguments in the
-  reproduction entry points.
+All four scripts accept `--sc-file`, `--st-file`, `--output-dir`, `--device`,
+`--k-celltype`, `--seeds`, `--attention-weight`, and `--skip-cellcom`. See
+[`examples/README.md`](examples/README.md) for details.
 
-## Reproducibility
+## Repository layout
 
-| Resource | Link |
-|---|---|
-| Original attention-only release | [v1.0.0](https://github.com/KuangQuanS/Spagraph/tree/v1.0.0) |
-| Manuscript reproduction guide | [docs/reproduction.md](docs/reproduction.md) |
-| Parameter record | [docs/parameters.md](docs/parameters.md) |
-| Pinned dependencies | [requirements-paper.txt](requirements-paper.txt) |
-| cSCC example and data download | [examples/cscc](examples/cscc/) |
-| Additional weight analyses | [Consensus ranking comparisons](docs/reproduction.md#configurable-lr-consensus-ranking) |
+```text
+Spagraph/
+├── spagraph/               # Core Python package (Stage 1 VAE, Stage 2 GAT, Stage 3 CellCom)
+├── examples/               # Four tumor case studies (cscc, tnbc, dcis, hgsoc)
+├── assets/                 # Figures displayed in this README
+├── README.md               # Installation, tutorial, parameters, and case-study guide
+├── pyproject.toml          # Package metadata and dependencies
+├── requirements.txt        # Runtime dependencies
+└── requirements-paper.txt  # Pinned manuscript environment
+```
+
+## Paper reproduction archive
+
+To keep `main` focused on the core software and clean examples, all manuscript
+benchmark runners (32 simulated datasets, STARmap, seqFISH+, synthetic and
+semi-synthetic LR benchmarks, Visium HD CRC), statistical audits, ablations,
+baseline workflows, parameter records, and figure-assembly scripts are archived
+in tagged snapshots:
+
+- **Full manuscript reproduction archive:** [`paper-reproduction-20261127`](https://github.com/KuangQuanS/Spagraph/tree/paper-reproduction-20261127)
+- **Original v1.0.0 release:** [`v1.0.0`](https://github.com/KuangQuanS/Spagraph/tree/v1.0.0)
 
 ## License
 

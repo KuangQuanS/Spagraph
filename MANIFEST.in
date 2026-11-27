@@ -5,7 +5,6 @@ include requirements.txt
 
 # Include configuration files
 include pyproject.toml
-include setup.py
 
 # Include marker gene files and databases
 recursive-include spagraph *.txt *.csv *.json

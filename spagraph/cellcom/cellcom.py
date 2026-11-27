@@ -266,15 +266,15 @@ def main(args=None):
     deconv_dir = args.deconv_dir
     
     # 1. CellChat database (for LR communication computation)
-    # Keep the historical checkout default; fall back to package data in wheels.
-    project_root = Path(__file__).resolve().parents[2]
-    source_database = project_root / 'cellchat_human.csv'
+    # Prefer the bundled package database; retain legacy repo-root fallback.
     bundled_database = Path(__file__).resolve().with_name('cellchat_human.csv')
+    project_root = Path(__file__).resolve().parents[2]
+    legacy_database = project_root / 'cellchat_human.csv'
     configured_lr_database = getattr(args, 'lr_database_csv', None)
     cellchat_file = (
         Path(configured_lr_database)
         if configured_lr_database
-        else source_database if source_database.is_file() else bundled_database
+        else bundled_database if bundled_database.is_file() else legacy_database
     )
     if not cellchat_file.is_file():
         raise FileNotFoundError(

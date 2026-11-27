@@ -18,10 +18,10 @@ If you find Spagraph helpful in your research, feel free to ⭐ the repository o
 
 ## ✨ Key Features
 
-- **🔗 Mixture-aware alignment (Stage 1):** Uses simulated pseudo-spots with known cell-type proportions to supervise joint scRNA-seq / ST latent representation learning.
-- **🧠 Adaptive GAT deconvolution (Stage 2):** Combines auto-`k` reference prototype selection with graph attention over reference and spatial neighbors, reconstructing cell-type-specific expression for downstream communication inference.
-- **📡 Spatial cell–cell communication (Stage 3):** Prioritizes spatially localized LR signaling via masked edge/node reconstruction using the bundled human CellChat database (`spagraph/cellcom/cellchat_human.csv`).
-- **⚖️ Configurable multi-seed consensus ranking:** Supports adjustable attention vs. edge-support weighting (`attention_weight` in `[0, 1]`) directly on saved per-seed outputs without retraining.
+- **Mixture-aware alignment (Stage 1):** Uses simulated pseudo-spots with known cell-type proportions to supervise joint scRNA-seq / ST latent representation learning.
+- **Adaptive GAT deconvolution (Stage 2):** Combines auto-`k` reference prototype selection with graph attention over reference and spatial neighbors, reconstructing cell-type-specific expression for downstream communication inference.
+- **Spatial cell–cell communication (Stage 3):** Prioritizes spatially localized LR signaling via masked edge/node reconstruction using the bundled human CellChat database (`spagraph/cellcom/cellchat_human.csv`).
+- **Configurable multi-seed consensus ranking:** Supports adjustable attention vs. edge-support weighting (`attention_weight` in `[0, 1]`) directly on saved per-seed outputs without retraining.
 
 ## 📦 Installation
 
@@ -38,7 +38,7 @@ python -m pip install -e .
 
 ## 🚀 Tutorial: Three-Stage Workflow
 
-### ⚠️ Input Data Requirements
+### Input Data Requirements
 
 > **Important:** Both `sc_file` and `st_file` must store **raw, unnormalized counts** in `adata.X`. Stage 1 estimates library-size ratios from raw counts and applies `normalize_total(target_sum=1e4)` and `log1p` internally — do **not** pass pre-normalized, log-transformed, or z-scored matrices.
 
@@ -51,7 +51,7 @@ python -m pip install -e .
   - `adata.var_names`: gene names matching `sc_file` (Stage 1 automatically takes the shared gene intersection).
   - `adata.obsm["spatial"]`: 2D spatial coordinates (`n_spots × 2`).
 
-### 🧪 Quick Start
+### Quick Start
 
 ```python
 from pathlib import Path
@@ -103,13 +103,13 @@ spg.cellcom(
 )
 ```
 
-### 📄 Main Outputs
+### Main Outputs
 
 - **Stage 1:** Returns an in-memory `Stage1Artifacts` object and writes `config_vae.txt` plus modality-alignment plots when `output_dir` is set.
 - **Stage 2:** Writes `*_composition.csv`, `config_deconv.txt`, training diagnostics, and (when `save_reconstructed_genes=True`) `*_spot_cell_expr.csv`.
 - **Stage 3:** Writes `communication_edge_statistics.csv` (unique directed edges with complete LR support) and `lr_pair_statistics.csv` per run, plus `lr_pair_ensemble_statistics.csv` and `cellcom_ensemble_manifest.json` for multi-seed runs.
 
-### 🔁 Optional Stage 2 Ensemble & Configurable Stage 3 Consensus
+### Optional Stage 2 Ensemble & Configurable Stage 3 Consensus
 
 Repeat only Stage 2 while reusing the same Stage 1 representation:
 

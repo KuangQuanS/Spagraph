@@ -39,7 +39,7 @@ archived files from
 ## Configurable LR consensus ranking
 
 The default attention weight is `1.0`, with the original aggregation and
-filenames. The [README example](../README.md#configurable-stage-3-consensus-ranking-attention_weight)
+filenames. The [README example](../README.md#optional-stage-2-ensemble--configurable-stage-3-consensus)
 shows how to evaluate different weights on the same saved per-seed
 `lr_pair_statistics.csv` files.
 

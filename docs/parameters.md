@@ -152,10 +152,9 @@ manifest. The old representative-LR `lr_communication.csv` is no longer written,
 including when deprecated export flags are supplied.
 
 Use `ccc_minimal_analysis.py` and `ccc_paper_plots.py` in `evaluate/scripts/cc_com/`
-for current single-run analysis. The SCC consensus replacement panels use
-`scripts/plot_communication_ranks.py`, `plot_communication_abundance.py`,
-`plot_communication_focality.py`, and `plot_scc_seed_stability.py`; compose the
-replacement PDFs with `scripts/assemble_communication_figures.py`.
+for current single-run analysis. The historical SCC panel rendering and PDF
+assembly scripts are in the
+[`v1.0.0` scripts snapshot](https://github.com/KuangQuanS/Spagraph/tree/v1.0.0/scripts).
 
 Older `lr_plot.py`, `panel_g_*.py`, `cellchat_scc_baseline_figures.py`, and
 `fix_csv.py` scripts retain historical data contracts. They are archival figure

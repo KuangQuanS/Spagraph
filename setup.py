@@ -65,6 +65,7 @@ setup(
             "sphinx-rtd-theme>=1.0.0",
         ],
     },
+    package_data={"spagraph.cellcom": ["cellchat_human.csv"]},
     include_package_data=True,
     zip_safe=False,
 )

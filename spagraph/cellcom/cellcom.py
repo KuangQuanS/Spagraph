@@ -266,19 +266,20 @@ def main(args=None):
     deconv_dir = args.deconv_dir
     
     # 1. CellChat database (for LR communication computation)
-    # Use absolute path based on the project root directory
-    project_root = Path(__file__).parent.parent.parent  # Go up to project root from cellcom/cellcom.py
+    # Keep the historical checkout default; fall back to package data in wheels.
+    project_root = Path(__file__).resolve().parents[2]
+    source_database = project_root / 'cellchat_human.csv'
+    bundled_database = Path(__file__).resolve().with_name('cellchat_human.csv')
     configured_lr_database = getattr(args, 'lr_database_csv', None)
     cellchat_file = (
         Path(configured_lr_database)
         if configured_lr_database
-        else project_root / 'cellchat_human.csv'
+        else source_database if source_database.is_file() else bundled_database
     )
-    if not cellchat_file.exists():
+    if not cellchat_file.is_file():
         raise FileNotFoundError(
-            f"CellChat database file not found: {cellchat_file}\\n"
-            f"Expected location: {project_root}/cellchat_human.csv\\n"
-            f"Please ensure cellchat_human.csv is in the project root directory."
+            f"CellChat database file not found: {cellchat_file}\n"
+            "Install Spagraph with its package data or pass lr_database_csv explicitly."
         )
     lr_db = pd.read_csv(cellchat_file)
     lr_pairs = []

@@ -68,6 +68,9 @@ packages = [
     "spagraph.analysis",
 ]
 
+[tool.setuptools.package-data]
+"spagraph.cellcom" = ["cellchat_human.csv"]
+
 [tool.setuptools.dynamic]
 version = {attr = "spagraph.__version__.__version__"}
 

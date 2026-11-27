@@ -82,7 +82,7 @@ Stage 1 representation:
 
 ```python
 deconv_result = spg.deconv_ensemble(
-    vae=vae_result,
+    vae=artifacts,
     st_file="data/spatial.h5ad",
     output_dir="results/deconv_ensemble",
     n_repeats=3,

@@ -42,20 +42,24 @@ python evaluate/scripts/cc_com/figure3e_lr_pair_statistics.py \
 
 ## Semisynthetic and synthetic LR benchmarks (Figure S2)
 
-- `spagraph/analysis/semisynthetic_lr_benchmark.py`
-- `spagraph/analysis/synthetic_lr_v2_benchmark.py`
-- `scripts/run_semisynthetic_lr_benchmark.py`
-- `scripts/run_semisynthetic_multiseed_gpu.sh`
-- `scripts/summarize_semisynthetic_multiseed.py`
-- `scripts/run_synthetic_lr_v2_benchmark.py`
-- `scripts/run_synthetic_lr_v2_gpu.sh`
-- `scripts/run_synthetic_lr_v2_multiseed_gpu.sh`
-- `scripts/summarize_synthetic_lr_v2_multiseed.py`
-- `scripts/plot_synthetic_lr_v2_summary.py`
+| Analysis | Per-seed runner | Across-seed summary |
+|---|---|---|
+| CID44971 semisynthetic | [run_semisynthetic_lr_benchmark.py](../scripts/run_semisynthetic_lr_benchmark.py) | [summarize_semisynthetic_multiseed.py](../scripts/summarize_semisynthetic_multiseed.py) |
+| Fully synthetic | [run_synthetic_lr_v2_benchmark.py](../scripts/run_synthetic_lr_v2_benchmark.py) | [summarize_synthetic_lr_v2_multiseed.py](../scripts/summarize_synthetic_lr_v2_multiseed.py) |
 
-The local copies of the core benchmark modules, runners and multiseed
-summarizers matched the final GPU workspace byte-for-byte before the release
-scripts were made path-portable.
+For each run, set `--output` to `<result-root>/seed_<seed>` and pass the
+corresponding `--seed`. Then call the matching summary script with
+`--root <result-root> --seeds <seed list>`. Both runners default to 30 epochs.
+
+- **Semisynthetic.** Supply the CID44971 Step 2 composition and reconstructed
+  spot-cell expression through `--composition-csv` and `--spot-cell-expr-csv`,
+  plus the matching Visium section through `--st-h5ad`. Use seeds 11, 23, 42,
+  67 and 101.
+- **Fully synthetic.** Use `--grid-side 22` and seeds 11, 17, 23, 29, 37, 42,
+  53, 61, 67, 73, 79, 83, 89, 97, 101, 107, 113, 127, 131 and 139.
+
+Historical launch and plotting recipes are in the
+[`v1.0.0` scripts snapshot](https://github.com/KuangQuanS/Spagraph/tree/v1.0.0/scripts).
 
 ## Visium HD CRC check (Figure S3)
 

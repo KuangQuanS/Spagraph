@@ -49,10 +49,18 @@ build of PyTorch matching your system and then run
 
 ## Tutorial: Three-stage workflow
 
-### Inputs
+### Input data requirements
 
-- **scRNA-seq (`.h5ad`):** Gene expression matrix (cells × genes).
-- **Spatial transcriptomics (`.h5ad`):** Spot expression matrix (spots × genes) with spatial coordinates in `adata.obsm["spatial"]`.
+> **Important:** Both `sc_file` and `st_file` must store **raw, unnormalized counts** in `adata.X`. Stage 1 computes library-size ratios from raw counts and runs `normalize_total(target_sum=1e4)` and `log1p` internally—do **not** pass pre-normalized, log-transformed, or z-scored matrices.
+
+- **scRNA-seq (`.h5ad`):**
+  - `adata.X`: raw UMI/read counts (cells × genes).
+  - `adata.var_names`: gene names using the same naming convention as the ST object (human gene symbols are required for the bundled Stage 3 `cellchat_human.csv` database).
+  - `adata.obs`: reference cell-type labels in `cell_type` or `celltype` (auto-detected), or specify another column via `celltype_key="..."`.
+- **Spatial transcriptomics (`.h5ad`):**
+  - `adata.X`: raw counts (spots × genes).
+  - `adata.var_names`: gene names matching `sc_file` (Stage 1 automatically takes the shared gene intersection).
+  - `adata.obsm["spatial"]`: 2D spatial coordinates (`n_spots × 2`).
 
 ### Quick start
 

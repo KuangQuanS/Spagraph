@@ -171,7 +171,10 @@ python examples/cscc/run.py
 
 All four scripts accept `--sc-file`, `--st-file`, `--output-dir`, `--device`,
 `--k-celltype`, `--seeds`, `--attention-weight`, and `--skip-cellcom`. See
-[`examples/README.md`](examples/README.md) for full CLI options.
+[`examples/README.md`](examples/README.md) for full CLI options. To reproduce
+Stage 3 directly from the exact manuscript Stage 2 deconvolution outputs without
+re-running Stages 1–2, download the archived outputs from
+[Hugging Face (`kmmuleelab/Spagraph-case-deconvolution`)](https://huggingface.co/datasets/kmmuleelab/Spagraph-case-deconvolution).
 
 ## 📚 Benchmark & Case-Study Datasets
 
@@ -204,6 +207,7 @@ Spagraph/
 
 ## 🗄️ Paper Reproduction & Archive
 
+- **Archived Stage 2 deconvolution outputs (4 tumor cases):** [Hugging Face (`kmmuleelab/Spagraph-case-deconvolution`)](https://huggingface.co/datasets/kmmuleelab/Spagraph-case-deconvolution)
 - **Manuscript parameter record:** [`docs/parameters.md`](docs/parameters.md)
 - **Reproduction guide & consensus ranking comparisons:** [`docs/reproduction.md`](docs/reproduction.md)
 - **Full manuscript reproduction archive (benchmarks, baselines, ablations, figure scripts):** [`paper-reproduction-20261127`](https://github.com/KuangQuanS/Spagraph/tree/paper-reproduction-20261127)

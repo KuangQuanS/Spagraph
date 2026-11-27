@@ -18,6 +18,11 @@ manuscript parameters (including Stage 3 seeds `11, 23, 42, 67, 101`):
 - [`examples/dcis/`](../examples/dcis/) — GSE243275 (DCIS)
 - [`examples/hgsoc/`](../examples/hgsoc/) — GSE211956 P3 (HGSOC)
 
+To reproduce Stage 3 directly from the exact manuscript Stage 2 deconvolution
+outputs (`*_composition.csv` and `*_spot_cell_expr.csv.gz`), download the
+archived files from
+[Hugging Face (`kmmuleelab/Spagraph-case-deconvolution`)](https://huggingface.co/datasets/kmmuleelab/Spagraph-case-deconvolution).
+
 ## Archived benchmark, baseline, and statistical scripts (`paper-reproduction-20261127`)
 
 - **Deconvolution benchmarks (Figures 2 and S1):**

@@ -1,29 +1,32 @@
-# cSCC example
+# cSCC Example (GSE144236 / GSE144239 P2)
 
-This example contains the P2 cutaneous squamous cell carcinoma data used in
-the Spagraph case study. The processed inputs are derived from the scRNA-seq
-series [GSE144236](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE144236)
-and spatial transcriptomics series
-[GSE144239](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE144239), both
-within SuperSeries GSE144240.
+This example runs the full three-stage Spagraph workflow on the P2 cutaneous
+squamous cell carcinoma (cSCC) case study from
+[GSE144236](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE144236)
+(scRNA-seq) and
+[GSE144239](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE144239)
+(Visium ST), within SuperSeries GSE144240.
 
-Download the compact, analysis-ready AnnData files from the `v1.0.0` release:
+## 1. Download compact analysis-ready inputs
 
 ```bash
 python examples/cscc/download.py
 ```
 
-The files are written to `examples/cscc/data/` and checked against their
-published SHA256 hashes. The spatial file retains the expression matrix and
-spatial coordinates but omits the embedded high-resolution histology image,
-which is not required by the Spagraph workflow.
+Files are saved under `examples/cscc/data/` and verified against their `v1.0.0`
+release SHA256 checksums.
 
-Run the three stages:
+## 2. Run Stage 1–3
 
 ```bash
 python examples/cscc/run.py
 ```
 
-Outputs are written to `results/cscc/`. Stage 3 uses five independent training
-runs for the consensus ligand-receptor ranking and therefore takes longer than
-the first two stages.
+By default, outputs are written to `results/cscc/{deconv,cellcom}` using the
+manuscript settings (`k_celltype=40`, `batch_size=96`, `epochs=200`,
+`n_repeats=5`). To enable optional w075 support-aware consensus ranking or
+override paths/device:
+
+```bash
+python examples/cscc/run.py --attention-weight 0.75 --device cuda:0
+```

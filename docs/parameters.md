@@ -1,9 +1,11 @@
 # Manuscript parameter record
 
-This document records the parameter settings used for the Spagraph manuscript.
+This document is the single parameter record for the Spagraph manuscript.
 Values were compiled from saved run configurations and the scripts used to
-generate the reported results. The companion [`parameters.xlsx`](parameters.xlsx)
-provides the same record in spreadsheet format.
+generate the reported results. An archival spreadsheet copy (`parameters.xlsx`)
+is preserved in the
+[`paper-reproduction-20261127`](https://github.com/KuangQuanS/Spagraph/tree/paper-reproduction-20261127)
+and [`v1.0.0`](https://github.com/KuangQuanS/Spagraph/tree/v1.0.0) tags.
 
 ## Shared model settings
 
@@ -45,13 +47,13 @@ dynamic cluster representation.
 
 ## Stage 3 case-study settings
 
-| Dataset | Ligand threshold | Receptor threshold | LR-score threshold | Spot neighbors | Epochs | Batch size | Seed | Source |
+| Dataset | Ligand threshold | Receptor threshold | LR-score threshold | Spot neighbors | Epochs | Batch size | Seed | Public entry point |
 |---|---:|---:|---:|---:|---:|---:|---:|---|
-| GSE211956 P3 (HGSOC) | 3 | 3 | 1 | 8 | 200 | 128 | 42 | `run_notebook/run_GSE211956.ipynb` |
-| CID44971 (basal-like TNBC) | 3 | 3 | 1 | 8 | 200 | 128 | 42 | `run_notebook/run_CID44971.ipynb` |
-| GSE243275 (DCIS) | 3 | 3 | 1 | 8 | 200 | 64 | 42 | `run_notebook/run_GSE243275.ipynb` |
-| GSE144236 (cSCC), Figure 3 analysis | 3 | 3 | 1 | 8 | 200 | 96 | 42 | `run_notebook/rerun_GSE144236_lr_associated_411367e.py` |
-| GSE280315 Visium HD CRC, P1/P2/P5 | 3 | 1 | 1 | 8 | 10 | 4 | 42 | `run_notebook/gse280315_visiumhd_crc/run_p*_128um_cellcom_smoke.py` |
+| GSE211956 P3 (HGSOC) | 3 | 3 | 1 | 8 | 200 | 128 | 42 | [`examples/hgsoc/run.py`](../examples/hgsoc/run.py) |
+| CID44971 (basal-like TNBC) | 3 | 3 | 1 | 8 | 200 | 128 | 42 | [`examples/tnbc/run.py`](../examples/tnbc/run.py) |
+| GSE243275 (DCIS) | 3 | 3 | 1 | 8 | 200 | 64 | 42 | [`examples/dcis/run.py`](../examples/dcis/run.py) |
+| GSE144236 (cSCC), Figure 3 analysis | 3 | 3 | 1 | 8 | 200 | 96 | 42 | [`examples/cscc/run.py`](../examples/cscc/run.py) |
+| GSE280315 Visium HD CRC, P1/P2/P5 | 3 | 1 | 1 | 8 | 10 | 4 | 42 | [`benchmarks/run_visium_hd.py`](../benchmarks/run_visium_hd.py) |
 
 Expression thresholds are in CP10k space and the LR-score threshold is in the
 pipeline's log1p score space. The tumour case-study runs use
@@ -140,7 +142,7 @@ replicates.
 | Cell-type-pair count | median 2 vs 24; U=0; raw P=2.69542e-6; Holm P=5.39085e-6 |
 
 The calculation is implemented in
-[`scripts/summarize_communication_focality.py`](../scripts/summarize_communication_focality.py).
+[`benchmarks/summarize_communication_focality.py`](../benchmarks/summarize_communication_focality.py).
 The resulting values and summary are stored under `results/communication/figures/`.
 
 ## Communication output compatibility
@@ -151,16 +153,10 @@ Repeated runs additionally produce `lr_pair_ensemble_statistics.csv` and a seed
 manifest. The old representative-LR `lr_communication.csv` is no longer written,
 including when deprecated export flags are supplied.
 
-Use `ccc_minimal_analysis.py` and `ccc_paper_plots.py` in `evaluate/scripts/cc_com/`
-for current single-run analysis. The historical SCC panel rendering and PDF
-assembly scripts are in the
-[`v1.0.0` scripts snapshot](https://github.com/KuangQuanS/Spagraph/tree/v1.0.0/scripts).
-
-Older `lr_plot.py`, `panel_g_*.py`, `cellchat_scc_baseline_figures.py`, and
-`fix_csv.py` scripts retain historical data contracts. They are archival figure
-recipes, not current package entry points: do not rename a current output to
-`lr_communication.csv` to make them run. Any reuse requires expansion through
+Archival manuscript plotting recipes, legacy notebooks, and historical per-dataset
+run configuration logs are preserved in the
+[`paper-reproduction-20261127`](https://github.com/KuangQuanS/Spagraph/tree/paper-reproduction-20261127)
+and [`v1.0.0`](https://github.com/KuangQuanS/Spagraph/tree/v1.0.0) tags. Any reuse
+of historical single-run plotting scripts requires expansion through
 `spagraph.cellcom.relation_ranker.read_associated_lr_events`, which checks
-complete LR support and rejects representative-ID tables. The
-[`v1.0.0` snapshot](https://github.com/KuangQuanS/Spagraph/tree/v1.0.0)
-contains the earlier draft runners and saved notebook outputs.
+complete LR support and rejects representative-ID tables.

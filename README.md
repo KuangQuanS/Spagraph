@@ -220,16 +220,31 @@ re-ranking at α = 0.75 increased Spagraph's recovery from 3 to 9 of 18 pairs.
   not versioned. Dataset paths are supplied as command-line arguments in the
   reproduction entry points.
 
+## Repository layout
+
+```text
+Spagraph/
+├── spagraph/       # Core library (Stage 1 VAE, Stage 2 GAT deconvolution, Stage 3 cell communication)
+├── examples/       # Four tumor case studies (cscc, tnbc, dcis, hgsoc) using the public Stage 1–3 API
+├── benchmarks/     # Simulated deconvolution, STARmap, seqFISH+, synthetic/semi-synthetic LR, Visium HD, ablations & baselines
+├── tests/          # Unit and contract tests
+└── docs/           # Manuscript parameter record and reproduction guide
+```
+
 ## Reproducibility
 
 | Resource | Link |
 |---|---|
-| Original attention-only release | [v1.0.0](https://github.com/KuangQuanS/Spagraph/tree/v1.0.0) |
+| Tumor case studies (cSCC, TNBC, DCIS, HGSOC) | [examples/](examples/) |
+| Core benchmarks, metrics, ablations & baselines | [benchmarks/](benchmarks/) |
 | Manuscript reproduction guide | [docs/reproduction.md](docs/reproduction.md) |
 | Parameter record | [docs/parameters.md](docs/parameters.md) |
-| Pinned dependencies | [requirements-paper.txt](requirements-paper.txt) |
-| cSCC example and data download | [examples/cscc](examples/cscc/) |
+| Pinned manuscript environment | [requirements-paper.txt](requirements-paper.txt) |
+| Full paper reproduction & figure-script archive | [paper-reproduction-20261127](https://github.com/KuangQuanS/Spagraph/tree/paper-reproduction-20261127) |
+| Original attention-only release | [v1.0.0](https://github.com/KuangQuanS/Spagraph/tree/v1.0.0) |
 | Additional weight analyses | [Consensus ranking comparisons](docs/reproduction.md#configurable-lr-consensus-ranking) |
+
+Historical figure-assembly recipes, per-dataset intermediate logs, and legacy notebooks remain preserved without rewriting history in the [`paper-reproduction-20261127`](https://github.com/KuangQuanS/Spagraph/tree/paper-reproduction-20261127) and [`v1.0.0`](https://github.com/KuangQuanS/Spagraph/tree/v1.0.0) tags.
 
 ## License
 

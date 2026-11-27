@@ -2,41 +2,56 @@
 
 Raw data and generated result directories are not versioned. All public entry
 points accept command-line inputs or resolve paths relative to the repository.
+Archival figure-styling scripts, legacy notebooks, and historical intermediate
+run logs remain intact in the
+[`paper-reproduction-20261127`](https://github.com/KuangQuanS/Spagraph/tree/paper-reproduction-20261127)
+and [`v1.0.0`](https://github.com/KuangQuanS/Spagraph/tree/v1.0.0) tags.
+
+## Tumor case studies (Figures 3–6)
+
+Clean Stage 1–3 runners using only the public Spagraph API and explicit
+manuscript parameters live under [`examples/`](../examples/):
+
+- [`examples/cscc/`](../examples/cscc/) — GSE144236 + GSE144239 P2 (cSCC; includes `download.py` for compact `v1.0.0` release inputs)
+- [`examples/tnbc/`](../examples/tnbc/) — CID44971 (basal-like TNBC)
+- [`examples/dcis/`](../examples/dcis/) — GSE243275 (DCIS)
+- [`examples/hgsoc/`](../examples/hgsoc/) — GSE211956 P3 (HGSOC)
 
 ## Deconvolution benchmarks (Figures 2 and S1)
 
-- `evaluate/scripts/deconv/evaluate_benchmark_metrics.py`: per-dataset PCC,
-  SSIM, RMSE and Jensen-Shannon divergence evaluation.
-- `evaluate/scripts/deconv/total_metrics_plot.py`: aggregate simulated-data
-  benchmark panels.
-- `evaluate/scripts/deconv/reproduce_spagraph_rctd_wilcoxon.py`: paired
-  Spagraph/RCTD comparison across the 32 simulated datasets.
-- `run_notebook/run_{CID44971,GSE144240,GSE211956,GSE243275}_stage1_only.py`:
-  reproducible Stage 1 entry points for the four tumour datasets.
-- `run_notebook/run_STARmap.ipynb` and `run_notebook/run_simulate.ipynb`:
-  STARmap/seqFISH+ and simulated-data orchestration retained from the manuscript
-  workflow.
+- [`benchmarks/run_deconvolution.py`](../benchmarks/run_deconvolution.py):
+  Stage 1–2 runner for simulated datasets `Data1`–`Data32`.
+- [`benchmarks/evaluate_deconvolution.py`](../benchmarks/evaluate_deconvolution.py):
+  per-dataset PCC, SSIM, RMSE and Jensen-Shannon divergence evaluation.
+- [`benchmarks/compare_rctd_wilcoxon.py`](../benchmarks/compare_rctd_wilcoxon.py):
+  paired Spagraph/RCTD Wilcoxon signed-rank comparison across the 32 simulated datasets.
+- [`benchmarks/run_starmap.py`](../benchmarks/run_starmap.py) and
+  [`benchmarks/run_seqfish.py`](../benchmarks/run_seqfish.py):
+  STARmap and seqFISH+ Stage 1–2 deconvolution runners.
+- [`benchmarks/baselines/deconvolution/`](../benchmarks/baselines/deconvolution/):
+  reference scripts and notebooks for DWLS, RCTD, Seurat, SPOTlight, DestVI,
+  Stereoscope, and Tangram.
 
-## SCC baselines and ablations (Figure 3)
+## SCC baselines, ablations and Figure 3e statistics (Figure 3)
 
-- `run_notebook/gse144240_ablation/`: edge masking, node masking, no masking
-  and no-LR-identity Stage 3 runs.
-- `run_notebook/gse144240_cellchat_baseline/`: CellChat input preparation and
-  spatial baseline runner; generated matrices and R objects are excluded.
-- `run_notebook/gse144240_commot_baseline/` and
-  `run_notebook/gse144240_giotto_baseline/`: COMMOT and Giotto baseline
-  entry points; generated input matrices are excluded.
-- `evaluate/scripts/cc_com/ablation_rank_heatmap.py` and the SCC comparison
-  scripts assemble the published rank and spatial panels.
-- `evaluate/scripts/cc_com/figure3e_lr_pair_statistics.py` recalculates Figure
-  3e from the selected LR-pair metrics and exports the panel, statistical
-  summary, excluded overlap and per-pair audit table.
+- [`benchmarks/ablations/`](../benchmarks/ablations/): edge masking, node
+  masking, no masking, and no-LR-identity Stage 3 runs.
+- [`benchmarks/baselines/communication/cellchat/`](../benchmarks/baselines/communication/cellchat/):
+  CellChat v2 input preparation and spatial baseline runner.
+- [`benchmarks/baselines/communication/commot/`](../benchmarks/baselines/communication/commot/) and
+  [`benchmarks/baselines/communication/giotto/`](../benchmarks/baselines/communication/giotto/):
+  COMMOT and Giotto spatial CCC baseline entry points.
+- [`benchmarks/figure3e_statistics.py`](../benchmarks/figure3e_statistics.py):
+  recalculates Figure 3e from LR-pair metrics (two-sided Mann–Whitney U tests
+  with Holm adjustment) and exports the statistical summary and audit table.
+- [`benchmarks/summarize_communication_focality.py`](../benchmarks/summarize_communication_focality.py):
+  recomputes 5-seed edge spatial focality metrics from complete LR support tables.
 
 Example:
 
 ```bash
-python evaluate/scripts/cc_com/figure3e_lr_pair_statistics.py \
-  --pair-metrics path/to/selected_top_pairs.csv \
+python benchmarks/figure3e_statistics.py \
+  --pair-metrics tests/fixtures/figure3e_selected_top_pairs.csv \
   --output-dir results/figure3e
 ```
 
@@ -44,29 +59,31 @@ python evaluate/scripts/cc_com/figure3e_lr_pair_statistics.py \
 
 | Analysis | Per-seed runner | Across-seed summary |
 |---|---|---|
-| CID44971 semisynthetic | [run_semisynthetic_lr_benchmark.py](../scripts/run_semisynthetic_lr_benchmark.py) | [summarize_semisynthetic_multiseed.py](../scripts/summarize_semisynthetic_multiseed.py) |
-| Fully synthetic | [run_synthetic_lr_v2_benchmark.py](../scripts/run_synthetic_lr_v2_benchmark.py) | [summarize_synthetic_lr_v2_multiseed.py](../scripts/summarize_synthetic_lr_v2_multiseed.py) |
+| CID44971 semisynthetic | [run_semisynthetic_lr.py](../benchmarks/run_semisynthetic_lr.py) | [summarize_semisynthetic_lr.py](../benchmarks/summarize_semisynthetic_lr.py) |
+| Fully synthetic | [run_synthetic_lr.py](../benchmarks/run_synthetic_lr.py) | [summarize_synthetic_lr.py](../benchmarks/summarize_synthetic_lr.py) |
 
 For each run, set `--output` to `<result-root>/seed_<seed>` and pass the
 corresponding `--seed`. Then call the matching summary script with
 `--root <result-root> --seeds <seed list>`. Both runners default to 30 epochs.
 
-- **Semisynthetic.** Supply the CID44971 Step 2 composition and reconstructed
+- **Semisynthetic.** Supply the CID44971 Stage 2 composition and reconstructed
   spot-cell expression through `--composition-csv` and `--spot-cell-expr-csv`,
   plus the matching Visium section through `--st-h5ad`. Use seeds 11, 23, 42,
   67 and 101.
 - **Fully synthetic.** Use `--grid-side 22` and seeds 11, 17, 23, 29, 37, 42,
   53, 61, 67, 73, 79, 83, 89, 97, 101, 107, 113, 127, 131 and 139.
 
-Historical launch and plotting recipes are in the
-[`v1.0.0` scripts snapshot](https://github.com/KuangQuanS/Spagraph/tree/v1.0.0/scripts).
+Historical launch and figure-plotting recipes remain preserved in
+[`paper-reproduction-20261127`](https://github.com/KuangQuanS/Spagraph/tree/paper-reproduction-20261127)
+and [`v1.0.0`](https://github.com/KuangQuanS/Spagraph/tree/v1.0.0).
 
 ## Visium HD CRC check (Figure S3)
 
-`run_notebook/gse280315_visiumhd_crc/` contains LR coverage checking, 128-µm
-aggregation, three section-specific Stage 3 smoke runs and the summary plot.
-These scripts reuse existing published deconvolution labels; they do not
-redistribute raw matrices or result tables.
+[`benchmarks/visium_hd/`](../benchmarks/visium_hd/) contains LR coverage
+checking and 128-µm aggregation input preparation, and
+[`benchmarks/run_visium_hd.py`](../benchmarks/run_visium_hd.py) runs Stage 3 on
+sections P1, P2, or P5 (`--sample P1|P2|P5`). These scripts reuse published
+deconvolution labels and do not redistribute raw matrices or result tables.
 
 ## Scope exclusions
 

@@ -162,5 +162,6 @@ Older `lr_plot.py`, `panel_g_*.py`, `cellchat_scc_baseline_figures.py`, and
 recipes, not current package entry points: do not rename a current output to
 `lr_communication.csv` to make them run. Any reuse requires expansion through
 `spagraph.cellcom.relation_ranker.read_associated_lr_events`, which checks
-complete LR support and rejects representative-ID tables. Scripts in `trash/`
-are also historical. This distinction does not revalidate historical figures.
+complete LR support and rejects representative-ID tables. The
+[`v1.0.0` snapshot](https://github.com/KuangQuanS/Spagraph/tree/v1.0.0)
+contains the earlier draft runners and saved notebook outputs.

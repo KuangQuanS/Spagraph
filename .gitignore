@@ -232,3 +232,26 @@ run_notebook/gse144240_cellchat_baseline/cellchat_smoke/
 run_notebook/gse144240_giotto_baseline/input/
 run_notebook/runtime_runs
 examples/cscc/data/
+
+# Local research data and model artifacts
+*.h5ad
+*.h5
+*.hdf5
+*.loom
+*.rds
+*.ckpt
+*.safetensors
+/output/
+/outputs/
+
+# Local workspace files
+.DS_Store
+.Rhistory
+.RData
+~$*.docx
+~$*.xlsx
+/AGENTS.md
+/Rplots.pdf
+/poster.pdf
+/实验.md
+/反卷积实验.md

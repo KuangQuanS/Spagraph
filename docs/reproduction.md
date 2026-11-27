@@ -73,27 +73,27 @@ Word files. No full model retraining or additional CCC statistical expansion
 is required to reproduce the documented Figure 3e correction.
 
 
-## Optional w075 analysis
+## Configurable LR consensus ranking
 
-Attention-only is the default, with the original aggregation and filenames.
-The [README example](../README.md#optional-support-aware-ranking-w075) shows
-how to apply w075 to existing `lr_pair_statistics.csv` files.
+The default attention weight is 1.0, with the original aggregation and
+filenames. The [README example](../README.md#configurable-lr-consensus-ranking)
+shows how to try different weights on the same `lr_pair_statistics.csv` files.
 
 ### Matched rankings from the same five runs
 
-Both modes used the same archived outputs, LR database and eligible pair set
+All weights used the same archived outputs, LR database and eligible pair set
 within each section. The following are ranks within the Spagraph candidate
 set, with rank 1 indicating highest priority.
 
-| Section | Eligible pairs | LR pair | Attention-only | w075 |
-|---|---:|---|---:|---:|
-| cSCC | 165 | TNC–SDC1 | 14 | 1 |
-| HGSOC | 242 | THBS2–CD47 | 9 | 3 |
-| HGSOC | 242 | CXCL12–CXCR4 | 41 | 6 |
-| DCIS | 428 | CDH5–CDH5 | 46 | 7 |
-| DCIS | 428 | CCL21–CCR7 | 24 | 10 |
-| TNBC | 267 | CLEC2D–KLRB1 | 2 | 1 |
-| TNBC | 267 | CXCL12–CXCR4 | 183 | 144 |
+| Section | Eligible pairs | LR pair | 1.0 (attention-only) | 0.75 | 0.5 |
+|---|---:|---|---:|---:|---:|
+| cSCC | 165 | TNC–SDC1 | 14 | 1 | 7 |
+| HGSOC | 242 | THBS2–CD47 | 9 | 3 | 5 |
+| HGSOC | 242 | CXCL12–CXCR4 | 41 | 6 | 3 |
+| DCIS | 428 | CDH5–CDH5 | 46 | 7 | 8 |
+| DCIS | 428 | CCL21–CCR7 | 24 | 10 | 23 |
+| TNBC | 267 | CLEC2D–KLRB1 | 2 | 1 | 5 |
+| TNBC | 267 | CXCL12–CXCR4 | 183 | 144 | 80 |
 
 The historical cSCC attention-only analysis placed TNC–SDC1 in the top 7%
 of 164 eligible pairs. The matched comparison above uses a 165-pair analysis

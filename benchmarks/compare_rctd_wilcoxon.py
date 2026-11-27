@@ -17,8 +17,8 @@ DEFAULT_DIRECTION = {
 
 
 def parse_args() -> argparse.Namespace:
-    script_dir = Path(__file__).resolve().parent
-    default_data_root = script_dir.parent.parent / "data"
+    repo_root = Path(__file__).resolve().parents[1]
+    default_data_root = repo_root / "results" / "simulated_deconvolution"
 
     parser = argparse.ArgumentParser(
         description=(

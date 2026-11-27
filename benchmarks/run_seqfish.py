@@ -29,7 +29,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--top-n-per-type", type=int, default=50, help="Markers per cluster (manuscript: 50).")
     parser.add_argument("--k-cells-per-cluster", type=int, default=15, help="Dynamic cluster k (manuscript: 15).")
-    parser.add_argument("--save-reconstructed-genes", action="store_true", help="Export reconstructed spot-cell expression.")
+    parser.add_argument(
+        "--no-save-reconstructed-genes",
+        action="store_true",
+        help="Disable reconstructed gene expression export (enabled by default for reconstruction evaluation).",
+    )
     parser.add_argument("--save-all-trials", action="store_true", help="Save all auto-k trial outputs.")
     parser.add_argument("--device", default=None, help="Compute device (e.g. 'cuda', 'cuda:0', 'cpu').")
     parser.add_argument("--seed", type=int, default=42, help="Random seed (default: 42).")
@@ -63,7 +67,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         k_cells_per_cluster=args.k_cells_per_cluster,
         attention_temperature=4.0 / 3.0,
         scale_basis="all",
-        save_reconstructed_genes=args.save_reconstructed_genes,
+        save_reconstructed_genes=not args.no_save_reconstructed_genes,
         save_all_trials=args.save_all_trials,
         device=args.device,
         seed=args.seed,

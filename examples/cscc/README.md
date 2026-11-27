@@ -24,7 +24,7 @@ python examples/cscc/run.py
 
 By default, outputs are written to `results/cscc/{deconv,cellcom}` using the
 manuscript settings (`k_celltype=40`, `batch_size=96`, `epochs=200`,
-`n_repeats=5`). To enable optional w075 support-aware consensus ranking or
+Stage 3 seeds `11 23 42 67 101`). To enable optional w075 support-aware consensus ranking or
 override paths/device:
 
 ```bash

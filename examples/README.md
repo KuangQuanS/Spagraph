@@ -20,8 +20,9 @@ Every case-study script accepts:
 - `--st-file`: path to the spatial transcriptomics `.h5ad` file (`obsm["spatial"]` required)
 - `--output-dir`: output directory (creates `deconv/` and `cellcom/` subdirectories)
 - `--device`: compute device (`cuda`, `cuda:0`, `cpu`; defaults to automatic CUDA detection)
-- `--seed`: random seed (default: `42`)
+- `--seed`: random seed for Stage 1–2 (default: `42`)
+- `--seeds`: explicit Stage 3 random seeds (default: `11 23 42 67 101` matching the manuscript)
 - `--k-celltype`: one integer for fixed `k`, or multiple integers for auto-k selection
-- `--n-repeats`: number of independent Stage 3 runs (default: `5`)
+- `--n-repeats`: optional repeat count when generating Stage 3 seeds from `--seed`
 - `--attention-weight`: Stage 3 consensus attention weight in `[0, 1]` (default: `1.0`; use `0.75` for w075 support-aware consensus)
 - `--skip-cellcom`: stop after Stage 2 deconvolution

@@ -21,6 +21,7 @@ DEFAULT_DATA = ROOT / "examples" / "cscc" / "data"
 DEFAULT_SC = DEFAULT_DATA / "GSE144236_P2_SC.h5ad"
 DEFAULT_ST = DEFAULT_DATA / "GSE144239_P2_ST.h5ad"
 DEFAULT_OUTPUT = ROOT / "results" / "cscc"
+MANUSCRIPT_STAGE3_SEEDS = [11, 23, 42, 67, 101]
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -38,8 +39,20 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Stage 2 k_celltype (one value for fixed k, multiple values for auto-k; manuscript: 40).",
     )
     parser.add_argument("--device", default=None, help="Compute device (e.g. 'cuda', 'cuda:0', 'cpu').")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed (manuscript: 42).")
-    parser.add_argument("--n-repeats", type=int, default=5, help="Independent Stage 3 runs (default: 5).")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for Stage 1-2 (manuscript: 42).")
+    parser.add_argument(
+        "--seeds",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Explicit Stage 3 seeds (default: 11 23 42 67 101 matching the manuscript).",
+    )
+    parser.add_argument(
+        "--n-repeats",
+        type=int,
+        default=None,
+        help="Optional number of Stage 3 repeats when generating seeds from --seed (default: uses --seeds).",
+    )
     parser.add_argument(
         "--attention-weight",
         type=float,
@@ -104,10 +117,19 @@ def main(argv: Sequence[str] | None = None) -> None:
         "epochs": args.stage3_epochs,
         "batch_size": args.stage3_batch_size,
         "seed": args.seed,
-        "n_repeats": args.n_repeats,
         "export_unified_csv": False,
         "attention_weight": args.attention_weight,
     }
+    if args.seeds is not None:
+        if args.n_repeats is not None and args.n_repeats != len(args.seeds):
+            raise ValueError("--n-repeats must match the number of values in --seeds")
+        cellcom_kwargs["seeds"] = list(args.seeds)
+        cellcom_kwargs["n_repeats"] = len(args.seeds)
+    elif args.n_repeats is not None:
+        cellcom_kwargs["n_repeats"] = args.n_repeats
+    else:
+        cellcom_kwargs["seeds"] = list(MANUSCRIPT_STAGE3_SEEDS)
+        cellcom_kwargs["n_repeats"] = len(MANUSCRIPT_STAGE3_SEEDS)
     if args.device is not None:
         cellcom_kwargs["device"] = args.device
     spg.cellcom(**cellcom_kwargs)

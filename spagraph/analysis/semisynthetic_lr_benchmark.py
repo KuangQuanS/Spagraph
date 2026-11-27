@@ -81,9 +81,9 @@ CID44971_SCENARIOS = {
 @dataclass
 class SemisyntheticBenchmarkConfig:
     output: str = "results/semisynthetic_lr_benchmark"
-    composition_csv: str = "evaluate/data/GSE144236/Spatial_composition.csv"
-    spot_cell_expr_csv: str = "evaluate/data/GSE144236/Spatial_spot_cell_expr.csv"
-    st_h5ad: str = "spagraph_data/database/GSE144240/GSE144236_P2_ST.h5ad"
+    composition_csv: str = "results/cscc/deconv/Spatial_composition.csv"
+    spot_cell_expr_csv: str = "results/cscc/deconv/Spatial_spot_cell_expr.csv"
+    st_h5ad: str = "examples/cscc/data/GSE144239_P2_ST.h5ad"
     epochs: int = 30
     seed: int = 42
     device: str = "cuda"

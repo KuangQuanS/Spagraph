@@ -16,6 +16,7 @@ from spagraph.cellcom.relation_ranker import (
     calibrate_lr_statistics,
     ensemble_lr_rankings,
     aggregate_attention_rankings,
+    aggregate_w075_rankings,
     rank_associated_attention,
     read_associated_lr_events,
 )
@@ -107,6 +108,25 @@ class CalibrationTests(unittest.TestCase):
         self.assertAlmostEqual(result.loc['B', 'mean_attention_percentile'], (2.5/3 + .5)/2)
         self.assertFalse(result.loc['C', 'eligible_for_ranking'])
         self.assertTrue(pd.isna(result.loc['C', 'rank']))
+
+    def test_w075_consensus_uses_eligible_percentiles_and_keeps_legacy(self):
+        frame = pd.DataFrame({
+            "lr_pair": ["A", "B", "C", "D"],
+            "associated_edge_attention_mean": [3., 2., 1., 100.],
+            "supporting_unique_edges": [10, 100, 50, 9],
+            "eligible_for_ranking": [True, True, True, False],
+        })
+        other = frame[frame.lr_pair != "C"].copy()
+        result = aggregate_w075_rankings([frame, other]).set_index("lr_pair")
+        self.assertAlmostEqual(result.loc["A", "mean_w075_score"],
+                               ((.75 + .25/3) + (.75 + .25/2))/2)
+        self.assertAlmostEqual(result.loc["B", "mean_w075_score"],
+                               ((.75*2/3 + .25) + (.75/2 + .25))/2)
+        self.assertEqual(result.loc["A", "rank"], 1)
+        self.assertTrue(pd.isna(result.loc["C", "rank"]))
+        self.assertTrue(pd.isna(result.loc["D", "rank"]))
+        legacy = aggregate_attention_rankings([frame, other])
+        self.assertNotIn("mean_w075_score", legacy.columns)
 
     def test_raw_ranking_rejects_invalid_or_mixed_scores(self):
         frame = pd.DataFrame({'lr_pair': ['A'], 'associated_edge_attention_mean': [float('nan')]})

@@ -16,6 +16,7 @@ import pandas as pd
 from spagraph.cellcom.cellcom import main as cellcom_main, parse_args
 from spagraph.cellcom.relation_ranker import (
     aggregate_attention_rankings,
+    aggregate_w075_rankings,
 )
 
 
@@ -23,8 +24,11 @@ def aggregate_cellcom_seed_outputs(
     seed_dirs: Sequence[Union[str, Path]],
     output_dir: Union[str, Path],
     seeds: Sequence[int],
+    ranking_mode: str = "attention",
 ) -> Dict[str, Any]:
-    """Aggregate raw attention percentiles from all requested Stage 3 runs."""
+    """Aggregate existing Stage 3 runs without retraining."""
+    if ranking_mode not in {"attention", "w075"}:
+        raise ValueError("ranking_mode must be 'attention' or 'w075'")
     if len(seed_dirs) != len(seeds) or not seed_dirs:
         raise ValueError("seed_dirs and seeds must be non-empty and have equal length")
     if len(set(seeds)) != len(seeds):
@@ -40,8 +44,12 @@ def aggregate_cellcom_seed_outputs(
 
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
-    ensemble = aggregate_attention_rankings(frames)
-    ensemble_path = output / "lr_pair_ensemble_statistics.csv"
+    if ranking_mode == "w075":
+        ensemble = aggregate_w075_rankings(frames)
+        ensemble_path = output / "lr_pair_ensemble_w075_statistics.csv"
+    else:
+        ensemble = aggregate_attention_rankings(frames)
+        ensemble_path = output / "lr_pair_ensemble_statistics.csv"
     ensemble.to_csv(ensemble_path, index=False)
     manifest = {
         "seeds": [int(value) for value in seeds],
@@ -50,7 +58,13 @@ def aggregate_cellcom_seed_outputs(
         "eligibility": "present and eligible in every requested run",
         "per_seed_directories": [str(Path(value)) for value in seed_dirs],
     }
-    manifest_path = output / "cellcom_ensemble_manifest.json"
+    if ranking_mode == "w075":
+        manifest.update(aggregation="mean within-run weighted percentile",
+                        ranking_mode="w075", attention_weight=0.75, support_weight=0.25,
+                        minimum_supporting_edges=10)
+        manifest_path = output / "cellcom_ensemble_w075_manifest.json"
+    else:
+        manifest_path = output / "cellcom_ensemble_manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     return {
         "ensemble": ensemble,
@@ -117,6 +131,7 @@ def run_cellcom(
     export_filtered_csv: bool = False,
     # Legacy support
     args: Optional[Union[argparse.Namespace, Dict[str, Any]]] = None,
+    ranking_mode: str = "attention",
     **overrides: Any,
 ) -> Optional[Dict[str, Any]]:
     """Run Stage 3 (cell communication) analysis.
@@ -173,6 +188,7 @@ def run_cellcom(
         seed: Random seed for a single run or deterministic repeat-seed generation
         n_repeats: Number of independent Stage3 runs to ensemble
         seeds: Explicit unique seeds; when supplied, overrides generated repeat seeds
+        ranking_mode: "attention" (legacy default) or optional "w075" multi-run consensus
         device: Computing device ('cuda' or 'cpu')
         early_stop_metric: Validation metric used for checkpoint selection,
             either ``total`` or ``relation_rank``
@@ -194,6 +210,8 @@ def run_cellcom(
         ...     batch_size=4
         ... )
     """
+    if ranking_mode not in {"attention", "w075"}:
+        raise ValueError("ranking_mode must be 'attention' or 'w075'")
     if n_repeats < 1:
         raise ValueError("n_repeats must be at least 1")
     if lambda_relation_rank < 0:
@@ -223,6 +241,9 @@ def run_cellcom(
         seed_values = rng.sample(range(1, 2**31 - 1), n_repeats)
     else:
         seed_values = [int(seed)]
+
+    if ranking_mode == "w075" and len(seed_values) < 2:
+        raise ValueError("w075 consensus requires multiple runs; use explicit seeds or n_repeats")
 
     if len(seed_values) > 1:
         if args is not None:
@@ -271,7 +292,7 @@ def run_cellcom(
                     seeds=None, **base_kwargs
                 )
             )
-        result = aggregate_cellcom_seed_outputs(seed_dirs, output_dir, seed_values)
+        result = aggregate_cellcom_seed_outputs(seed_dirs, output_dir, seed_values, ranking_mode=ranking_mode)
         result["seed_results"] = seed_results
         return result
 

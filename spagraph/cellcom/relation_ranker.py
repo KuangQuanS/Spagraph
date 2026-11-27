@@ -165,6 +165,64 @@ def aggregate_attention_rankings(frames: Sequence[pd.DataFrame]) -> pd.DataFrame
     return result.sort_values(["rank", "lr_pair"], na_position="last").reset_index(drop=True)
 
 
+def aggregate_w075_rankings(frames: Sequence[pd.DataFrame]) -> pd.DataFrame:
+    """Optional consensus of 75% attention and 25% unique-edge support percentiles.
+
+    Rank within each run before averaging; retain formal ranks only for pairs
+    eligible in every run. The original attention-only function is unchanged.
+    """
+    if not frames:
+        raise ValueError("At least one run is required")
+    ranked = []
+    for i, frame in enumerate(frames):
+        required = {"lr_pair", "associated_edge_attention_mean", "supporting_unique_edges"}
+        if not required.issubset(frame.columns):
+            raise ValueError("w075 requires complete associated-edge statistics")
+        if "score_source" in frame and (
+            set(frame.score_source.dropna().astype(str))
+            - {"shared_attention_associated_lr_support"}
+        ):
+            raise ValueError("w075 requires shared associated-edge attention")
+        f = rank_associated_attention(frame)
+        count = pd.to_numeric(f["supporting_unique_edges"], errors="raise")
+        if not np.isfinite(count).all() or (count < 0).any() or (count % 1 != 0).any():
+            raise ValueError("Supporting-edge counts must be finite nonnegative integers")
+        eligible = f["eligible_for_ranking"] & count.ge(10)
+        f["eligible_for_ranking"] = eligible
+        f["attention_percentile"] = np.nan
+        f["support_percentile"] = np.nan
+        f.loc[eligible, "attention_percentile"] = f.loc[
+            eligible, "associated_edge_attention_mean"
+        ].astype(float).rank(method="average", pct=True)
+        f.loc[eligible, "support_percentile"] = np.log1p(
+            count[eligible]
+        ).rank(method="average", pct=True)
+        f["w075_score"] = (
+            0.75 * f["attention_percentile"] + 0.25 * f["support_percentile"]
+        )
+        f["w075_run_rank"] = f["w075_score"].rank(ascending=False, method="min")
+        ranked.append(f.assign(run=i))
+    merged = pd.concat(ranked, ignore_index=True)
+    result = merged.groupby("lr_pair", as_index=False).agg(
+        mean_attention_percentile=("attention_percentile", "mean"),
+        mean_support_percentile=("support_percentile", "mean"),
+        mean_w075_score=("w075_score", "mean"),
+        w075_score_std=("w075_score", "std"),
+        run_rank_min=("w075_run_rank", "min"),
+        run_rank_max=("w075_run_rank", "max"),
+        n_runs=("run", "nunique"),
+        n_eligible_runs=("eligible_for_ranking", "sum"),
+    )
+    eligible = result.n_runs.eq(len(frames)) & result.n_eligible_runs.eq(len(frames))
+    result["eligible_for_ranking"] = eligible
+    result["rank"] = pd.Series(pd.NA, index=result.index, dtype="Int64")
+    result.loc[eligible, "rank"] = result.loc[eligible, "mean_w075_score"].rank(
+        ascending=False, method="min"
+    ).astype("Int64")
+    result["score_source"] = "mean_run_w075_percentile"
+    return result.sort_values(["rank", "lr_pair"], na_position="last").reset_index(drop=True)
+
+
 def calibrate_lr_statistics(
     statistics: pd.DataFrame,
     weights: Optional[CalibrationWeights] = None,

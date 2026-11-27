@@ -71,3 +71,31 @@ the unrelated Visium HD colon pilot, partner-swap and archetype experiments,
 historical outputs, checkpoints, server logs, private runbooks and manuscript
 Word files. No full model retraining or additional CCC statistical expansion
 is required to reproduce the documented Figure 3e correction.
+
+
+## Optional w075 analysis
+
+The attention-only mode is the default and its existing output filenames and
+aggregation are unchanged. The optional w075 mode is a separate post-processing
+analysis of per-seed `lr_pair_statistics.csv` files. Use the README example
+with explicit seeds 11, 23, 42, 67 and 101. Supply the exact same upstream inputs
+and LR database when comparing weights.
+
+The following are manuscript-reported case-study observations, not results
+reproduced by this PR:
+
+| Analysis | Reported observation |
+|---|---|
+| cSCC historical attention-only | TNC-SDC1 in top 7% of 164 eligible pairs |
+| cSCC w075 | TNC-SDC1 first of 165 eligible pairs |
+| HGSOC common-set reference recovery, w075 / CellChat / COMMOT | top 10%: 9/18, 6/18, 2/18; top 20%: 10/18 for all three |
+| TNBC common-set comparison | CLEC2D-KLRB1 first by w075; CXCL12-CXCR4 ranked 138th by w075, 16th by CellChat and 7th by COMMOT |
+
+The cSCC candidate universe changed (MMP9-LRP1 was added in the revised
+analysis); the historical and revised ranks are not a controlled comparison
+of weights alone. The HGSOC reference list is literature-derived, not
+experimental ground truth. Existing synthetic benchmarks test attention
+against abundance, not necessarily the w075 composite. Full case-study
+reproduction requires the original per-seed outputs, exact database version,
+baseline rankings, and HGSOC reference list; those frozen inputs are not
+included in this change. No new biological or robustness claims are made.

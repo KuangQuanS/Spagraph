@@ -130,6 +130,38 @@ reconstruction; relation and candidate ranking losses are disabled. Repeated
 runs assess sensitivity to training randomness, not independent biological
 replication or a guaranteed improvement in ranking accuracy.
 
+### Optional support-aware ranking (w075)
+
+The default ranking remains attention-only and preserves existing outputs.
+For multi-seed analyses, optionally set `ranking_mode="w075"` with
+`spg.cellcom_ensemble(...)` (the default explicit seeds are 11, 23, 42, 67,
+101). Within each run, w075 combines 0.75 times the attention percentile
+with 0.25 times the percentile of log1p(unique supporting-edge count),
+among eligible pairs with at least 10 unique supporting edges.
+The scores are averaged across runs; formal ranks require eligibility in every
+run. This is post-processing, not a change to HE-GAT training or LR inference.
+
+To compare both modes without retraining, use the existing per-seed CSVs:
+
+```python
+from pathlib import Path
+from spagraph.training.cellcom import aggregate_cellcom_seed_outputs
+
+root = Path("outputs/cellcom")
+seeds = [11, 23, 42, 67, 101]
+dirs = [root / f"seed_{seed}" for seed in seeds]
+aggregate_cellcom_seed_outputs(dirs, root, seeds, ranking_mode="attention")
+aggregate_cellcom_seed_outputs(dirs, root, seeds, ranking_mode="w075")
+```
+
+w075 writes separate `lr_pair_ensemble_w075_statistics.csv` and
+`cellcom_ensemble_w075_manifest.json` files, so the attention-only results
+are not overwritten. Support weighting is intended to balance high attention
+with the amount of supporting evidence; it does not establish biochemical
+activity, statistical significance, or universally improved accuracy or
+robustness. See [reproduction notes](docs/reproduction.md#optional-w075-analysis)
+for the validation scope.
+
 ## Inputs and outputs
 
 - Stage 1 inputs: an scRNA-seq `.h5ad` and an ST `.h5ad` with genes as

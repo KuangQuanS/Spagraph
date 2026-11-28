@@ -3,14 +3,14 @@
 Each subdirectory provides a standalone Python script that runs the complete
 three-stage Spagraph workflow (`spg.vae` -> `spg.deconv` -> `spg.cellcom`)
 using only the public API and the explicit manuscript parameters summarized in
-[`README.md`](../README.md#tumor-case-study-examples).
+[`README.md`](../README.md#-tumor-case-study-examples).
 
 | Case study | Directory | Dataset | Stage 2 `k_celltype` | Stage 3 `batch_size` |
 |---|---|---|---|---:|
 | Cutaneous squamous cell carcinoma (cSCC) | [`cscc/`](cscc/) | GSE144236 + GSE144239 (P2) | `40` (fixed) | `96` |
 | Basal-like triple-negative breast cancer (TNBC) | [`tnbc/`](tnbc/) | CID44971 | `[20, 30, 40]` (selected: 40) | `128` |
 | Ductal carcinoma in situ (DCIS) | [`dcis/`](dcis/) | GSE243275 | `20` (fixed) | `64` |
-| High-grade serous ovarian cancer (HGSOC) | [`hgsoc/`](hgsoc/) | GSE211956 (P3) | `[20, 30, 40]` (selected: 30) | `128` |
+| High-grade serous ovarian cancer (HGSOC) | [`hgsoc/`](hgsoc/) | GSE211956 (P3) | `30` (selected from `[20, 30, 40]`) | `128` |
 
 ## Common CLI options
 

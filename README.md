@@ -154,7 +154,8 @@ Four ready-to-run Stage 1–3 scripts under [`examples/`](examples/) implement
 the tumor case studies with their exact manuscript parameters (Stage 1:
 `resolution=4.0`, `top_n_per_type=100`, `lambda_pseudospot_contrastive=0.01`,
 `mixture_temperature=0.15`, `seed=42`; Stage 2: `k_cells_per_cluster=15`,
-`attention_temperature=4/3`, `scale_basis="all"`; Stage 3: `n_spot_neighbors=8`,
+`attention_temperature=4/3`, `lambda_gene_pearson=1.0`, `lambda_gene_cosine=5.0`,
+`scale_basis="all"`; Stage 3: `n_spot_neighbors=8`,
 `ligand/receptor_expr_threshold=3.0`, `epochs=200`, `seeds=[11, 23, 42, 67, 101]`):
 
 | Case study | Script | Dataset | Stage 2 `k_celltype` | Stage 3 `batch_size` |
@@ -162,7 +163,7 @@ the tumor case studies with their exact manuscript parameters (Stage 1:
 | cSCC (P2) | [`examples/cscc/run.py`](examples/cscc/run.py) | GSE144236 + GSE144239 | `40` | `96` |
 | TNBC | [`examples/tnbc/run.py`](examples/tnbc/run.py) | CID44971 | `[20, 30, 40]` | `128` |
 | DCIS | [`examples/dcis/run.py`](examples/dcis/run.py) | GSE243275 | `20` | `64` |
-| HGSOC (P3) | [`examples/hgsoc/run.py`](examples/hgsoc/run.py) | GSE211956 | `[20, 30, 40]` | `128` |
+| HGSOC (P3) | [`examples/hgsoc/run.py`](examples/hgsoc/run.py) | GSE211956 | `30` | `128` |
 
 The cSCC example includes a one-command downloader for compact `v1.0.0` release inputs:
 

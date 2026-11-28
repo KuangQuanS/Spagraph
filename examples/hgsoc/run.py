@@ -3,7 +3,7 @@
 
 Default parameters match the manuscript settings:
 - Stage 1: resolution=4.0, top_n_per_type=100, lambda_pseudospot_contrastive=0.01, mixture_temperature=0.15
-- Stage 2: k_celltype=[20, 30, 40] (manuscript selected: 30), k_cells_per_cluster=15, attention_temperature=4/3, scale_basis='all'
+- Stage 2: k_celltype=30 (manuscript selected from [20, 30, 40]), k_cells_per_cluster=15, attention_temperature=4/3, lambda_gene_pearson=1.0, lambda_gene_cosine=5.0, scale_basis='all'
 - Stage 3: n_spot_neighbors=8, ligand/receptor thresholds=3.0, lr_score_threshold=1.0, epochs=200, batch_size=128
 """
 
@@ -32,8 +32,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--k-celltype",
         type=int,
         nargs="+",
-        default=[20, 30, 40],
-        help="Stage 2 k_celltype candidates or fixed value (manuscript: 20 30 40; selected: 30).",
+        default=[30],
+        help="Stage 2 k_celltype (manuscript selected: 30; pass multiple values e.g. 20 30 40 for auto-k).",
     )
     parser.add_argument("--device", default=None, help="Compute device (e.g. 'cuda', 'cuda:0', 'cpu').")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for Stage 1-2 (manuscript: 42).")
@@ -90,6 +90,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         k_celltype=k_celltype,
         k_cells_per_cluster=15,
         attention_temperature=4.0 / 3.0,
+        lambda_gene_pearson=1.0,
+        lambda_gene_cosine=5.0,
         scale_basis="all",
         save_reconstructed_genes=True,
         device=args.device,

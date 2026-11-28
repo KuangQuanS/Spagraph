@@ -1304,14 +1304,15 @@ class SpatialDeconvolutionLoss(nn.Module):
         sparsity_loss = -torch.mean(attention_weights * torch.log(attention_weights + 1e-8))
 
         # ============ 6. 基因维度 Pearson/Cosine（跨 spot） ============
-        # NOTE: 这些指标跨 batch 维度计算，统计量随 batch 组成变化，
-        # 不适合做训练 loss（梯度不稳定），但仍作为监控指标记录。
-        # lambda_gene_pearson / lambda_gene_cosine 默认为 0，不参与梯度。
+        # 默认 lambda_gene_pearson / lambda_gene_cosine 为 0，仅做无梯度监控；
+        # 显式开启非零权重（如全图训练下的真实组织案例）时允许正常回传梯度。
         gene_pearson_loss = torch.tensor(0.0, device=attention_weights.device)
         gene_cosine_loss = torch.tensor(0.0, device=attention_weights.device)
         if reconstructed_log.shape[0] > 1:
-            with torch.no_grad():
-                rec_T = reconstructed_log.detach().transpose(0, 1)
+            need_gene_grad = (self.lambda_gene_pearson > 0) or (self.lambda_gene_cosine > 0)
+            ctx = torch.enable_grad() if need_gene_grad else torch.no_grad()
+            with ctx:
+                rec_T = (reconstructed_log if need_gene_grad else reconstructed_log.detach()).transpose(0, 1)
                 true_T = true_log.detach().transpose(0, 1)
                 rec_centered = rec_T - rec_T.mean(dim=1, keepdim=True)
                 true_centered = true_T - true_T.mean(dim=1, keepdim=True)

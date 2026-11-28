@@ -3,7 +3,7 @@
 
 Default parameters match the manuscript settings:
 - Stage 1: resolution=4.0, top_n_per_type=100, lambda_pseudospot_contrastive=0.01, mixture_temperature=0.15
-- Stage 2: k_celltype=40 (fixed), k_cells_per_cluster=15, attention_temperature=4/3, scale_basis='all'
+- Stage 2: k_celltype=40 (fixed), k_cells_per_cluster=15, attention_temperature=4/3, lambda_gene_pearson=1.0, lambda_gene_cosine=5.0, scale_basis='all'
 - Stage 3: n_spot_neighbors=8, ligand/receptor thresholds=3.0, lr_score_threshold=1.0, epochs=200, batch_size=96
 """
 
@@ -96,6 +96,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         k_celltype=k_celltype,
         k_cells_per_cluster=15,
         attention_temperature=4.0 / 3.0,
+        lambda_gene_pearson=1.0,
+        lambda_gene_cosine=5.0,
         scale_basis="all",
         save_reconstructed_genes=True,
         device=args.device,

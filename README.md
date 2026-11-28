@@ -151,7 +151,8 @@ aggregate_cellcom_seed_outputs(dirs, root, seeds, attention_weight=0.75)
 ## 🧫 Tumor Case-Study Examples
 
 Four ready-to-run Stage 1–3 scripts under [`examples/`](examples/) implement
-the tumor case studies with their exact manuscript parameters (Stage 1:
+the current end-to-end workflow for the tumor case studies with manuscript-aligned
+parameters (Stage 1:
 `resolution=4.0`, `top_n_per_type=100`, `lambda_pseudospot_contrastive=0.01`,
 `mixture_temperature=0.15`, `seed=42`; Stage 2: `k_cells_per_cluster=15`,
 `attention_temperature=4/3`, `lambda_gene_pearson=1.0`, `lambda_gene_cosine=5.0`,

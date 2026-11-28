@@ -244,16 +244,17 @@ def main(args=None):
     
     # ========== CPU优化设置 ==========
     if device.type == 'cpu':
-        # 设置PyTorch使用的CPU线程数（充分利用多核）
+        # 设置PyTorch使用的CPU线程数（充分利用多核）；多种子重复运行时避免重复调用 interop 报错
         import multiprocessing
         n_threads = min(multiprocessing.cpu_count(), 8)  # 最多8线程，避免过度竞争
         torch.set_num_threads(n_threads)
-        torch.set_num_interop_threads(2)  # 操作间并行
-        
-        # 启用优化的矩阵运算
-        torch.backends.mkl.is_available() and None  # 确保MKL可用
-        
-        print(f"CPU Optimization:   threads={n_threads}, interop=2")
+        try:
+            if torch.get_num_interop_threads() != 2:
+                torch.set_num_interop_threads(2)
+        except RuntimeError:
+            pass
+        interop_threads = torch.get_num_interop_threads()
+        print(f"CPU Optimization:   threads={n_threads}, interop={interop_threads}")
     
     _print_stage3_header(args, device)
     

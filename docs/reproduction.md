@@ -10,8 +10,8 @@ and [`v1.0.0`](https://github.com/KuangQuanS/Spagraph/tree/v1.0.0) tags.
 
 ## Tumor case studies (Figures 3–6, on `main`)
 
-Standalone Stage 1–3 runners using only the public Spagraph API and the exact
-manuscript parameters (including Stage 3 seeds `11, 23, 42, 67, 101`):
+Standalone Stage 1–3 runners using only the public Spagraph API and the
+current manuscript-aligned parameters (including Stage 3 seeds `11, 23, 42, 67, 101`):
 
 - [`examples/cscc/`](../examples/cscc/) — GSE144236 + GSE144239 P2 (cSCC; includes `download.py` for compact `v1.0.0` release inputs)
 - [`examples/tnbc/`](../examples/tnbc/) — CID44971 (basal-like TNBC)
